@@ -125,12 +125,23 @@ PWA_FILES = frozenset({
 })
 
 
-# 4096 is not enough for a model asked to write a file in one tool call: the
-# arguments are cut off mid-JSON and the call cannot be run at all. The window
-# is 200k, and a ceiling that is never reached costs nothing. Defined once -
-# /ui/config advertised 16384 while the turn itself still fell back to 4096,
-# so any caller that omitted the setting silently got the old limit.
-DEFAULT_MAX_TOKENS = 16384
+# A ceiling, not an allocation: generation stops at the end of the answer, so a
+# limit that is never reached costs nothing, and one that is reached costs the
+# whole tool call - the arguments are cut off mid-JSON and the call cannot be
+# run at all. 4096 could not write a page; 16384 could not write a long one.
+# The window is 200k+, so the ceiling is set where it stops being the thing
+# that decides how much work fits in one reply. Defined once - /ui/config once
+# advertised one number while the turn itself fell back to another, so any
+# caller that omitted the setting silently got the old limit.
+DEFAULT_MAX_TOKENS = 65536
+
+# ...except on a model whose whole window is smaller than that. Half the
+# context is a reasonable ceiling for an answer when nothing else is known: it
+# leaves room for the conversation that prompted it.
+def default_max_tokens(context_length=None):
+    if not context_length:
+        return DEFAULT_MAX_TOKENS
+    return max(2048, min(DEFAULT_MAX_TOKENS, int(context_length) // 2))
 
 
 class ChatUI:
@@ -529,7 +540,7 @@ class ChatUI:
                 "top_p": float(self.cfg.get("TOP_P") or 0.95),
                 "top_k": int(self.cfg.get("TOP_K") or 20),
                 "max_tokens": int(self.cfg.get("MAX_TOKENS")
-                                  or DEFAULT_MAX_TOKENS),
+                                  or default_max_tokens(self.context_length)),
             },
         }
 
@@ -696,7 +707,8 @@ class ChatUI:
             "temperature": float(settings.get("temperature", 0.6)),
             "top_p": float(settings.get("top_p", 0.95)),
             "top_k": int(settings.get("top_k", 20)),
-            "max_tokens": int(settings.get("max_tokens", DEFAULT_MAX_TOKENS)),
+            "max_tokens": int(settings.get(
+                "max_tokens", default_max_tokens(self.context_length))),
         }
         # How hard the model should think. "off" is exact - the chat template
         # emits an empty <think></think> and there is nowhere to reason. The

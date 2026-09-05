@@ -4278,6 +4278,68 @@ def test_a_cut_off_call_is_told_apart_from_a_malformed_one():
           (banner or {}).get("message"))
 
 
+def test_the_reply_ceiling_is_not_the_thing_that_decides_what_fits():
+    """Max new tokens is a ceiling, not an allocation: a limit never reached
+    costs nothing, and one that is reached costs the whole tool call, because
+    the arguments are cut off mid-JSON and cannot be run. 4096 could not write
+    a page. 16384 could not write a long one. Both were shipped as defaults,
+    and both quietly decided how much work fitted in one reply."""
+    import webui_app as wa                              # noqa: WPS433
+
+    check("the ceiling is high enough to stop being the limit",
+          wa.DEFAULT_MAX_TOKENS == 65536, wa.DEFAULT_MAX_TOKENS)
+    env = (Path(__file__).parent.parent / ".env.example").read_text()
+    check("...and the shipped setting agrees with the code",
+          "MAX_TOKENS=65536" in env)
+
+    # ...except on a model whose whole window is smaller than the ceiling.
+    for context, want in ((None, 65536), (0, 65536), (4096, 2048),
+                          (8192, 4096), (32768, 16384), (131072, 65536),
+                          (262144, 65536)):
+        got = wa.default_max_tokens(context)
+        check(f"a {context} window gets {want}", got == want, got)
+    check("even a tiny window leaves something usable",
+          wa.default_max_tokens(512) == 2048)
+
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    # The slider should not offer a ceiling the endpoint cannot reach.
+    gen = js.split('fieldSlider("max_tokens"')[0].split("function paneGeneration")[1]
+    check("the slider's top follows the window, not a fixed number",
+          "activeContextLength()" in gen and "Math.floor(room / 2)" in gen)
+    check("...and says what that window is",
+          "This endpoint's window is" in js)
+
+
+def test_a_ceiling_nobody_chose_moves_when_the_default_moves():
+    """Every time the shipped ceiling turned out to be too low, the people
+    carrying the old one were the ones who never touched the setting: it was
+    saved once from a default. The old migration ran once under a flag and
+    recognised one specific number, so a browser that had already seen it could
+    never be lifted again - which is exactly how a saved 4096 survived two
+    raises of the default."""
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    body = js.split("function migrateSettings()")[1].split("\n}")[0]
+
+    check("the defaults this kit has shipped are known by name",
+          "const INHERITED_MAX_TOKENS = [4096, 16384];" in js)
+    check("a value that is one of them was inherited, so it moves",
+          "INHERITED_MAX_TOKENS.includes(mine)" in body)
+    check("...and any other value is the person's own and is left alone",
+          "return;   // chosen: leave it alone" in body)
+    check("a value already above the default is not lowered",
+          "mine >= fresh" in body)
+    # The one-shot flag is what made this unrepeatable.
+    check("the stamp carries the default it applied, not just 'done'",
+          'localStorage.setItem("chatui.maxTokensDefault", String(fresh));' in body)
+    check("...so a browser stamped with an older default is lifted again",
+          'Number(localStorage.getItem("chatui.maxTokensDefault")) === fresh' in body)
+    check("the flag that could never fire twice is gone",
+          "maxTokensBumped" not in js)
+    # Changing someone's saved setting silently is worse than the setting.
+    check("it says so when it changes a saved setting",
+          "Max new tokens raised from" in body and "toast(" in body)
+
+
 def test_an_approval_asks_in_words_a_person_can_judge():
     """This is the one moment where someone has to decide something on the
     agent's behalf, and it was the least readable thing on screen: the
@@ -4800,6 +4862,8 @@ def main():
     test_levels_can_be_declared_from_the_menu()
     test_arguments_can_be_read_as_they_arrive()
     test_a_cut_off_call_is_told_apart_from_a_malformed_one()
+    test_the_reply_ceiling_is_not_the_thing_that_decides_what_fits()
+    test_a_ceiling_nobody_chose_moves_when_the_default_moves()
     test_an_approval_asks_in_words_a_person_can_judge()
     test_thinking_lands_where_it_happened()
     test_a_sentence_is_not_cut_in_half_by_a_tool_call()

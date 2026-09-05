@@ -3201,10 +3201,18 @@ function paneGeneration(pane) {
     "Considers only the likeliest words that add up to this much probability."));
   pane.append(fieldSlider("top_k", "Top-k", 0, 100, 1,
     "A hard cap on how many candidates are in play. 0 turns it off."));
-  pane.append(fieldSlider("max_tokens", "Max new tokens", 256, 65536, 256,
+  // The slider should not offer a ceiling the endpoint cannot reach: half the
+  // window leaves room for the conversation that prompted the answer, which is
+  // the same rule the server picks its default by.
+  const room = activeContextLength();
+  const ceiling = Math.max(8192, Math.min(131072,
+    room ? Math.floor(room / 2) : 65536));
+  pane.append(fieldSlider("max_tokens", "Max new tokens", 256, ceiling, 256,
     "The ceiling for one reply. It stops there whether or not it was finished - "
     + "and a tool call cut off mid-argument cannot be run at all, so keep this "
-    + "high if you ask the agent to write whole files."));
+    + "high if you ask the agent to write whole files."
+    + (room ? ` This endpoint's window is ${Math.round(room / 1024)}k tokens.`
+            : "")));
 
   pane.append(el("hr", "set-sep"));
 
@@ -3499,17 +3507,39 @@ function settingsModal(startAt) {
    call cannot be run at all. Anyone still sitting on exactly that number
    inherited it rather than chose it, so take the new default once - and record
    that we did, so a deliberate 4096 is never overwritten twice. */
+/* Ceilings people never chose.
+
+   Max new tokens is a ceiling on one reply, and every time the shipped ceiling
+   has turned out to be too low, the people carrying the old one were the ones
+   who never touched the setting: it was saved once from a default and then
+   quietly decided how much work could fit in a reply - long enough to write
+   half a file and lose the whole tool call. The old migration ran once, under
+   a flag, and recognised one specific number, so a browser that had already
+   seen it could never be lifted again.
+
+   A saved value that is exactly one of the defaults this kit has shipped was
+   inherited rather than chosen, so it moves when the default moves. Anything
+   else is the person's own number and is left alone. The key carries the
+   default it last applied, so a later change can lift it again. */
+const INHERITED_MAX_TOKENS = [4096, 16384];
+
 function migrateSettings() {
-  try {
-    if (localStorage.getItem("chatui.maxTokensBumped")) return;
-    localStorage.setItem("chatui.maxTokensBumped", "1");
-  } catch (e) { return; }        // no storage: nothing was saved to migrate
   const fresh = Number(state.config?.defaults?.max_tokens) || 0;
-  if (fresh > 4096 && Number(state.settings.max_tokens) === 4096) {
-    state.settings.max_tokens = fresh;
-    saveSettings();
-  }
+  const mine = Number(state.settings.max_tokens) || 0;
+  if (!fresh || !mine || mine >= fresh) return;
+  if (!INHERITED_MAX_TOKENS.includes(mine)) return;   // chosen: leave it alone
+  try {
+    if (Number(localStorage.getItem("chatui.maxTokensDefault")) === fresh) return;
+    localStorage.setItem("chatui.maxTokensDefault", String(fresh));
+  } catch (e) { return; }        // no storage: nothing was saved to migrate
+  state.settings.max_tokens = fresh;
+  saveSettings();
+  // Changing someone's saved setting silently is worse than the setting.
+  toast(`Max new tokens raised from ${mine.toLocaleString()} to `
+        + `${fresh.toLocaleString()} - the old ceiling could cut a file off `
+        + "mid-write. Settings \u203a Generation");
 }
+
 
 function saveSettings() {
   try { localStorage.setItem("chatui.settings", JSON.stringify(state.settings)); }
