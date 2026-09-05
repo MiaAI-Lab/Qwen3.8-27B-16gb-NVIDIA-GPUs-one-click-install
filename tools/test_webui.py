@@ -4278,6 +4278,112 @@ def test_a_cut_off_call_is_told_apart_from_a_malformed_one():
           (banner or {}).get("message"))
 
 
+def test_three_themes_and_a_background_that_does_not_band():
+    """A wide, shallow ramp across a dark screen is where 8-bit colour runs out
+    of steps and the eye reads the steps as stripes. And OLED is not "dark
+    turned down": on that panel #000 is a pixel switched off, which is the
+    whole reason to have the theme."""
+    import re                                           # noqa: WPS433
+    css = (Path(__file__).parent / "webui" / "style.css").read_text()
+
+    check("there is an OLED theme", ':root[data-theme="oled"] {' in css)
+    oled = css.split(':root[data-theme="oled"] {')[1].split("\n}")[0]
+    check("...and its background is actually black", "--bg: #000000;" in oled)
+    check("...with a gradient of its own", "--bg-grad:" in oled)
+    check("...that arrives from black and returns to it",
+          "rgba(0, 0, 0, 0)" in oled)
+
+    # Every theme has to define every token, or a switch leaves half the UI
+    # wearing the last one's colours.
+    def tokens(block):
+        return set(re.findall(r"(--[a-z0-9-]+):", block))
+    dark = css.split(":root {")[1].split("\n}")[0]
+    light = css.split(':root[data-theme="light"] {')[1].split("\n}")[0]
+    # Not every token: --ring and the shadows are built out of --accent and
+    # black, so they follow the theme by themselves, and --accent-ink is white
+    # on any theme whose accent is saturated. It is the surface-and-text ladder
+    # that has to be restated, because half of it inherited from another theme
+    # is exactly how a switch leaves the UI wearing two palettes at once.
+    ladder = {"--bg", "--bg-grad", "--panel", "--panel-2", "--chrome", "--raise",
+              "--line", "--line-soft", "--text", "--text-2", "--muted",
+              "--accent", "--accent-2", "--accent-soft",
+              "--band", "--row-hover", "--row-on"}
+    check("the dark theme is the one the others are measured against",
+          ladder <= tokens(dark), sorted(ladder - tokens(dark)))
+    for name, block in (("light", light), ("OLED", oled)):
+        missing = sorted(ladder - tokens(block))
+        check(f"the {name} theme restates the whole surface ladder",
+              not missing, ", ".join(missing))
+
+    # Fading to `transparent` fades to transparent BLACK, which desaturates the
+    # ramp on the way out and leaves a dirty edge where it lands.
+    for name, block in (("dark", dark), ("light", light), ("OLED", oled)):
+        grad = block.split("--bg-grad:")[1].split(";")[0]
+        check(f"the {name} gradient never fades to bare `transparent`",
+              "transparent" not in grad, grad[:70])
+
+    check("a dither breaks up what is left of the banding",
+          "--bg-noise:" in css and "feTurbulence" in css)
+    check("...blended with overlay, which leaves black at black",
+          "background-blend-mode: var(--bg-blend);" in css)
+
+    # background-blend-mode takes one entry per layer INCLUDING the background
+    # colour, and a short list repeats - which silently put `overlay` on the
+    # base colour, and on a theme with a third gradient, on a gradient too.
+    for name, block in (("dark", dark), ("light", light), ("OLED", oled)):
+        grad = block.split("--bg-grad:")[1].split(";")[0]
+        layers = grad.count("-gradient(") + 1 + 1        # gradients + noise + colour
+        blend = block.split("--bg-blend:")[1].split(";")[0] if "--bg-blend:" in block \
+            else dark.split("--bg-blend:")[1].split(";")[0]
+        check(f"the {name} theme blends exactly its own layers",
+              len(blend.split(",")) == layers,
+              f"{len(blend.split(','))} entries for {layers} layers")
+
+    # ":not([data-theme='dark'])" was the same as "nothing chosen" while there
+    # were two themes, and stopped being it the moment there was a third.
+    check("following the OS means nothing was chosen, not 'not dark'",
+          ':root:not([data-theme="dark"])' not in css)
+    check("...and the topbar icon follows the same rule",
+          ":root:not([data-theme]) #theme-btn .theme-sun" in css)
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    check("the button cycles all three", 'const THEME_CYCLE = ["light", "dark", "oled"];' in js)
+    check("...and Settings offers them plus the system",
+          '["oled", "OLED"]' in js and '["", "System"]' in js)
+
+
+def test_work_in_progress_looks_like_it():
+    """Two places say "this is happening now", and both were saying it quietly:
+    a flat 90deg wipe of one accent behind the word Thinking, and, in the
+    sidebar, nothing at all - the list is only refreshed when a turn ENDS, so
+    the row for the chat you were watching never showed it was working."""
+    css = (Path(__file__).parent / "webui" / "style.css").read_text()
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+
+    check("a light runs down the rail the thinking hangs from",
+          ".think.live::before" in css and "rail-run" in css)
+    check("...so it is visible even with the block folded shut",
+          "top: 0; bottom: 0" in css.split(".think.live::before")[1].split("}")[0])
+    check("...and the sweep across the words has a core, not one flat colour",
+          "color-mix(in srgb, #fff 70%, var(--accent))" in css)
+    check("both are real keyframes", "@keyframes rail-run" in css)
+
+    check("a chat still working wears a light round its edge",
+          ".session .edge::before" in css and "@keyframes edge-run" in css)
+    check("...drawn as the row's own outline, not a box near it",
+          "mask-composite: exclude" in css.split(".session .edge {")[1].split("}")[0])
+    check("...and only on rows that are working",
+          'if (s.running) row.append(el("i", "edge"));' in js)
+
+    # The sidebar has no poll: without this the chat you are looking at never
+    # showed as running, because the only refresh happens when it stops.
+    check("the row is marked while the turn runs, without a poll",
+          "function markRunningRow" in js and "markRunningRow(on);" in js)
+    check("...a chat drawn for the first time mid-turn gets it too",
+          "markRunningRow(state.streaming);" in js)
+    check("...and it comes off when the turn ends, whatever the server says yet",
+          "this window is the authority" in js)
+
+
 def test_a_page_the_agent_wrote_can_be_opened_but_not_trusted():
     """Asking for "a single HTML file" and then being told where it is on disk
     is a strange place to stop, so the conversation offers to open it. That
@@ -4936,6 +5042,8 @@ def main():
     test_levels_can_be_declared_from_the_menu()
     test_arguments_can_be_read_as_they_arrive()
     test_a_cut_off_call_is_told_apart_from_a_malformed_one()
+    test_three_themes_and_a_background_that_does_not_band()
+    test_work_in_progress_looks_like_it()
     test_a_page_the_agent_wrote_can_be_opened_but_not_trusted()
     test_the_reply_ceiling_is_not_the_thing_that_decides_what_fits()
     test_a_ceiling_nobody_chose_moves_when_the_default_moves()

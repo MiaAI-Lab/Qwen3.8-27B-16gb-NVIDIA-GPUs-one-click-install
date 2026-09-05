@@ -18,6 +18,18 @@
      with one number. 1 is the app's own (already slightly reduced) default. */
   --text-scale: 1;
 
+  /* A wide, shallow ramp across a dark screen is where 8-bit colour
+     runs out of steps, and the eye reads the steps as stripes. This is
+     the fix every film grade uses: a fine grey noise tile, blended
+     with overlay so it dithers the ramp without lifting anything -
+     overlay leaves pure black at pure black, which the OLED theme
+     depends on. */
+  --bg-noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' opacity='0.26'/%3E%3C/svg%3E");
+  /* One entry per background layer, and the list has to be exactly as long:
+     a short list repeats, which quietly put `overlay` on the base colour -
+     and on a theme with a third gradient, on the gradient too. */
+  --bg-blend: overlay, normal, normal, normal;
+
   /* shape and motion -------------------------------------------------- */
   --r-sm: 8px;
   --r-md: 12px;
@@ -31,8 +43,19 @@
   /* dark palette (default) -------------------------------------------- */
   color-scheme: dark;
   --bg: #0b0d12;
-  --bg-grad: radial-gradient(1200px 620px at 78% -12%, #1b2340 0%, transparent 62%),
-             radial-gradient(900px 520px at 8% 4%, #16203a 0%, transparent 55%);
+  /* Fading to `transparent` fades to transparent BLACK, so the ramp loses
+     saturation on the way out and leaves a dirty edge where it lands. Every
+     stop below ends on the same colour at zero alpha, and the middle stops
+     ease the falloff instead of letting one linear ramp cross 600px - which
+     on an 8-bit screen is what the banding was. */
+  --bg-grad: radial-gradient(1250px 660px at 78% -12%,
+               rgba(31, 40, 74, 1) 0%, rgba(27, 35, 64, .72) 26%,
+               rgba(22, 29, 53, .38) 48%, rgba(18, 23, 42, .14) 68%,
+               rgba(15, 19, 34, 0) 84%),
+             radial-gradient(980px 560px at 8% 4%,
+               rgba(22, 32, 58, 1) 0%, rgba(20, 28, 52, .66) 28%,
+               rgba(17, 23, 43, .3) 52%, rgba(14, 18, 33, .1) 72%,
+               rgba(12, 15, 27, 0) 88%);
   --panel: #10131b;
   --panel-2: #151926;
   --raise: #1a1f2e;
@@ -67,12 +90,24 @@
   --row-on: #2a3360;    /* the conversation on screen: unmistakably the accent */
 }
 
+/* Only when nothing has been chosen. This used to say :not([data-theme="dark"]),
+   which was the same thing while there were two themes and stopped being it the
+   moment there was a third: on a light-OS machine the light palette matched the
+   OLED theme too, and the two fought over every token. */
 @media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) {
+  :root:not([data-theme]) {
     color-scheme: light;
     --bg: #e8ebf3;
-    --bg-grad: radial-gradient(1100px 560px at 82% -14%, #eef1fb 0%, transparent 62%),
-               radial-gradient(800px 460px at 4% 2%, #f0f3fc 0%, transparent 55%);
+    /* Same reason as the dark theme: fading to `transparent` fades to
+       transparent black, which on a pale ground dirties the ramp rather
+       than letting it end. */
+    --bg-grad: radial-gradient(1150px 600px at 82% -14%,
+                 rgba(238, 241, 251, 1) 0%, rgba(238, 241, 251, .7) 28%,
+                 rgba(238, 241, 251, .34) 52%, rgba(238, 241, 251, .1) 72%,
+                 rgba(238, 241, 251, 0) 88%),
+               radial-gradient(860px 500px at 4% 2%,
+                 rgba(240, 243, 252, 1) 0%, rgba(240, 243, 252, .64) 30%,
+                 rgba(240, 243, 252, .28) 54%, rgba(240, 243, 252, 0) 80%);
     --panel: #ffffff;
     --panel-2: #eef1f7;
     --chrome: #dbe0ec;   /* sidebar and topbar: recessed, not white */
@@ -100,8 +135,13 @@
 :root[data-theme="light"] {
   color-scheme: light;
   --bg: #e8ebf3;
-  --bg-grad: radial-gradient(1100px 560px at 82% -14%, #eef1fb 0%, transparent 62%),
-             radial-gradient(800px 460px at 4% 2%, #f0f3fc 0%, transparent 55%);
+  --bg-grad: radial-gradient(1150px 600px at 82% -14%,
+               rgba(238, 241, 251, 1) 0%, rgba(238, 241, 251, .7) 28%,
+               rgba(238, 241, 251, .34) 52%, rgba(238, 241, 251, .1) 72%,
+               rgba(238, 241, 251, 0) 88%),
+             radial-gradient(860px 500px at 4% 2%,
+               rgba(240, 243, 252, 1) 0%, rgba(240, 243, 252, .64) 30%,
+               rgba(240, 243, 252, .28) 54%, rgba(240, 243, 252, 0) 80%);
   --panel: #ffffff;
   --panel-2: #eef1f7;
   --chrome: #dbe0ec;   /* sidebar and topbar: recessed, not white */
@@ -125,6 +165,52 @@
   --row-on: #d3dcff;
 }
 
+/* OLED: black that is actually black.
+
+   On an OLED panel a #0b0d12 background is 2.5 million lit pixels; #000 is
+   2.5 million pixels switched off, which is why the theme exists. So the
+   surfaces are near-black rather than dark grey, and the gradient is a
+   suggestion of colour rather than a wash - it has to arrive from black and
+   return to black without ever lifting the corners of the screen off it.
+   Borders carry the structure the fills used to. */
+:root[data-theme="oled"] {
+  color-scheme: dark;
+  --bg: #000000;
+  --bg-grad: radial-gradient(1250px 700px at 78% -14%,
+               rgba(26, 33, 62, .58) 0%, rgba(20, 26, 50, .34) 24%,
+               rgba(14, 18, 35, .16) 46%, rgba(8, 10, 20, .05) 68%,
+               rgba(0, 0, 0, 0) 86%),
+             radial-gradient(900px 540px at 6% 2%,
+               rgba(19, 28, 52, .5) 0%, rgba(14, 21, 40, .28) 26%,
+               rgba(9, 13, 26, .11) 50%, rgba(0, 0, 0, 0) 78%),
+             radial-gradient(1100px 620px at 50% 118%,
+               rgba(12, 22, 40, .34) 0%, rgba(0, 0, 0, 0) 72%);
+  --bg-blend: overlay, normal, normal, normal, normal;   /* one more gradient */
+  --panel: #060609;
+  --panel-2: #0b0c12;
+  --chrome: #030305;
+  --raise: #111320;
+  --line: #1e2130;
+  --line-soft: #14161f;
+  --text: #edf0f7;
+  --text-2: #b0b8ca;
+  --muted: #79819a;
+  --accent: #8b98ff;
+  --accent-2: #b39cff;
+  --accent-ink: #05050a;
+  --accent-soft: #141a3a;
+  --ok: #3fd6a8;
+  --warn: #f0b429;
+  --danger: #ff6b7d;
+  /* Shadows do nothing against black; the depth has to come from the edges. */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, .9);
+  --shadow-2: 0 10px 30px -12px rgba(0, 0, 0, 1);
+  --shadow-3: 0 24px 60px -20px rgba(0, 0, 0, 1);
+  --band: #0f1220;
+  --row-hover: #14172a;
+  --row-on: #232c58;
+}
+
 /* ------------------------------------------------------------- basics -- */
 
 * { box-sizing: border-box; }
@@ -133,7 +219,8 @@
 html, body { height: 100%; }
 body {
   margin: 0;
-  background: var(--bg-grad), var(--bg);
+  background: var(--bg-noise), var(--bg-grad), var(--bg);
+  background-blend-mode: var(--bg-blend);
   background-attachment: fixed;
   color: var(--text);
   font: calc(14px * var(--text-scale))/1.6 var(--sans);
@@ -432,6 +519,28 @@ body.resizing * { cursor: col-resize !important; }
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 .session.live .t { color: var(--text); }
+/* A chat still working, seen from the sidebar: two lights chase round its
+   edge. A pulsing dot says "something", an edge in motion says "this one, and
+   it has not finished". It is one rotating conic gradient, masked down to the
+   border - so it costs a transform per frame and nothing else, and it is the
+   row's own outline rather than a box drawn near it. */
+.session .edge {
+  position: absolute; inset: 0; z-index: 2; padding: 1px;
+  border-radius: inherit; overflow: hidden; pointer-events: none;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor; mask-composite: exclude;
+}
+.session .edge::before {
+  content: ""; position: absolute; left: 50%; top: 50%;
+  width: 260%; aspect-ratio: 1; transform: translate(-50%, -50%);
+  background: conic-gradient(from 0deg,
+    transparent 0 46%,
+    color-mix(in srgb, #fff 82%, var(--accent)) 52%, transparent 58%,
+    transparent 90%,
+    color-mix(in srgb, #fff 55%, var(--accent)) 96%, transparent 100%);
+  animation: edge-run 2.6s linear infinite;
+}
 .session .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
               font-size: calc(12.5px * var(--text-scale));
               /* the body's 1.6 is set for paragraphs; a single-line row only
@@ -669,15 +778,22 @@ body.resizing * { cursor: col-resize !important; }
   color: var(--muted); font-size: calc(10.5px * var(--text-scale)); font-variant-numeric: tabular-nums; }
 
 #theme-btn .theme-moon { display: none; }
-:root[data-theme="dark"] #theme-btn .theme-sun,
-:root:not([data-theme="light"]) #theme-btn .theme-sun { display: none; }
-:root[data-theme="dark"] #theme-btn .theme-moon,
-:root:not([data-theme="light"]) #theme-btn .theme-moon { display: block; }
+/* An explicit choice wins, whatever the OS is set to. */
 :root[data-theme="light"] #theme-btn .theme-sun { display: block; }
 :root[data-theme="light"] #theme-btn .theme-moon { display: none; }
+:root[data-theme="dark"] #theme-btn .theme-sun,
+:root[data-theme="oled"] #theme-btn .theme-sun { display: none; }
+:root[data-theme="dark"] #theme-btn .theme-moon,
+:root[data-theme="oled"] #theme-btn .theme-moon { display: block; }
+/* OLED is a dark theme, so it wears the moon - dimmed, because the point of it
+   is that the screen is off where it can be. */
+:root[data-theme="oled"] #theme-btn .theme-moon { opacity: .72; }
+/* ...and with nothing chosen, follow the OS. */
+:root:not([data-theme]) #theme-btn .theme-sun { display: none; }
+:root:not([data-theme]) #theme-btn .theme-moon { display: block; }
 @media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) #theme-btn .theme-sun { display: block; }
-  :root:not([data-theme="dark"]) #theme-btn .theme-moon { display: none; }
+  :root:not([data-theme]) #theme-btn .theme-sun { display: block; }
+  :root:not([data-theme]) #theme-btn .theme-moon { display: none; }
 }
 
 /* --------------------------------------------------------------- plan --- */
@@ -862,10 +978,32 @@ body.resizing * { cursor: col-resize !important; }
 .think > summary .chev { transition: transform var(--med); }
 .think[open] > summary .chev { transform: rotate(180deg); }
 .think.live > summary { color: var(--accent); }
+/* Thinking, while it is happening: a light runs down the rail the block hangs
+   from, and a brighter, tighter sweep crosses the words - a flat 90deg wipe of
+   one accent read as a loading bar, which is the wrong idea. The rail is the
+   part that carries it: it is the full height of the block, so the movement is
+   visible even with the block folded shut. */
+.think { position: relative; }
+.think.live { border-left-color: transparent; }
+.think.live::before {
+  content: ""; position: absolute; left: -2px; top: 0; bottom: 0; width: 2px;
+  border-radius: 2px; pointer-events: none;
+  background: linear-gradient(180deg,
+    var(--line) 0%, var(--line) 34%,
+    color-mix(in srgb, var(--accent) 70%, var(--line)) 43%,
+    var(--accent) 48%, color-mix(in srgb, #fff 65%, var(--accent)) 50%,
+    var(--accent) 52%, color-mix(in srgb, var(--accent) 70%, var(--line)) 57%,
+    var(--line) 66%, var(--line) 100%);
+  background-size: 100% 260%;
+  animation: rail-run 2.4s var(--ease) infinite;
+}
 .think.live > summary .label {
-  background: linear-gradient(90deg, var(--muted) 20%, var(--accent) 50%, var(--muted) 80%);
-  background-size: 220% 100%; -webkit-background-clip: text; background-clip: text;
-  color: transparent; animation: shimmer 1.9s linear infinite;
+  background: linear-gradient(100deg,
+    var(--muted) 0%, var(--muted) 36%,
+    var(--accent) 45%, color-mix(in srgb, #fff 70%, var(--accent)) 50%,
+    var(--accent) 55%, var(--muted) 64%, var(--muted) 100%);
+  background-size: 260% 100%; -webkit-background-clip: text; background-clip: text;
+  color: transparent; animation: shimmer 2.4s var(--ease) infinite;
 }
 .think .think-body {
   padding: 6px 12px 4px; color: var(--muted);
@@ -1524,6 +1662,9 @@ input[type=range]::-moz-range-thumb {
 @keyframes bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .55; }
                     30% { transform: translateY(-5px); opacity: 1; } }
 @keyframes shimmer { from { background-position: 120% 0; } to { background-position: -120% 0; } }
+@keyframes rail-run { from { background-position: 0 -130%; }
+                      to   { background-position: 0 230%; } }
+@keyframes edge-run { to { transform: translate(-50%, -50%) rotate(1turn); } }
 @keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-7px); } }
 @keyframes glow {
   0%, 100% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 9%, transparent); }

@@ -1948,8 +1948,23 @@ function handleEvent(ev, body, cards, stats) {
   }
 }
 
+/* The sidebar list is refreshed when a turn ends, never while one runs - there
+   is no poll - so the row for the chat you are actually watching never showed
+   that it was working. Everything was in place except saying so: the class
+   goes on when the turn starts, and the refresh at the end confirms it. */
+function markRunningRow(on) {
+  const id = state.sessionId;
+  const row = id && $(`#sessions .session[data-id="${CSS.escape(id)}"]`);
+  if (!row) return;
+  row.classList.toggle("live", on);
+  const edge = row.querySelector(".edge");
+  if (on && !edge) row.append(el("i", "edge"));
+  if (!on && edge) edge.remove();
+}
+
 function setStreaming(on) {
   state.streaming = on;
+  markRunningRow(on);
   /* A turn just started: start sampling now rather than waiting out the idle
      interval, or the whole answer can finish before the first busy poll. */
   if (on) { sample = null; scheduleSpeedSample(120); }
@@ -2280,6 +2295,9 @@ async function loadSessions() {
       const dot = el("span", "dot");
       if (s.running) dot.title = "Still working - open it to watch";
       row.append(dot);
+      // the running edge belongs to rows that are still working, and to no
+      // others - it is drawn only where it means something
+      if (s.running) row.append(el("i", "edge"));
 
       const title = el("span", "t");
       title.append(el("span", null, s.title));
@@ -2327,6 +2345,12 @@ async function loadSessions() {
 
     nav.append(section);
   });
+  // A conversation that started a moment ago is drawn for the first time here,
+  // after its turn was already running - and the redraw at the END of a turn
+  // races the server, which can still be reporting it as running for another
+  // moment and would leave the light going after the answer had landed. For
+  // the chat this window is looking at, this window is the authority.
+  markRunningRow(state.streaming);
 }
 
 /* Drag-and-drop only reorders pinned chats - the rest of the list sorts
@@ -3153,10 +3177,12 @@ function paneAppearance(pane) {
     "How the app looks on this device. Kept in this browser and never sent to "
     + "the model.");
 
-  pane.append(fieldChoices("Theme", "the topbar button flips light and dark",
-    [["", "System"], ["light", "Light"], ["dark", "Dark"]], currentTheme(),
-    (v) => setTheme(v),
-    "System follows whatever this computer is set to, and changes with it."));
+  pane.append(fieldChoices("Theme", "the topbar button cycles the three",
+    [["", "System"], ["light", "Light"], ["dark", "Dark"], ["oled", "OLED"]],
+    currentTheme(), (v) => setTheme(v),
+    "System follows whatever this computer is set to, and changes with it. "
+    + "OLED is black rather than dark grey: on an OLED screen those pixels "
+    + "are switched off rather than lit dark."));
 
   pane.append(fieldChoices("Font size", null,
     [["0.9", "Small"], ["1", "Default"], ["1.15", "Large"], ["1.3", "Extra large"]],
@@ -3639,12 +3665,18 @@ function currentTheme() {
   catch (e) { return ""; }
 }
 
+/* The button cycles the three explicit themes rather than flipping two, so
+   OLED is reachable without opening Settings. Following the system is still a
+   real choice, but it is one you make once - it stays in Settings. */
+const THEME_CYCLE = ["light", "dark", "oled"];
+
 function toggleTheme() {
   const root = document.documentElement;
-  const dark = root.dataset.theme
-    ? root.dataset.theme === "dark"
-    : matchMedia("(prefers-color-scheme: dark)").matches;
-  setTheme(dark ? "light" : "dark");
+  const now = root.dataset.theme
+    || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  const at = THEME_CYCLE.indexOf(now);
+  setTheme(THEME_CYCLE[(at + 1) % THEME_CYCLE.length]);
+  toast(`${{ light: "Light", dark: "Dark", oled: "OLED" }[currentTheme()]} theme`);
 }
 
 /* A display preference, not a generation parameter - kept out of
