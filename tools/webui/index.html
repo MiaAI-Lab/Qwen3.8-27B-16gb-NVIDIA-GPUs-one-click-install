@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Local chat</title>
+<link rel="stylesheet" href="/ui/static/style.css">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#f4f6fb" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0b0d12" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Simplex">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='42' fill='%236d7cff'/><circle cx='50' cy='50' r='16' fill='%23fff'/></svg>">
+</head>
+<body>
+
+<svg class="sprite" aria-hidden="true">
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5v.2a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.6 1.7 1.7 0 0 0-1.9.4l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.7 9a1.7 1.7 0 0 0-.4-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1h.2a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.6 1z"/></symbol>
+  <symbol id="i-clip" viewBox="0 0 24 24"><path d="M21.4 11.05 12.25 20.2a5.5 5.5 0 0 1-7.78-7.78l9.19-9.19a3.67 3.67 0 1 1 5.18 5.18l-9.2 9.2a1.83 1.83 0 0 1-2.59-2.6l8.49-8.48"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2.5" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3.2a2 2 0 0 1 1.5.7l1.1 1.3h7.2A2.5 2.5 0 0 1 21 9.5v8A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5z"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15H4.5A1.5 1.5 0 0 1 3 13.5v-9A1.5 1.5 0 0 1 4.5 3h9A1.5 1.5 0 0 1 15 4.5V5"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 13 4 4L19 7"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.2A8.2 8.2 0 0 1 9.8 4 8.2 8.2 0 1 0 20 14.2"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3.5 9h17M3.5 15h17M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></symbol>
+  <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4.5 13.5H11l-1 8.5 8.5-11.5H12z"/></symbol>
+  <symbol id="i-pin" viewBox="0 0 24 24"><path d="M9 3h6l-1 6 4 3v2H6v-2l4-3z"/><path d="M12 14v7"/></symbol>
+  <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M4 20h4l10.5-10.5a2.8 2.8 0 0 0-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5 12 15l4.5-4.5M5 19h14"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></symbol>
+  <symbol id="i-retry" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></symbol>
+  <symbol id="i-ask" viewBox="0 0 24 24"><path d="M12 17.5v.01M9.2 9a2.9 2.9 0 0 1 5.6 1c0 2-2.8 2.4-2.8 4"/><circle cx="12" cy="12" r="9.2"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6.4 6.4l11.2 11.2M17.6 6.4 6.4 17.6"/></symbol>
+  <symbol id="i-palette" viewBox="0 0 24 24"><path d="M12 3a9 9 0 0 0 0 18c1.3 0 2-.9 2-1.9 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.2 0-1 .8-1.7 1.8-1.7H16a5 5 0 0 0 5-5c0-3.9-4-7-9-7"/><circle cx="7.5" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="9.8" cy="8" r="1.1" fill="currentColor" stroke="none"/><circle cx="14.2" cy="7.6" r="1.1" fill="currentColor" stroke="none"/><circle cx="17.3" cy="10.7" r="1.1" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2"/><rect x="3.5" y="3.5" width="17" height="17" rx="4"/><path d="M9.5 1.8v1.7M14.5 1.8v1.7M9.5 20.5v1.7M14.5 20.5v1.7M1.8 9.5h1.7M1.8 14.5h1.7M20.5 9.5h1.7M20.5 14.5h1.7"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 8h9M17.5 8H20M4 16h3.5M12 16h8"/><circle cx="15.2" cy="8" r="2.3"/><circle cx="9.7" cy="16" r="2.3"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8.5a6 6 0 1 0-12 0c0 5-2 6.5-2 6.5h16s-2-1.5-2-6.5"/><path d="M13.7 19a2 2 0 0 1-3.4 0"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="2.8" y="4" width="18.4" height="16" rx="3"/><path d="m7.5 10 2.6 2.4-2.6 2.4M13 15.2h4"/></symbol>
+  <symbol id="i-reset" viewBox="0 0 24 24"><path d="M4 11a8 8 0 1 1 2.3 5.7"/><path d="M4 4v7h7"/></symbol>
+  <symbol id="i-grip" viewBox="0 0 24 24"><path d="M10 5v14M14 5v14"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 5 6v5.5c0 4.3 2.9 8.3 7 9.5 4.1-1.2 7-5.2 7-9.5V6z"/></symbol>
+</svg>
+
+<div id="app">
+
+  <aside id="sidebar">
+    <div class="side-head">
+      <div class="brand">
+        <span class="brand-mark"><i class="pulse"></i></span>
+        <span id="brand-name">Local chat</span>
+      </div>
+      <button id="new-chat" class="btn block">
+        <svg class="ico"><use href="#i-plus"/></svg><span>New chat</span>
+      </button>
+    </div>
+    <div class="side-search">
+      <svg class="ico"><use href="#i-search"/></svg>
+      <input id="session-filter" type="search" aria-label="Search conversations"
+             title="Searches names and message text"
+             placeholder="Search chats"
+             autocomplete="off" spellcheck="false">
+    </div>
+    <nav id="sessions" aria-label="Conversations"></nav>
+    <div class="side-foot">
+      <!-- Status only. The model is something you act on, so it lives with the
+           composer where you are actually typing - not docked down here. -->
+      <div class="foot-status">
+        <span id="stat-context">-</span>
+        <span id="stat-speed" class="foot-speed" hidden></span>
+      </div>
+      <div class="meter" id="context-meter" hidden>
+        <i></i><span id="context-used"></span>
+      </div>
+    </div>
+    <!-- Drag to set the width; double-click resets it. Hidden on narrow
+         screens, where the sidebar is a full-height drawer instead. -->
+    <div id="side-resize" class="side-resize" role="separator"
+         aria-orientation="vertical" aria-label="Resize the sidebar"
+         tabindex="0" title="Drag to resize - double-click to reset">
+      <span class="grip"></span>
+    </div>
+  </aside>
+  <div id="scrim"></div>
+
+  <main id="main">
+    <header id="topbar">
+      <button id="menu" class="icon" title="Conversations" aria-label="Conversations">
+        <svg class="ico"><use href="#i-menu"/></svg>
+      </button>
+
+      <div class="modes" role="tablist" aria-label="Chat mode">
+        <span class="mode-glider" aria-hidden="true"></span>
+        <button class="mode on" data-mode="chat" role="tab" aria-selected="true">
+          <svg class="ico"><use href="#i-globe"/></svg><span>Chat</span>
+        </button>
+        <button class="mode" data-mode="agent" role="tab" aria-selected="false">
+          <svg class="ico"><use href="#i-bolt"/></svg><span>Agent</span>
+        </button>
+      </div>
+
+      <button id="ws-change" class="ws-chip" hidden title="Change the agent's folder">
+        <svg class="ico"><use href="#i-folder"/></svg>
+        <span id="ws-path">-</span>
+      </button>
+
+      <div class="spacer"></div>
+
+      <span id="speed" class="speed" hidden title="Generation speed">
+        <svg class="ico"><use href="#i-bolt"/></svg><b>-</b>&nbsp;tok/s
+      </span>
+
+      <button id="install-btn" class="btn small" hidden
+              title="Install Simplex as an app on this device">
+        <svg class="ico"><use href="#i-download"/></svg><span>Install</span>
+      </button>
+
+      <button id="theme-btn" class="icon" title="Theme" aria-label="Theme">
+        <svg class="ico theme-sun"><use href="#i-sun"/></svg>
+        <svg class="ico theme-moon"><use href="#i-moon"/></svg>
+      </button>
+      <button id="settings-btn" class="icon" title="Settings" aria-label="Settings">
+        <svg class="ico"><use href="#i-gear"/></svg>
+      </button>
+    </header>
+
+    <details id="plan-bar" hidden>
+      <summary>
+        <span class="plan-title">Plan</span>
+        <span class="plan-bar-track"><i></i></span>
+        <span class="plan-count">0/0</span>
+        <svg class="ico chev"><use href="#i-down"/></svg>
+      </summary>
+      <ul class="plan-list"></ul>
+    </details>
+
+    <!-- not a live region: it is replaced on every token, which makes a
+         screen reader re-read the whole answer. The status line below is. -->
+    <section id="thread"></section>
+    <p id="sr-status" class="sr-only" role="status" aria-live="polite"></p>
+
+    <button id="to-bottom" class="to-bottom" hidden aria-label="Scroll to newest">
+      <svg class="ico"><use href="#i-down"/></svg>
+    </button>
+
+    <footer id="composer">
+      <div id="attachments"></div>
+      <div class="input-shell">
+        <button id="attach" class="icon ghost" title="Attach an image" aria-label="Attach an image">
+          <svg class="ico"><use href="#i-clip"/></svg>
+        </button>
+        <textarea id="input" rows="1" enterkeyhint="send"
+          placeholder="Message the model" title="Enter sends, Shift+Enter for a new line"></textarea>
+        <button id="send" class="btn send" title="Send" aria-label="Send">
+          <svg class="ico"><use href="#i-send"/></svg>
+        </button>
+        <button id="stop" class="btn stop" hidden title="Stop" aria-label="Stop">
+          <svg class="ico"><use href="#i-stop"/></svg>
+        </button>
+      </div>
+      <div class="composer-bar">
+        <button id="stat-model" class="model-chip" title="Switch model"
+                aria-label="Switch model" disabled>
+          <svg class="ico"><use href="#i-cpu"/></svg>
+          <span id="stat-model-name">-</span>
+          <b id="stat-remote" class="tag remote" hidden></b>
+          <svg class="ico chev"><use href="#i-down"/></svg>
+        </button>
+        <div class="hint" id="hint"></div>
+      </div>
+      <input type="file" id="file-input" multiple hidden
+             accept="image/*,text/*,.md,.csv,.json,.py,.js,.ts,.html,.css,.yaml,.yml,.toml,.ini,.log,.sql,.sh,.bat,.ps1">
+    </footer>
+  </main>
+</div>
+
+<div id="modal" class="modal" hidden>
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-head">
+      <b id="modal-title">Settings</b>
+      <button class="icon close-btn" id="modal-close" aria-label="Close settings"
+              title="Close  (Esc)">
+        <svg class="ico"><use href="#i-close"/></svg>
+      </button>
+    </div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<div id="menu-pop" class="menu" hidden role="menu"></div>
+
+<div id="toasts" aria-live="polite"></div>
+
+<script src="/ui/static/app.js"></script>
+</body>
+</html>

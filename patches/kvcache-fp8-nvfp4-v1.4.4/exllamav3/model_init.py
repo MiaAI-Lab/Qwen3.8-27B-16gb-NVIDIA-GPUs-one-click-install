@@ -1,0 +1,398 @@
+from types import SimpleNamespace
+
+from . import Model, Config, Cache, Tokenizer
+from .loader import SafetensorsCollection, VariantSafetensorsCollection
+from .cache import CacheLayer_fp16, CacheLayer_quant, CacheLayer_fp8, CacheLayer_nvfp4
+from .generator.sampler import ComboSampler
+from argparse import ArgumentParser
+import yaml
+from pathlib import Path
+
+def add_args(
+    parser: ArgumentParser,
+    cache: bool = True,
+    default_cache_size = 8192,
+    default_recurrent_cache_size = 4.0,
+    default_cpu_cache_size = 0.0,
+    add_sampling_args: bool = False,
+    default_sampling_args: dict = None,
+    default_autosplit_max_batch_size: int = 1,
+    add_draft_model_args: bool = False,
+):
+    """
+    Add standard model loading arguments to command line parser
+
+    :param parser:
+        argparse.ArgumentParser
+
+    :param cache:
+        bool, include cache arguments. If present, model_init.init() will also return cache
+
+    :param default_cache_size:
+        Default value for -cs / --cache_size argument
+
+    :param default_recurrent_cache_size:
+        Default value for -rcs / --recurrent_cache_size argument
+
+    :param default_cpu_cache_size:
+        Default value for -ccs / --cpu_cache_size argument
+
+    :param add_sampling_args:
+        bool, add sampling arguments
+
+    :param default_autosplit_max_batch_size:
+        Default value for -ambs / --autosplit_max_batch_size argument
+
+    :param default_sampling_args:
+        dict of default values
+
+    :param add_draft_model_args:
+        bool, add draft model args. If True, init() will return draft_model and draft_config as well
+    """
+    parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
+    parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
+    parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
+    parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
+
+    parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load model in Tensor-parallel mode, attempts to respect --gpu_split")
+    parser.add_argument("-mcl", "--moe_cpu_offload", type = int, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
+    parser.add_argument("-mcs", "--moe_cpu_split", type = int, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts", default = 0)
+    parser.add_argument("-mct", "--moe_cpu_threads", type = int, help = "Worker thread count for --moe_cpu_offload / --moe_cpu_split (default: EXL3_MOE_CPU_THREADS env, else cpu_count/2)", default = None)
+    parser.add_argument("-tpb", "--tp_backend", type = str, help = "Tensor-parallel backend, either 'native' (default) or 'nccl'", default = "native")
+    parser.add_argument("-tp_attn", "--tp_max_parallelism_attn", type = int, help = "(TP) Maximum parallelism for attention layers", default = None)
+    parser.add_argument("-tp_mlp", "--tp_max_parallelism_mlp", type = int, help = "(TP) Maximum parallelism for MLP layers", default = None)
+    parser.add_argument("-tp_moe", "--tp_max_parallelism_moe", type = int, help = "(TP) Maximum parallelism for MoE layers", default = None)
+    parser.add_argument("-tp_linear", "--tp_max_parallelism_linear", type = int, help = "(TP) Maximum parallelism for linear (output) layers", default = None)
+    parser.add_argument("-tp_linear_attn", "--tp_max_parallelism_linear_attn", type = int, help = "(TP) Maximum parallelism for linear-attention layers", default = None)
+    parser.add_argument("-tp_moe_ts", "--tp_moe_tensor_split", action = "store_true", help = "(TP) Use tensor split for MoE layers rather than expert parallelism")
+
+    parser.add_argument("-swa_full", "--swa_full", action = "store_true", help = f"Use full cache for SWA layers. Default is recurrent mode with snapshots")
+    parser.add_argument("-ambs", "--autosplit_max_batch_size", type = int, help = f"Max batch size to account for when loading in autosplit mode (default: {default_autosplit_max_batch_size})", default = default_autosplit_max_batch_size)
+
+    parser.add_argument("-lv", "--load_verbose", action = "store_true", help = "Verbose output while loading")
+    parser.add_argument("-asnf", "--autosplit_no_forward", action = "store_true", help = "Skip forward pass in autosplit, for debug purposes.")
+
+    parser.add_argument("-layer_map", "--layer_map", type = str, help = "RYS layer map as a list of ints or (inclusive) ranges, example: 0..15,11..31 (repeats layers 11 through 15 once)", default = None)
+
+    if add_sampling_args:
+        defs = default_sampling_args if default_sampling_args is not None else {}
+        d = SimpleNamespace()
+        d.temperature = defs.get("temperature", 0.8)
+        d.repetition_penalty = defs.get("repetition_penalty", 1.0)
+        d.presence_penalty = defs.get("presence_penalty", 0.0)
+        d.frequency_penalty = defs.get("frequency_penalty", 0.0)
+        d.penalty_range = defs.get("penalty_range", 1024)
+        d.min_p = defs.get("min_p", 0.08)
+        d.top_k = defs.get("top_k", 0)
+        d.top_p = defs.get("top_p", 1.0)
+        d.adaptive_target = defs.get("adaptive_target", 1.0)
+        d.adaptive_decay = defs.get("adaptive_decay", 0.9)
+        parser.add_argument("-temp", "--temperature", type = float, help = f"Sampling temperature (default: {d.temperature:.1f})", default = d.temperature)
+        parser.add_argument("-temp_first", "--temperature_first", action = "store_true", help = "Apply temperature before truncation")
+        parser.add_argument("-repp", "--repetition_penalty", type = float, help = f"Repetition penalty, HF style, 1 to disable (default: {d.repetition_penalty:.1f})", default = d.repetition_penalty)
+        parser.add_argument("-presp", "--presence_penalty", type = float, help = f"Presence penalty, 0 to disable (default: {d.presence_penalty:.1f})", default = d.presence_penalty)
+        parser.add_argument("-freqp", "--frequency_penalty", type = float, help = f"Frequency penalty, 0 to disable (default: {d.frequency_penalty:.1f})", default = d.frequency_penalty)
+        parser.add_argument("-penr", "--penalty_range", type = int, help = f"Range for penalties, in tokens (default: {d.penalty_range})", default = d.penalty_range)
+        parser.add_argument("-minp", "--min_p", type = float, help = f"Min-P truncation, 0 to disable (default: {d.min_p:.2f})", default = d.min_p)
+        parser.add_argument("-topk", "--top_k", type = int, help = f"Top-K truncation, 0 to disable (default: {d.top_k})", default = d.top_k)
+        parser.add_argument("-topp", "--top_p", type = float, help = f"Top-P truncation, 1 to disable (default: {d.top_p:.2f})", default = d.top_p)
+        parser.add_argument("-adaptive_target", "--adaptive_target", type = float, help = f"Adaptive-P target, 1 to disable (default: {d.adaptive_target:.2f})", default = d.adaptive_target)
+        parser.add_argument("-adaptive_decay", "--adaptive_decay", type = float, help = f"Adaptive-P decay, if Adaptive-P enabled (default: {d.adaptive_decay:.2f})", default = d.adaptive_decay)
+
+    if cache:
+        parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
+        parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
+        parser.add_argument("-cca", "--cache_compand_a", type = float, help = "Compand a value for simulated cache, default: 0.0", default = 0.0)
+        parser.add_argument("-ccs", "--cpu_cache_size", type = float, help = f"CPU second-tier cache size, in GB, default: {default_cpu_cache_size}", default = default_cpu_cache_size)
+        parser.add_argument("-rcs", "--recurrent_cache_size", type = float, help = f"CPU second-tier cache size, in GB, default: {default_recurrent_cache_size}", default = default_recurrent_cache_size)
+
+    if add_draft_model_args:
+        parser.add_argument("-dm", "--draft_model_dir", type = str, help = "Path to draft model directory", default = None)
+        parser.add_argument("-ndt", "--num_draft_tokens", type = int, help = "Number of draft tokens (default: draft model default, else 4)", default = None)
+        parser.add_argument("-mtp", "--mtp", action = "store_true", help = "Use MTP drafting")
+        parser.add_argument("-ngram", "--ngram_match_min", type = int, help = "N-gram draft minimum match length, default = 0 (disabled)", default = 0)
+        parser.add_argument("-dds", "--dynamic_draft", action = "store_true", help = "Dynamically adapt draft length to acceptance rate (num_draft_tokens acts as ceiling)")
+        parser.add_argument("-dc", "--draft_confidence", type = float, help = "Confidence target for dynamic draft truncation, default: 0.4", default = 0.4)
+        parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = int, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head)", default = 0)
+
+
+def get_arg_sampler(args):
+    """
+    Create CompoSampler from default args above
+
+    :param args:
+        args from ArgumentParser
+
+    :return:
+        ComboSampler
+    """
+    return ComboSampler(
+        rep_p = args.repetition_penalty,
+        pres_p = args.presence_penalty,
+        freq_p = args.frequency_penalty,
+        rep_sustain_range = args.penalty_range,
+        rep_decay_range = args.penalty_range,
+        temperature = args.temperature,
+        min_p = args.min_p,
+        top_k = args.top_k,
+        top_p = args.top_p,
+        temp_last = not args.temperature_first,
+        adaptive_target = args.adaptive_target,
+        adaptive_decay = args.adaptive_decay,
+    )
+
+
+def init(
+    args,
+    load_tokenizer: bool = True,
+    quiet: bool = False,
+    progress: bool = True,
+    override_dynamic_seq_len: int | None = None,
+    min_draft_len: int = None,
+    **kwargs
+):
+    """
+    Create
+
+    :param args:
+        argparse.Namespace returned by parse_args()
+
+    :param load_tokenizer:
+        bool, also load tokenizer
+
+    :param quiet:
+        bool, no console output
+
+    :param progress:
+        bool, show rich progress bar while loading
+
+    :param override_dynamic_seq_len:
+        (optional) Some models (Like Phi4) have two RoPE modes and adjust their positional embeddings depending on
+        sequence length. This argument sets the expected max context length to help select the right mode at load time.
+        Mostly relevant if you know ahead of time that you're going to use a long-context model with a short context.
+
+    :param min_draft_len:
+        Minimum draft length, even if no draft model is given (for ngram etc.)
+
+    :param kwargs:
+        Additional parameters to forwart to Model.load()
+
+    :return:
+        tuple of (Model, Config, Cache | None, Tokenizer | None)  or
+        tuple of (Model, Config, Cache | None, Tokenizer | None, Model, Config, Cache | None) if draft model args enabled
+    """
+
+    def printp(p: bool, s: str):
+        if p: print(s)
+
+    return_draft = "draft_model_dir" in args
+    draft_model_dir = args.draft_model_dir if return_draft else None
+    if "mtp" in args:
+        assert not (args.mtp and draft_model_dir), "Cannot specify both --mtp and --draft_model_dir"
+        if args.mtp:
+            args.draft_model_dir = draft_model_dir = args.model_dir
+        use_mtp = draft_model_dir and Path(args.model_dir).resolve() == Path(draft_model_dir).resolve()
+    else:
+        use_mtp = False
+
+    # Config
+    config = Config.from_directory(args.model_dir, layer_map = args.layer_map)
+    if getattr(args, "moe_cpu_offload", 0):
+        assert not args.tensor_parallel, "--moe_cpu_offload currently requires layer-split mode"
+        config.infer_params.moe_cpu_offload = args.moe_cpu_offload
+    if getattr(args, "moe_cpu_split", 0):
+        assert not args.tensor_parallel, "--moe_cpu_split currently requires layer-split mode"
+        assert not getattr(args, "moe_cpu_offload", 0), "--moe_cpu_split and --moe_cpu_offload are mutually exclusive"
+        config.infer_params.moe_cpu_split = args.moe_cpu_split
+    if getattr(args, "moe_cpu_threads", None) is not None:
+        config.infer_params.moe_cpu_threads = args.moe_cpu_threads
+    if override_dynamic_seq_len: config.override_dynamic_seq_len(override_dynamic_seq_len)
+    dmcl = getattr(args, "draft_moe_cpu_layers", 0)
+    dmclt = getattr(args, "moe_cpu_threads", None)
+    if dmcl:
+        assert not args.tensor_parallel, "--draft_moe_cpu_layers currently requires layer-split mode"
+        assert draft_model_dir, "--draft_moe_cpu_layers requires a draft model (or --mtp)"
+    if use_mtp:
+        draft_config = config
+        # Shared config: the MTP head is a separate component with its own budget and worker
+        config.infer_params.draft_moe_cpu_offload = dmcl
+        if dmclt is not None:
+            config.infer_params.draft_moe_cpu_threads = dmclt
+    elif draft_model_dir:
+        draft_config = Config.from_directory(draft_model_dir)
+        # Separate config: the draft model's own text component takes the budget
+        draft_config.infer_params.moe_cpu_offload = dmcl
+        if dmclt is not None:
+            draft_config.infer_params.moe_cpu_threads = dmclt
+    else:
+        draft_config = None
+
+    # Override tensors
+    if args.override:
+        assert not draft_model_dir, "Tensor overrides not supported when loading with draft model"
+        with open(args.override, "r") as f:
+            comp = yaml.safe_load(f)
+        sources = {s["id"]: s["model_dir"] for s in comp["sources"]}
+        overrides = {o["key"]: sources[o["source"]] for o in comp["overrides"]}
+        collections = {}
+        for o_key, o_dir in overrides.items():
+            if o_dir not in collections:
+                collections[o_dir] = []
+            collections[o_dir].append(o_key)
+        if len(collections):
+            vstc = VariantSafetensorsCollection(config.stc)
+            for o_dir, o_keys in collections.items():
+                printp(not quiet, f" -- Overriding from: {o_dir}:")
+                for o_key in o_keys:
+                    printp(not quiet, f"      {o_key}")
+                vstc.add_stc(o_keys, SafetensorsCollection(o_dir))
+            config.stc = vstc
+
+    # Model instance
+    model = Model.from_config(config, swa_full = args.swa_full)
+    draft_model = Model.from_config(
+        draft_config,
+        swa_full = args.swa_full,
+        component = "mtp" if use_mtp else "text",
+    ) if draft_model_dir else None
+
+    # Cache
+    max_history = max(
+        min_draft_len or 0,
+        draft_model.caps.get("default_draft_size", 4) if draft_model else 0,
+        vars(args).get("num_draft_tokens") or 0,
+        4 if (vars(args).get("ngram_match_min") and not vars(args).get("num_draft_tokens")) else 0,
+    )
+    if "cache_size" in vars(args):
+        if args.cache_quant in ("fp8", "nvfp4"):
+            # Float KV formats (MiaAI-Lab exllamav3 fork, ported to v1.4.4):
+            #   fp8   - raw E4M3 per element, no scales (8 bits/elem)
+            #   nvfp4 - E2M1 elements + one E4M3 scale per 16 (4.5 bits/elem)
+            # Both are read by the Triton paged kernels with online dequant. The MTP /
+            # draft cache keeps upstream's integer path (int8 K / int4 V), which the
+            # speculative-decoding code has been validated against.
+            fmt_layer = CacheLayer_fp8 if args.cache_quant == "fp8" else CacheLayer_nvfp4
+            cache = Cache(
+                model,
+                max_num_tokens = args.cache_size,
+                layer_type = fmt_layer,
+                max_history = max_history,
+                max_batch_size = args.autosplit_max_batch_size,
+            )
+            draft_cache = Cache(
+                draft_model,
+                max_num_tokens = args.cache_size,
+                layer_type = CacheLayer_quant,
+                k_bits = 8,
+                v_bits = 4
+            ) if draft_model_dir else None
+        elif args.cache_quant is not None:
+            split = [int(bits) for bits in args.cache_quant.split(",")]
+            if len(split) == 1:
+                k_bits = v_bits = split[0]
+            elif len(split) == 2:
+                k_bits, v_bits = tuple(split)
+            else:
+                raise ValueError("Specify either one or two bitrates for cache quantization")
+            cache = Cache(
+                model,
+                max_num_tokens = args.cache_size,
+                layer_type = CacheLayer_quant,
+                k_bits = k_bits,
+                v_bits = v_bits,
+                compand_a = args.cache_compand_a,
+                max_history = max_history,
+                max_batch_size = args.autosplit_max_batch_size,
+            )
+            draft_cache = Cache(
+                draft_model,
+                max_num_tokens = args.cache_size,
+                layer_type = CacheLayer_quant,
+                k_bits = k_bits,
+                v_bits = v_bits
+            ) if draft_model_dir else None
+        else:
+            cache = Cache(
+                model,
+                max_num_tokens = args.cache_size,
+                layer_type = CacheLayer_fp16,
+                max_history = max_history,
+                max_batch_size = args.autosplit_max_batch_size,
+            )
+            draft_cache = Cache(
+                draft_model,
+                max_num_tokens = args.cache_size,
+                layer_type = CacheLayer_fp16
+            ) if draft_model_dir else None
+    else:
+        cache = None
+        draft_cache = None
+
+    # Split
+    if args.gpu_split is None or args.gpu_split == "auto":
+        split = None
+    else:
+        split = [float(alloc) for alloc in args.gpu_split.split(",")]
+
+    # Parallelism options
+    tp_options = {
+        "moe_tensor_split": args.tp_moe_tensor_split
+    }
+
+    # Parallelism limits
+    tp_dev_limits = {}
+    for key, arg_name in [
+        ("attn", "tp_max_parallelism_attn"),
+        ("mlp", "tp_max_parallelism_mlp"),
+        ("moe", "tp_max_parallelism_moe"),
+        ("linear", "tp_max_parallelism_linear"),
+        ("linear_attn", "tp_max_parallelism_linear_attn"),
+    ]:
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            tp_dev_limits[key] = value
+    if len(tp_dev_limits) and not args.tensor_parallel:
+        printp(not quiet, " !! Warning, parallelism are do not applied to layer-split model")
+
+    # Load draft model
+    if draft_model_dir:
+        printp(not quiet, f" -- Loading {draft_model_dir}")
+        draft_model.load(
+            use_per_device = split,
+            progressbar = progress,
+            verbose = args.load_verbose,
+            max_batch_size = args.autosplit_max_batch_size,
+            autosplit_no_forward = args.autosplit_no_forward,
+            **kwargs
+        )
+
+    # Load model
+    printp(not quiet, f" -- Loading {args.model_dir}")
+    model.load(
+        use_per_device = split,
+        tensor_p = args.tensor_parallel,
+        progressbar = progress,
+        tp_dev_limits = tp_dev_limits,
+        tp_backend = args.tp_backend,
+        verbose = args.load_verbose,
+        tp_options = tp_options,
+        max_batch_size = args.autosplit_max_batch_size,
+        autosplit_no_forward = args.autosplit_no_forward,
+        **kwargs
+    )
+
+    # Load tokenizer
+    if load_tokenizer:
+        printp(not quiet, f" -- Loading tokenizer...")
+        tokenizer = Tokenizer.from_config(config)
+    else:
+        tokenizer = None
+
+    # Metrics
+    if args.load_metrics:
+        config.stc.metrics.print()
+
+    if return_draft:
+        return model, config, cache, tokenizer, draft_model, draft_config, draft_cache
+    else:
+        return model, config, cache, tokenizer

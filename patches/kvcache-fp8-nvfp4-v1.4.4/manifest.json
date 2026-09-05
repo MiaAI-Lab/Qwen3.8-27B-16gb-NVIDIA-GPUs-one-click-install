@@ -1,0 +1,38 @@
+{
+  "engine_version": "1.4.4",
+  "files": {
+    "exllamav3/cache/__init__.py": {
+      "patched_sha256": "3cf509c8d7831f2791c3f4cf98fdb557cff956bed20c80758a583dbb53d2fc25",
+      "kind": "modified",
+      "stock_sha256": "9d727dbf9ba1584d5652c02395245df84ef84f5986bd67f96f027768c0f0ec86"
+    },
+    "exllamav3/model_init.py": {
+      "patched_sha256": "cb81ad43fda0f139ef7f9023f6561f8c1105bc83b069d7e77c2da6472db885b7",
+      "kind": "modified",
+      "stock_sha256": "0c573243228c525619ac2d1230eee75369df04f7cd5b93f18cbefe5cf93f3f84"
+    },
+    "exllamav3/modules/attention_fn/common.py": {
+      "patched_sha256": "5f980c80a0c2e5879d7016777bd12190cec17ee74e4756474aecc5887647a398",
+      "kind": "modified",
+      "stock_sha256": "7da2ba93613cc8a2455847a2910cb565388ffc09c7ede218436cd97b36324180"
+    },
+    "exllamav3/modules/attention_fn/dispatch.py": {
+      "patched_sha256": "58a84ff9c09e93b2ece46bdf33a872252f9adf70eb90dcdf3d60dc3aaff299de",
+      "kind": "modified",
+      "stock_sha256": "6b3eea73060d7795b7e96c3c8aad30ed78dd3962b6afb5493a7f6644228cfb27"
+    },
+    "exllamav3/modules/attention_fn/triton_paged.py": {
+      "patched_sha256": "cbfb08c9b79d93b4b18a6443e175d4149356d3f69df3044e04e0b24e45e6cddb",
+      "kind": "modified",
+      "stock_sha256": "7e40f1a504054d348931fbdc84ab828ba168c0dba15dcb0404f843f253d0fac4"
+    },
+    "exllamav3/cache/fp8.py": {
+      "patched_sha256": "c4f2d24e3aa4a754c489e3799baec9f47bf4fbd94b07610b60bc546f69155c7a",
+      "kind": "added"
+    },
+    "exllamav3/cache/nvfp4.py": {
+      "patched_sha256": "c26e9403decd2cdd87d3558ec6cb1f7a9f0b43074c4e17996d36c3764b3c5d71",
+      "kind": "added"
+    }
+  }
+}

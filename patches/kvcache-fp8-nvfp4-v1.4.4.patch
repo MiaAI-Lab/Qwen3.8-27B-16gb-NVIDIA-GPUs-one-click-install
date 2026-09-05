@@ -1,0 +1,1116 @@
+diff --git a/exllamav3/cache/__init__.py b/exllamav3/cache/__init__.py
+index 5d42ae1..22f338a 100644
+--- a/exllamav3/cache/__init__.py
++++ b/exllamav3/cache/__init__.py
+@@ -1,5 +1,7 @@
+ from .cache import Cache, CacheLayer
+ from .fp16 import CacheLayer_fp16
++from .fp8 import CacheLayer_fp8
++from .nvfp4 import CacheLayer_nvfp4
+ from .quant import CacheLayer_quant
+ from .mla import CacheLayer_MLA_fp16, CacheLayer_MLA_quant
+ from .dsa import CacheLayer_dsa
+diff --git a/exllamav3/cache/fp8.py b/exllamav3/cache/fp8.py
+new file mode 100644
+index 0000000..fcbcde4
+--- /dev/null
++++ b/exllamav3/cache/fp8.py
+@@ -0,0 +1,140 @@
++from __future__ import annotations
++from typing_extensions import override
++import torch
++from ..constants import PAGE_SIZE
++from .cache import CacheLayer
++from typing import TYPE_CHECKING
++if TYPE_CHECKING:
++    from ..modules import Attention
++    from ..model import Model, Config
++import numpy as np
++
++class CacheLayer_fp8(CacheLayer):
++    """KV cache stored as raw FP8 E4M3 (the NVFP4 recipe's KV format), no scales.
++
++    K/V are bounded post-projection for the architectures this targets (k post-k_norm,
++    v post-hidden_norm etc.), so no per-group scales are needed; E4M3 covers the range
++    directly. Reads take the Triton online-dequant path (k/v tiles are cast to fp16
++    inside the attention kernels); the generic get_kv returns dequantized fp16 tensors
++    for non-Triton backends and diagnostics.
++    """
++
++    def __init__(
++        self,
++        config: Config | None,
++        attention: Attention,
++        cache_id: int,
++        max_num_tokens: int,
++        **kwargs,   # accept k_bits/v_bits/compand_a for Cache(**layer_kwargs) compatibility
++    ):
++        super().__init__(config, attention, cache_id, max_num_tokens)
++
++        assert max_num_tokens % PAGE_SIZE == 0, \
++            f"max_num_tokens must be a multiple of {PAGE_SIZE}."
++
++        self.shape = (
++            (max_num_tokens // PAGE_SIZE, PAGE_SIZE, attention.num_kv_heads, attention.head_dim)
++            if attention else None
++        )
++        self.k = None
++        self.v = None
++        self.device = None
++
++
++    @override
++    def alloc(self, device: torch.device):
++        self.device = device
++        self.k = torch.zeros(self.shape, dtype = torch.float8_e4m3fn, device = device) if self.shape else None
++        self.v = torch.zeros(self.shape, dtype = torch.float8_e4m3fn, device = device) if self.shape else None
++
++
++    @override
++    def free(self):
++        self.device = None
++        self.k = None
++        self.v = None
++
++
++    @override
++    def get_qkv(self):
++        # Not a packed-int quant layer; the fp8 fast path is selected by layer type in the
++        # attention dispatch, not through this interface
++        return None
++
++
++    def get_paged(self) -> tuple:
++        """Raw paged fp8 tensors for the Triton fp8 attention path."""
++        return self.k, self.v
++
++
++    @override
++    def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor, sliding_window: int = -1) -> tuple:
++        return self.k, self.v
++
++
++    @override
++    def update_kv(
++        self,
++        cache_seqlens: torch.Tensor,
++        block_table: torch.Tensor,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        length: int
++    ):
++        # Torch scatter-cast write. Used by the dispatch post-hook on the fallback path
++        # (non-Triton backends attend over dequantized copies and never touch the fp8
++        # pages); on the Triton fast path new K/V are appended in-kernel instead and this
++        # is not called
++        bsz = k.shape[0]
++        for b in range(bsz):
++            pos = int(cache_seqlens[b])
++            rows = torch.arange(pos, pos + length, device = k.device)
++            page_idx = rows // PAGE_SIZE
++            page_off = rows - page_idx * PAGE_SIZE
++            phys = block_table[b].index_select(0, page_idx)
++            self.k[phys, page_off] = k[b, : length].to(torch.float8_e4m3fn)
++            self.v[phys, page_off] = v[b, : length].to(torch.float8_e4m3fn)
++
++    @override
++    def update_kv_direct(
++        self,
++        cache_seqlens: torch.Tensor,
++        block_table: torch.Tensor,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        length: int
++    ):
++        self.update_kv(cache_seqlens, block_table, k, v, length)
++
++
++    @override
++    def copy_page(self, source: CacheLayer_fp8, from_page: int, to_page: int, num_tokens: int):
++        assert self.shape == source.shape
++        self.k[to_page, :num_tokens, :, :].copy_(source.k[from_page, :num_tokens, :, :], non_blocking = True)
++        self.v[to_page, :num_tokens, :, :].copy_(source.v[from_page, :num_tokens, :, :], non_blocking = True)
++
++
++    @override
++    def get_tensors(self):
++        return [self.k, self.v]
++
++
++    @override
++    def storage_size(self):
++        return 2 * np.prod(self.shape) * 1
++
++
++    @override
++    def overhead_size(self):
++        return 0
++
++
++    @override
++    def tp_export(self, plan):
++        return {
++            "cls": CacheLayer_fp8,
++            "args": {
++                "cache_id": self.cache_id,
++                "max_num_tokens": self.max_num_tokens
++            }
++        }
+diff --git a/exllamav3/cache/nvfp4.py b/exllamav3/cache/nvfp4.py
+new file mode 100644
+index 0000000..4f54839
+--- /dev/null
++++ b/exllamav3/cache/nvfp4.py
+@@ -0,0 +1,204 @@
++from __future__ import annotations
++from typing_extensions import override
++import torch
++from ..constants import PAGE_SIZE
++from .cache import CacheLayer
++from typing import TYPE_CHECKING
++if TYPE_CHECKING:
++    from ..modules import Attention
++    from ..model import Model, Config
++import numpy as np
++
++# NVFP4 element format: E2M1 (1 sign, 2 exp, 1 mantissa), 16 levels
++#   code: [s | 2 exp bits | 1 mantissa bit]; positive magnitudes by idx (code & 7):
++#   0:0  1:0.5  2:1  3:1.5  4:2  5:3  6:4  7:6
++# Block scale: one E4M3 per 16 elements = amax/6 (clamped to E4M3 range). Two 4-bit
++# codes per uint8 byte, low nibble = even element index (matches the RadixArk NVFP4
++# checkpoint layout verified empirically during the M0.4 dequant work).
++
++_E2M1_BOUNDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)   # nearest-level boundaries
++
++
++def nvfp4_quantize(x: torch.Tensor):
++    """fp16/bf16 [..., G] with G % 16 == 0 -> (packed uint8 [..., G//2], scales e4m3 [..., G//16])"""
++    x = x.half()
++    g = x.shape[-1]
++    xg = x.reshape(*x.shape[:-1], g // 16, 16)
++    amax = xg.abs().amax(dim = -1, keepdim = True)
++    scale = (amax / 6.0).clamp(max = 448.0).to(torch.float8_e4m3fn)
++    sc = scale.half()                                     # decoded scale
++    t = (xg / torch.where(sc == 0, torch.ones_like(sc), sc)).abs().clamp(max = 6.0)
++    idx = torch.zeros_like(t, dtype = torch.uint8)
++    for b in _E2M1_BOUNDS:
++        idx += (t > b).to(torch.uint8)
++    codes = idx | ((xg < 0).to(torch.uint8) << 3)
++    codes = codes.reshape(*x.shape[:-1], g)
++    packed = codes[..., 0::2] | (codes[..., 1::2] << 4)
++    return packed.contiguous(), scale.squeeze(-1).contiguous()
++
++
++def nvfp4_dequantize(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
++    """Inverse of nvfp4_quantize -> fp16 [..., G]"""
++    codes_lo = (packed & 0xF).to(torch.uint8)
++    codes_hi = (packed >> 4).to(torch.uint8)
++    codes = torch.stack((codes_lo, codes_hi), dim = -1).flatten(-2)
++    idx = codes & 7
++    sgn = (codes >> 3).half()
++    t = idx.half()
++    mag = torch.zeros_like(t)
++    for i, v in enumerate((0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)):
++        mag += torch.where(idx == i + 1, torch.full_like(t, v), torch.zeros_like(t))
++    g = codes.shape[-1]
++    sc = scales.half().repeat_interleave(16, dim = -1)   # [.., G/16] -> [.., G]
++    val = mag * torch.where(sgn > 0, torch.full_like(mag, -1.0), torch.ones_like(mag))
++    return (val * sc).contiguous()
++
++
++class CacheLayer_nvfp4(CacheLayer):
++    """KV cache stored in the NVFP4 format: E2M1 elements + E4M3 block scales (16 elems/
++    block), 4.5 bits per element. Reads take the Triton online-dequant path; the generic
++    get_kv returns dequantized fp16 tensors for non-Triton backends and diagnostics."""
++
++    def __init__(
++        self,
++        config: Config | None,
++        attention: Attention,
++        cache_id: int,
++        max_num_tokens: int,
++        **kwargs,   # accept k_bits/v_bits/compand_a for Cache(**layer_kwargs) compatibility
++    ):
++        super().__init__(config, attention, cache_id, max_num_tokens)
++
++        assert max_num_tokens % PAGE_SIZE == 0, \
++            f"max_num_tokens must be a multiple of {PAGE_SIZE}."
++        assert attention is None or attention.head_dim % 32 == 0, \
++            "NVFP4 cache requires head_dim % 32 == 0 (byte and block alignment)"
++
++        if attention:
++            pages = max_num_tokens // PAGE_SIZE
++            h, d = attention.num_kv_heads, attention.head_dim
++            self.shape4 = (pages, PAGE_SIZE, h, d // 2)
++            self.shape_s = (pages, PAGE_SIZE, h, d // 16)
++        else:
++            self.shape4 = None
++            self.shape_s = None
++        self.shape = None
++        self.k = None
++        self.v = None
++        self.ks = None
++        self.vs = None
++        self.device = None
++
++
++    @override
++    def alloc(self, device: torch.device):
++        self.device = device
++        self.k = torch.zeros(self.shape4, dtype = torch.uint8, device = device) if self.shape4 else None
++        self.v = torch.zeros(self.shape4, dtype = torch.uint8, device = device) if self.shape4 else None
++        self.ks = torch.zeros(self.shape_s, dtype = torch.float8_e4m3fn, device = device) if self.shape_s else None
++        self.vs = torch.zeros(self.shape_s, dtype = torch.float8_e4m3fn, device = device) if self.shape_s else None
++
++
++    @override
++    def free(self):
++        self.device = None
++        self.k = self.v = self.ks = self.vs = None
++
++
++    @override
++    def get_qkv(self):
++        return None    # not a packed-int quant layer
++
++
++    def get_paged(self) -> tuple:
++        """(k4, k_scales, v4, v_scales) for the Triton online-dequant path."""
++        return self.k, self.ks, self.v, self.vs
++
++
++    @override
++    def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor, sliding_window: int = -1) -> tuple:
++        # Raw tensors are uint8; only meaningful to callers that know the format. The
++        # attention dispatch dequantizes when handing pages to generic backends.
++        return self.k, self.v
++
++
++    def dequant_full(self) -> tuple:
++        k = nvfp4_dequantize(self.k.int(), self.ks.half()) if self.k is not None else None
++        v = nvfp4_dequantize(self.v.int(), self.vs.half()) if self.v is not None else None
++        return k, v
++
++
++    @override
++    def update_kv(
++        self,
++        cache_seqlens: torch.Tensor,
++        block_table: torch.Tensor,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        length: int
++    ):
++        # Torch quantize + scatter (fallback path and pre-write callers). The Triton fast
++        # path quantizes and appends in-kernel instead
++        bsz = k.shape[0]
++        for b in range(bsz):
++            pos = int(cache_seqlens[b])
++            rows = torch.arange(pos, pos + length, device = k.device)
++            page_idx = rows // PAGE_SIZE
++            page_off = rows - page_idx * PAGE_SIZE
++            phys = block_table[b].index_select(0, page_idx)
++            kq, ksc = nvfp4_quantize(k[b, : length])
++            vq, vsc = nvfp4_quantize(v[b, : length])
++            self.k[phys, page_off] = kq
++            self.ks[phys, page_off] = ksc
++            self.v[phys, page_off] = vq
++            self.vs[phys, page_off] = vsc
++
++
++    @override
++    def update_kv_direct(
++        self,
++        cache_seqlens: torch.Tensor,
++        block_table: torch.Tensor,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        length: int
++    ):
++        self.update_kv(cache_seqlens, block_table, k, v, length)
++
++
++    @override
++    def copy_page(self, source: CacheLayer_nvfp4, from_page: int, to_page: int, num_tokens: int):
++        assert self.shape4 == source.shape4
++        self.k[to_page, :num_tokens].copy_(source.k[from_page, :num_tokens], non_blocking = True)
++        self.v[to_page, :num_tokens].copy_(source.v[from_page, :num_tokens], non_blocking = True)
++        self.ks[to_page, :num_tokens].copy_(source.ks[from_page, :num_tokens], non_blocking = True)
++        self.vs[to_page, :num_tokens].copy_(source.vs[from_page, :num_tokens], non_blocking = True)
++
++
++    @override
++    def get_tensors(self):
++        return [self.k, self.v, self.ks, self.vs]
++
++
++    @override
++    def storage_size(self):
++        if not self.shape4:
++            return 0
++        # K and V have identical packed layouts (bytes + one fp8 scale per 16 elems)
++        return (np.prod(self.shape4) + np.prod(self.shape_s)) * 2
++
++
++    @override
++    def overhead_size(self):
++        return 0
++
++
++    @override
++    def tp_export(self, plan):
++        return {
++            "cls": CacheLayer_nvfp4,
++            "args": {
++                "cache_id": self.cache_id,
++                "max_num_tokens": self.max_num_tokens
++            }
++        }
+diff --git a/exllamav3/model_init.py b/exllamav3/model_init.py
+index 34ef04a..2bc281d 100755
+--- a/exllamav3/model_init.py
++++ b/exllamav3/model_init.py
+@@ -2,7 +2,7 @@ from types import SimpleNamespace
+ 
+ from . import Model, Config, Cache, Tokenizer
+ from .loader import SafetensorsCollection, VariantSafetensorsCollection
+-from .cache import CacheLayer_fp16, CacheLayer_quant
++from .cache import CacheLayer_fp16, CacheLayer_quant, CacheLayer_fp8, CacheLayer_nvfp4
+ from .generator.sampler import ComboSampler
+ from argparse import ArgumentParser
+ import yaml
+@@ -264,7 +264,29 @@ def init(
+         4 if (vars(args).get("ngram_match_min") and not vars(args).get("num_draft_tokens")) else 0,
+     )
+     if "cache_size" in vars(args):
+-        if args.cache_quant is not None:
++        if args.cache_quant in ("fp8", "nvfp4"):
++            # Float KV formats (MiaAI-Lab exllamav3 fork, ported to v1.4.4):
++            #   fp8   - raw E4M3 per element, no scales (8 bits/elem)
++            #   nvfp4 - E2M1 elements + one E4M3 scale per 16 (4.5 bits/elem)
++            # Both are read by the Triton paged kernels with online dequant. The MTP /
++            # draft cache keeps upstream's integer path (int8 K / int4 V), which the
++            # speculative-decoding code has been validated against.
++            fmt_layer = CacheLayer_fp8 if args.cache_quant == "fp8" else CacheLayer_nvfp4
++            cache = Cache(
++                model,
++                max_num_tokens = args.cache_size,
++                layer_type = fmt_layer,
++                max_history = max_history,
++                max_batch_size = args.autosplit_max_batch_size,
++            )
++            draft_cache = Cache(
++                draft_model,
++                max_num_tokens = args.cache_size,
++                layer_type = CacheLayer_quant,
++                k_bits = 8,
++                v_bits = 4
++            ) if draft_model_dir else None
++        elif args.cache_quant is not None:
+             split = [int(bits) for bits in args.cache_quant.split(",")]
+             if len(split) == 1:
+                 k_bits = v_bits = split[0]
+diff --git a/exllamav3/modules/attention_fn/common.py b/exllamav3/modules/attention_fn/common.py
+index 401caae..efd5918 100644
+--- a/exllamav3/modules/attention_fn/common.py
++++ b/exllamav3/modules/attention_fn/common.py
+@@ -24,6 +24,8 @@ class AttnArgs(NamedTuple):
+     non_causal_spans: list | None = None
+     q_cache: tuple | None = None    # (qk, sk, qv, sv, k_bits, v_bits): packed quantized cache
+     sinks: torch.Tensor | None = None    # learned per-q-head sink logits (gpt-oss style)
++    k_scales: torch.Tensor | None = None  # NVFP4 cache: E4M3 block scales for k_cache
++    v_scales: torch.Tensor | None = None  # NVFP4 cache: E4M3 block scales for v_cache
+ 
+     def sanity_check(self):
+         # Cache must be paged
+diff --git a/exllamav3/modules/attention_fn/dispatch.py b/exllamav3/modules/attention_fn/dispatch.py
+index 4c567bd..ded8601 100644
+--- a/exllamav3/modules/attention_fn/dispatch.py
++++ b/exllamav3/modules/attention_fn/dispatch.py
+@@ -1,5 +1,5 @@
+ import torch
+-from ...cache import CacheLayer, Cache, CacheLayer_quant
++from ...cache import CacheLayer, Cache, CacheLayer_quant, CacheLayer_fp8, CacheLayer_nvfp4
+ from .common import AttnArgs, AttnFn
+ from .flash_attn_2 import fn_flash_attn_with_kvcache, fn_flash_attn_func, fn_flash_attn_varlen_func, has_fa2
+ from .bighead_scalar import fn_bighead_scalar_attn
+@@ -43,6 +43,14 @@ _fns_qc: list[AttnFn] = [
+     fn_triton_paged_attn_prefill_qc,
+ ]
+ 
++# FP8 (E4M3) cache layers hand their raw paged tensors to the general Triton paged
++# kernels (online fp8->fp16 dequant in-kernel). Other backends only ever see this path
++# through full dequantized fp16 copies, so fp8 calls dispatch over these two only
++_fns_fp8: list[AttnFn] = [
++    fn_triton_paged_attn,
++    fn_triton_paged_attn_longq,
++]
++
+ # Quantized caches feed the attention kernels directly (online dequant or prefill staging by
+ # EXL3_QC_STAGING level, see triton_paged); level 2 restores the dequantize-then-attend path
+ # with full-size fp16 temporaries for A/B testing
+@@ -128,6 +136,9 @@ def attn_dispatch(
+     # kernels when possible: new K/V are quantized into the cache up front and never
+     # materialized as full fp16 cache-sized temporaries
+     q_cache = None
++    fp8_fast = False
++    k_scales = None
++    v_scales = None
+     if cache is not None:
+         assert block_table is not None
+         assert cache_seqlens is not None
+@@ -143,8 +154,40 @@ def attn_dispatch(
+             layer.update_kv_direct(cache_seqlens, block_table, k, v, q_len)
+             q_cache = layer.get_qkv()
+             k_cache, v_cache = None, None
++        elif (
++            has_triton and
++            isinstance(layer, CacheLayer_nvfp4) and
++            layer.k is not None and
++            q.dtype == torch.float16 and
++            cu_seqlens is None
++        ):
++            # NVFP4 path: new K/V are quantized (E2M1 + E4M3 scale/16) and appended in-kernel
++            # by the nvfp4 update kernel; attention reads the packed pages with online dequant
++            k_cache, v_cache = layer.k, layer.v
++            k_scales, v_scales = layer.ks, layer.vs
++            fp8_fast = True
++        elif (
++            has_triton and
++            isinstance(layer, CacheLayer_fp8) and
++            layer.k is not None and
++            q.dtype == torch.float16 and
++            cu_seqlens is None
++        ):
++            # Raw fp8 pages straight into the Triton kernels; new K/V are appended in-kernel
++            # (dtype-aware update kernel), same flow as fp16 caches
++            k_cache, v_cache = layer.k, layer.v
++            fp8_fast = True
+         else:
+             k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, window_size if window_size is not None else -1)
++            if isinstance(layer, CacheLayer_fp8) and k_cache is not None:
++                # No Triton: give the generic backends dequantized fp16 copies. They append
++                # the new K/V into these temporaries; the dispatch post-hook then writes the
++                # fp8 pages for real
++                k_cache = k_cache.to(torch.half)
++                v_cache = v_cache.to(torch.half)
++            elif isinstance(layer, CacheLayer_nvfp4) and k_cache is not None:
++                k_cache, v_cache = layer.dequant_full()
++                # Generous copies; the post-hook re-quantizes the new K/V into the pages
+     else:
+         k_cache, v_cache = None, None
+ 
+@@ -167,12 +210,21 @@ def attn_dispatch(
+         non_causal_spans,
+         q_cache,
+         sinks,
++        k_scales,
++        v_scales,
+     )
+     # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
+     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache
+     # and would accept them as cache-less)
+-    candidates = _fns_qc if q_cache is not None else attn_fns
+-    hint_key = "fn_qc" if q_cache is not None else "fn"
++    if fp8_fast:
++        candidates = _fns_fp8
++        hint_key = "fn_fp8"
++    elif q_cache is not None:
++        candidates = _fns_qc
++        hint_key = "fn_qc"
++    else:
++        candidates = attn_fns
++        hint_key = "fn"
+ 
+     # Retry the backend that matched last time for this caller before scanning the full list.
+     # Candidate functions return None on incompatible arguments, so a stale hint self-corrects
+@@ -191,8 +243,9 @@ def attn_dispatch(
+         if dispatch_cache is not None:
+             dispatch_cache[hint_key] = fn
+ 
+-    # Update cache (quant-direct mode already wrote the new K/V before the attention call)
+-    if cache is not None and q_cache is None:
++    # Update cache (quant-direct and fp8-triton modes already wrote the new K/V before or
++    # during the attention call)
++    if cache is not None and q_cache is None and not fp8_fast:
+         if isinstance(cache, CacheLayer):
+             cache.update_kv(cache_seqlens, block_table, k_cache, v_cache, q_len)
+         elif isinstance(cache, Cache):
+diff --git a/exllamav3/modules/attention_fn/triton_paged.py b/exllamav3/modules/attention_fn/triton_paged.py
+index d1f1f7d..1beb252 100644
+--- a/exllamav3/modules/attention_fn/triton_paged.py
++++ b/exllamav3/modules/attention_fn/triton_paged.py
+@@ -29,6 +29,60 @@ def _is_power_of_2(x: int) -> bool:
+     return x > 0 and (x & (x - 1)) == 0
+ 
+ 
++@triton.jit
++def _nvfp4_encode(x, s16):
++    """fp16 values x [..., head_dim] with per-16 fp16 scales s16 -> packed uint8 bytes [head_dim//2].
++    Mirrors cache.nvfp4.nvfp4_quantize bit-for-bit: fp32 math rounded to fp16 at each torch step,
++    boundary compares on the rounded quotients, sign from x < 0."""
++    head_dim: tl.constexpr = x.shape[-1]
++    sg = tl.reshape(tl.broadcast_to(s16[:, None], (head_dim // 16, 16)), (head_dim,))
++    q = (x.to(tl.float32) / tl.where(sg == 0, 1.0, sg).to(tl.float32)).to(tl.float16)
++    a = tl.minimum(tl.abs(q), 6.0)
++    idx = ((a > 0.25).to(tl.uint8) + (a > 0.75).to(tl.uint8) + (a > 1.25).to(tl.uint8) +
++           (a > 1.75).to(tl.uint8) + (a > 2.5).to(tl.uint8) + (a > 3.5).to(tl.uint8) +
++           (a > 5.0).to(tl.uint8))
++    code = idx | ((x < 0).to(tl.uint8) << 3)
++    lo, hi = tl.split(tl.reshape(code, (head_dim // 2, 2)))
++    return (lo | (hi << 4)).to(tl.uint8)
++
++
++@triton.jit
++def _paged_kv_update_nvfp4_kernel(
++    k, v, k_cache, v_cache, ks_cache, vs_cache,
++    block_table, cache_seqlens,
++    num_pages_per_seq, kv_append_len,
++    n_kv_heads: tl.constexpr, page_size: tl.constexpr, head_dim: tl.constexpr,
++):
++    """Quantize new K/V to NVFP4 (E2M1 + E4M3 scale/16) and append into packed pages.
++    One program per (new token, kv head): full-head amax groups, in-register nibble pack."""
++    pid_t = tl.program_id(0)
++    pid_h = tl.program_id(1)
++    b = pid_t // kv_append_len
++    pos = tl.load(cache_seqlens + b) + (pid_t - b * kv_append_len)
++    phys = tl.load(block_table + b * num_pages_per_seq + pos // page_size)
++    page_off = pos % page_size
++
++    offs = tl.arange(0, head_dim)
++    src_base = ((pid_t * n_kv_heads + pid_h) * head_dim) + offs
++    dst_base = ((phys * page_size + page_off) * n_kv_heads + pid_h)
++    dst_elems = dst_base * (head_dim // 2) + tl.arange(0, head_dim // 2)
++    dst_scales = dst_base * (head_dim // 16) + tl.arange(0, head_dim // 16)
++
++    x = tl.load(k + src_base)                                        # K
++    amax = tl.max(tl.reshape(tl.abs(x), (head_dim // 16, 16)), axis = 1)
++    s16 = tl.minimum((amax.to(tl.float32) / 6.0).to(tl.float16), 448.0)
++    s8 = s16.to(tl.float8e4nv)
++    tl.store(ks_cache + dst_scales, s8)
++    tl.store(k_cache + dst_elems, _nvfp4_encode(x, s8.to(tl.float16)))   # quantize with the *decoded* scale, as nvfp4_quantize does
++
++    x = tl.load(v + src_base)                                        # V
++    amax = tl.max(tl.reshape(tl.abs(x), (head_dim // 16, 16)), axis = 1)
++    s16 = tl.minimum((amax.to(tl.float32) / 6.0).to(tl.float16), 448.0)
++    s8 = s16.to(tl.float8e4nv)
++    tl.store(vs_cache + dst_scales, s8)
++    tl.store(v_cache + dst_elems, _nvfp4_encode(x, s8.to(tl.float16)))
++
++
+ @triton.jit
+ def _paged_kv_update_kernel(
+     k,
+@@ -60,8 +114,8 @@ def _paged_kv_update_kernel(
+     src = (((batch * kv_append_len + t) * n_kv_heads + pid_h) * head_dim + offs_d)
+     dst = (((phys * page_size + page_off) * n_kv_heads + pid_h) * head_dim + offs_d)
+     mask = offs_d < head_dim
+-    tl.store(k_cache + dst, tl.load(k + src, mask=mask, other=0.0), mask=mask)
+-    tl.store(v_cache + dst, tl.load(v + src, mask=mask, other=0.0), mask=mask)
++    tl.store(k_cache + dst, tl.load(k + src, mask=mask, other=0.0).to(k_cache.dtype.element_ty), mask=mask)
++    tl.store(v_cache + dst, tl.load(v + src, mask=mask, other=0.0).to(v_cache.dtype.element_ty), mask=mask)
+ 
+ 
+ @triton.jit
+@@ -73,6 +127,8 @@ def _paged_attn_splitdv_kernel(
+     cache_seqlens,
+     out,
+     sinks,
++    k_scales,             # NVFP4 only (dummy pointer otherwise)
++    v_scales,
+     q_len,               # runtime: only used in masks and address math
+     kv_append_len,       # runtime
+     n_q_heads: tl.constexpr,
+@@ -88,6 +144,7 @@ def _paged_attn_splitdv_kernel(
+     HAS_WINDOW_RIGHT: tl.constexpr,
+     SOFTCAP: tl.constexpr,
+     HAS_SINKS: tl.constexpr,
++    NVFP4: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     BLOCK_DV: tl.constexpr,
+@@ -126,8 +183,14 @@ def _paged_attn_splitdv_kernel(
+             other=0,
+         )
+ 
+-        k_ptrs = k_cache + (((phys[None, :] * page_size + page_off[None, :]) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
+-        k_tile = tl.load(k_ptrs, mask=offs_n[None, :] < total_k_len, other=0.0)
++        if NVFP4:
++            k_tile = _nvfp4_kt_tile(k_cache, k_scales, phys, page_off, offs_n < total_k_len, kv_head,
++                                    n_kv_heads, page_size, head_dim, BLOCK_N)
++        else:
++            k_ptrs = k_cache + (((phys[None, :] * page_size + page_off[None, :]) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
++            k_tile = tl.load(k_ptrs, mask=offs_n[None, :] < total_k_len, other=0.0)
++            if k_cache.dtype.element_ty != q.dtype.element_ty:   # fp8 cache: online dequant
++                k_tile = k_tile.to(q.dtype.element_ty)
+         scores = tl.dot(q_tile, k_tile) * scale
+         if SOFTCAP > 0.0:
+             scores_scaled = scores / SOFTCAP
+@@ -149,12 +212,18 @@ def _paged_attn_splitdv_kernel(
+         alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
+         l_new = l * alpha + tl.sum(p, axis=1)
+ 
+-        v_ptrs = v_cache + (((phys[:, None] * page_size + page_off[:, None]) * n_kv_heads + kv_head) * head_dim + offs_dv[None, :])
+-        v_tile = tl.load(
+-            v_ptrs,
+-            mask=(offs_n[:, None] < total_k_len) & (offs_dv[None, :] < head_dim),
+-            other=0.0,
+-        )
++        if NVFP4:
++            v_tile = _nvfp4_v_tile(v_cache, v_scales, phys, page_off, offs_n < total_k_len, kv_head,
++                                   pid_dv * BLOCK_DV, n_kv_heads, page_size, head_dim, BLOCK_N, BLOCK_DV)
++        else:
++            v_ptrs = v_cache + (((phys[:, None] * page_size + page_off[:, None]) * n_kv_heads + kv_head) * head_dim + offs_dv[None, :])
++            v_tile = tl.load(
++                v_ptrs,
++                mask=(offs_n[:, None] < total_k_len) & (offs_dv[None, :] < head_dim),
++                other=0.0,
++            )
++            if v_cache.dtype.element_ty != q.dtype.element_ty:   # fp8 cache: online dequant
++                v_tile = v_tile.to(q.dtype.element_ty)
+         acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
+         m = m_new
+         l = l_new
+@@ -181,6 +250,8 @@ def _paged_attn_longq_grouped_kernel(
+     cache_seqlens,
+     out,
+     sinks,
++    k_scales,             # NVFP4 only (dummy pointer otherwise)
++    v_scales,
+     q_len,               # runtime: only used in masks and address math
+     kv_append_len,       # runtime
+     n_q_heads: tl.constexpr,
+@@ -196,6 +267,7 @@ def _paged_attn_longq_grouped_kernel(
+     HAS_WINDOW_RIGHT: tl.constexpr,
+     SOFTCAP: tl.constexpr,
+     HAS_SINKS: tl.constexpr,
++    NVFP4: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_ROWS: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+@@ -244,8 +316,14 @@ def _paged_attn_longq_grouped_kernel(
+             other=0,
+         )
+ 
+-        k_ptrs = k_cache + (((phys[None, :] * page_size + page_off[None, :]) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
+-        k_tile = tl.load(k_ptrs, mask=offs_n[None, :] < total_k_len, other=0.0)
++        if NVFP4:
++            k_tile = _nvfp4_kt_tile(k_cache, k_scales, phys, page_off, offs_n < total_k_len, kv_head,
++                                    n_kv_heads, page_size, head_dim, BLOCK_N)
++        else:
++            k_ptrs = k_cache + (((phys[None, :] * page_size + page_off[None, :]) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
++            k_tile = tl.load(k_ptrs, mask=offs_n[None, :] < total_k_len, other=0.0)
++            if k_cache.dtype.element_ty != q.dtype.element_ty:   # fp8 cache: online dequant
++                k_tile = k_tile.to(q.dtype.element_ty)
+         scores = tl.dot(q_tile, k_tile) * scale
+         if SOFTCAP > 0.0:
+             scores_scaled = scores / SOFTCAP
+@@ -267,12 +345,18 @@ def _paged_attn_longq_grouped_kernel(
+         alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
+         l_new = l * alpha + tl.sum(p, axis=1)
+ 
+-        v_ptrs = v_cache + (((phys[:, None] * page_size + page_off[:, None]) * n_kv_heads + kv_head) * head_dim + offs_dv[None, :])
+-        v_tile = tl.load(
+-            v_ptrs,
+-            mask=(offs_n[:, None] < total_k_len) & (offs_dv[None, :] < head_dim),
+-            other=0.0,
+-        )
++        if NVFP4:
++            v_tile = _nvfp4_v_tile(v_cache, v_scales, phys, page_off, offs_n < total_k_len, kv_head,
++                                   pid_dv * BLOCK_DV, n_kv_heads, page_size, head_dim, BLOCK_N, BLOCK_DV)
++        else:
++            v_ptrs = v_cache + (((phys[:, None] * page_size + page_off[:, None]) * n_kv_heads + kv_head) * head_dim + offs_dv[None, :])
++            v_tile = tl.load(
++                v_ptrs,
++                mask=(offs_n[:, None] < total_k_len) & (offs_dv[None, :] < head_dim),
++                other=0.0,
++            )
++            if v_cache.dtype.element_ty != q.dtype.element_ty:   # fp8 cache: online dequant
++                v_tile = v_tile.to(q.dtype.element_ty)
+         acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
+         m = m_new
+         l = l_new
+@@ -302,11 +386,13 @@ def _normalize_window(window_size):
+     return int(window_size[0]), int(window_size[1])
+ 
+ 
+-def _check_tensor(name: str, tensor: torch.Tensor, dtype: torch.dtype | None = torch.float16):
++def _check_tensor(name: str, tensor: torch.Tensor, dtype: torch.dtype | tuple | None = torch.float16):
+     if not tensor.is_cuda:
+         raise ValueError(f"{name} must be a CUDA tensor")
+-    if dtype is not None and tensor.dtype != dtype:
+-        raise ValueError(f"{name} must have dtype {dtype}")
++    if dtype is not None:
++        allowed = dtype if isinstance(dtype, tuple) else (dtype,)
++        if tensor.dtype not in allowed:
++            raise ValueError(f"{name} must have dtype {allowed}")
+     if not tensor.is_contiguous():
+         raise ValueError(f"{name} must be contiguous")
+ 
+@@ -354,19 +440,36 @@ def paged_attn_triton(
+     block_dv: int | None = None,
+     num_warps: int = 8,
+     num_stages: int = 3,
++    k_scales: torch.Tensor | None = None,
++    v_scales: torch.Tensor | None = None,
++    kv_append_len: int | None = None,
+ ) -> torch.Tensor:
+     """Paged KV-cache attention with GQA and optional in-place cache append.
+ 
+     Tensor layouts match flash_attn_with_kvcache for the supported path:
+     q/k/v are [batch, seq, heads, dim], caches are [pages, page_size, kv_heads, dim],
+     block_table is [batch, pages_per_seq], and cache_seqlens is the pre-append length.
++
++    NVFP4 caches: k_cache/v_cache are packed uint8 [pages, page_size, kv_heads, dim/2]
++    with E4M3 block scales passed as k_scales/v_scales; new K/V must be pre-appended
++    by the caller (k = None) with the append length given via kv_append_len.
+     """
+     if not has_triton:
+         raise RuntimeError("paged_attn_triton requires Triton, but Triton is not available")
+ 
+-    _check_tensor("q", q)
+-    _check_tensor("k_cache", k_cache)
+-    _check_tensor("v_cache", v_cache)
++    nvfp4 = k_scales is not None
++    if nvfp4:
++        if v_scales is None:
++            raise ValueError("NVFP4 calls require v_scales")
++        _check_tensor("q", q)
++        _check_tensor("k_cache", k_cache, torch.uint8)
++        _check_tensor("v_cache", v_cache, torch.uint8)
++        _check_tensor("k_scales", k_scales, torch.float8_e4m3fn)
++        _check_tensor("v_scales", v_scales, torch.float8_e4m3fn)
++    else:
++        _check_tensor("q", q)
++        _check_tensor("k_cache", k_cache, (torch.float16, torch.float8_e4m3fn))
++        _check_tensor("v_cache", v_cache, (torch.float16, torch.float8_e4m3fn))
+     _check_tensor("block_table", block_table, None)
+     _check_tensor("cache_seqlens", cache_seqlens, None)
+ 
+@@ -385,7 +488,7 @@ def paged_attn_triton(
+     _, page_size, n_kv_heads, cache_dim = k_cache.shape
+     if v_cache.shape != k_cache.shape:
+         raise ValueError("v_cache must have the same shape as k_cache")
+-    if cache_dim != head_dim:
++    if cache_dim != (head_dim // 2 if nvfp4 else head_dim):
+         raise ValueError("q and cache head dimensions must match")
+     if n_q_heads % n_kv_heads != 0:
+         raise ValueError("n_q_heads must be divisible by n_kv_heads")
+@@ -394,7 +497,7 @@ def paged_attn_triton(
+     if head_dim > 512 or not _is_power_of_2(head_dim):
+         raise ValueError("paged_attn_triton currently supports power-of-two head_dim <= 512")
+ 
+-    kv_append_len = 0
++    kv_append_len = kv_append_len or 0
+     if k is not None or v is not None:
+         if k is None or v is None:
+             raise ValueError("k and v must be provided together")
+@@ -433,24 +536,33 @@ def paged_attn_triton(
+ 
+     with torch.cuda.device(q.device):
+         if k is not None and kv_append_len:
+-            update_block_d = triton.next_power_of_2(head_dim)
+-            update_grid = (bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))
+-            _paged_kv_update_kernel[update_grid](
+-                k,
+-                v,
+-                k_cache,
+-                v_cache,
+-                block_table,
+-                cache_seqlens,
+-                num_pages_per_seq,
+-                kv_append_len,
+-                n_kv_heads,
+-                page_size,
+-                head_dim,
+-                update_block_d,
+-                num_warps=2,
+-                num_stages=3,
+-            )
++            if nvfp4:
++                _paged_kv_update_nvfp4_kernel[(bsz * kv_append_len, n_kv_heads)](
++                    k, v, k_cache, v_cache, k_scales, v_scales,
++                    block_table, cache_seqlens,
++                    num_pages_per_seq, kv_append_len,
++                    n_kv_heads, page_size, head_dim,
++                    num_warps = 4,
++                )
++            else:
++                update_block_d = triton.next_power_of_2(head_dim)
++                update_grid = (bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))
++                _paged_kv_update_kernel[update_grid](
++                    k,
++                    v,
++                    k_cache,
++                    v_cache,
++                    block_table,
++                    cache_seqlens,
++                    num_pages_per_seq,
++                    kv_append_len,
++                    n_kv_heads,
++                    page_size,
++                    head_dim,
++                    update_block_d,
++                    num_warps=2,
++                    num_stages=3,
++                )
+ 
+         q_blocks = triton.cdiv(q_len, block_m)
+         attn_grid = (bsz * n_q_heads * q_blocks, triton.cdiv(head_dim, block_dv))
+@@ -462,6 +574,8 @@ def paged_attn_triton(
+             cache_seqlens,
+             out,
+             sinks,
++            k_scales if nvfp4 else q,   # dummy pointer when unused
++            v_scales if nvfp4 else q,
+             q_len,
+             kv_append_len,
+             n_q_heads,
+@@ -477,6 +591,7 @@ def paged_attn_triton(
+             window_right >= 0,
+             float(softcap or 0.0),
+             has_sinks,
++            nvfp4,
+             block_m,
+             block_n,
+             block_dv,
+@@ -506,14 +621,32 @@ def paged_attn_triton_longq(
+     block_dv: int | None = None,
+     num_warps: int = 4,
+     num_stages: int = 1,
++    k_scales: torch.Tensor | None = None,
++    v_scales: torch.Tensor | None = None,
++    kv_append_len: int | None = None,
+ ) -> torch.Tensor:
+-    """Long-query paged attention path that groups GQA sibling Q heads per program."""
++    """Long-query paged attention path that groups GQA sibling Q heads per program.
++
++    NVFP4 caches: k_cache/v_cache are packed uint8 with E4M3 block scales passed as
++    k_scales/v_scales; new K/V must be pre-appended by the caller (k = None) with the
++    append length given via kv_append_len.
++    """
+     if not has_triton:
+         raise RuntimeError("paged_attn_triton_longq requires Triton, but Triton is not available")
+ 
+-    _check_tensor("q", q)
+-    _check_tensor("k_cache", k_cache)
+-    _check_tensor("v_cache", v_cache)
++    nvfp4 = k_scales is not None
++    if nvfp4:
++        if v_scales is None:
++            raise ValueError("NVFP4 calls require v_scales")
++        _check_tensor("k_cache", k_cache, torch.uint8)
++        _check_tensor("v_cache", v_cache, torch.uint8)
++        _check_tensor("k_scales", k_scales, torch.float8_e4m3fn)
++        _check_tensor("v_scales", v_scales, torch.float8_e4m3fn)
++        _check_tensor("q", q)
++    else:
++        _check_tensor("q", q)
++        _check_tensor("k_cache", k_cache, (torch.float16, torch.float8_e4m3fn))
++        _check_tensor("v_cache", v_cache, (torch.float16, torch.float8_e4m3fn))
+     _check_tensor("block_table", block_table, None)
+     _check_tensor("cache_seqlens", cache_seqlens, None)
+ 
+@@ -532,7 +665,7 @@ def paged_attn_triton_longq(
+     _, page_size, n_kv_heads, cache_dim = k_cache.shape
+     if v_cache.shape != k_cache.shape:
+         raise ValueError("v_cache must have the same shape as k_cache")
+-    if cache_dim != head_dim:
++    if cache_dim != (head_dim // 2 if nvfp4 else head_dim):
+         raise ValueError("q and cache head dimensions must match")
+     if n_q_heads % n_kv_heads != 0:
+         raise ValueError("n_q_heads must be divisible by n_kv_heads")
+@@ -541,7 +674,7 @@ def paged_attn_triton_longq(
+     if head_dim > 512 or not _is_power_of_2(head_dim):
+         raise ValueError("paged_attn_triton_longq currently supports power-of-two head_dim <= 512")
+ 
+-    kv_append_len = 0
++    kv_append_len = kv_append_len or 0
+     if k is not None or v is not None:
+         if k is None or v is None:
+             raise ValueError("k and v must be provided together")
+@@ -585,23 +718,32 @@ def paged_attn_triton_longq(
+     num_pages_per_seq = block_table.shape[1]
+     with torch.cuda.device(q.device):
+         if k is not None and kv_append_len:
+-            update_block_d = triton.next_power_of_2(head_dim)
+-            _paged_kv_update_kernel[(bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
+-                k,
+-                v,
+-                k_cache,
+-                v_cache,
+-                block_table,
+-                cache_seqlens,
+-                num_pages_per_seq,
+-                kv_append_len,
+-                n_kv_heads,
+-                page_size,
+-                head_dim,
+-                update_block_d,
+-                num_warps=2,
+-                num_stages=3,
+-            )
++            if nvfp4:
++                _paged_kv_update_nvfp4_kernel[(bsz * kv_append_len, n_kv_heads)](
++                    k, v, k_cache, v_cache, k_scales, v_scales,
++                    block_table, cache_seqlens,
++                    num_pages_per_seq, kv_append_len,
++                    n_kv_heads, page_size, head_dim,
++                    num_warps = 4,
++                )
++            else:
++                update_block_d = triton.next_power_of_2(head_dim)
++                _paged_kv_update_kernel[(bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
++                    k,
++                    v,
++                    k_cache,
++                    v_cache,
++                    block_table,
++                    cache_seqlens,
++                    num_pages_per_seq,
++                    kv_append_len,
++                    n_kv_heads,
++                    page_size,
++                    head_dim,
++                    update_block_d,
++                    num_warps=2,
++                    num_stages=3,
++                )
+ 
+         group_size = n_q_heads // n_kv_heads
+         grid0 = bsz * n_kv_heads * triton.cdiv(q_len, block_m) * triton.cdiv(group_size, block_h)
+@@ -613,6 +755,8 @@ def paged_attn_triton_longq(
+             cache_seqlens,
+             out,
+             sinks,
++            k_scales if nvfp4 else q,   # dummy pointer when unused
++            v_scales if nvfp4 else q,
+             q_len,
+             kv_append_len,
+             n_q_heads,
+@@ -628,6 +772,7 @@ def paged_attn_triton_longq(
+             window_right >= 0,
+             float(softcap or 0.0),
+             has_sinks,
++            nvfp4,
+             block_m,
+             block_rows,
+             block_n,
+@@ -649,9 +794,12 @@ def fn_triton_paged_attn(args: AttnArgs) -> torch.Tensor | None:
+         return None
+ 
+     if args.non_causal_spans:
++        if args.k_scales is not None:
++            return None    # NVFP4 path does not implement non-causal spans
+         arglist = get_non_causal_span_arglist(args)
+         return torch.cat([paged_attn_triton(**a) for a in arglist], dim=1)
+ 
++    kw = {} if args.k is not None else {"kv_append_len": args.kv_len}
+     return paged_attn_triton(
+         q=args.q,
+         k=args.k,
+@@ -665,6 +813,9 @@ def fn_triton_paged_attn(args: AttnArgs) -> torch.Tensor | None:
+         window_size=args.get_window_size(),
+         softcap=args.softcap,
+         sinks=args.sinks,
++        k_scales=args.k_scales,
++        v_scales=args.v_scales,
++        **kw,
+     )
+ 
+ 
+@@ -680,9 +831,12 @@ def fn_triton_paged_attn_longq(args: AttnArgs) -> torch.Tensor | None:
+         return None
+ 
+     if args.non_causal_spans:
++        if args.k_scales is not None:
++            return None    # NVFP4 path does not implement non-causal spans
+         arglist = get_non_causal_span_arglist(args)
+         return torch.cat([paged_attn_triton_longq(**a) for a in arglist], dim=1)
+ 
++    kw = {} if args.k is not None else {"kv_append_len": args.kv_len}
+     return paged_attn_triton_longq(
+         q=args.q,
+         k=args.k,
+@@ -696,6 +850,9 @@ def fn_triton_paged_attn_longq(args: AttnArgs) -> torch.Tensor | None:
+         window_size=args.get_window_size(),
+         softcap=args.softcap,
+         sinks=args.sinks,
++        k_scales=args.k_scales,
++        v_scales=args.v_scales,
++        **kw,
+     )
+ 
+ 
+@@ -724,6 +881,71 @@ _qc_staging = int(os.environ.get("EXL3_QC_STAGING", "1"))
+ # path reads less gmem (short trailing chunks over long contexts, low bitrates)
+ _qc_prefill_two_pass_min_q = int(os.environ.get("EXL3_QC_PF_TWO_PASS_MIN_Q", "256"))
+ 
++# ---- NVFP4 cache format (E2M1 + E4M3 block-16 scales, 4.5 bits/elem) ----------------------
++# Codes: [sign | 2 exp | 1 mantissa]; magnitudes by idx: 0, 0.5, 1, 1.5, 2, 3, 4, 6.
++# Packed two per uint8 byte, low nibble = even element. One E4M3 scale per 16 elements.
++
++@triton.jit
++def _nvfp4_decode(codes, scale):
++    """int32 code tile x fp16 scale tile -> fp16 value tile"""
++    idx = codes & 7
++    sgn = codes >> 3
++    mag = tl.zeros(idx.shape, dtype = tl.float16)
++    mag = tl.where(idx == 1, 0.5, mag)
++    mag = tl.where(idx == 2, 1.0, mag)
++    mag = tl.where(idx == 3, 1.5, mag)
++    mag = tl.where(idx == 4, 2.0, mag)
++    mag = tl.where(idx == 5, 3.0, mag)
++    mag = tl.where(idx == 6, 4.0, mag)
++    mag = tl.where(idx == 7, 6.0, mag)
++    return tl.where(sgn > 0, -mag, mag) * scale
++
++
++@triton.jit
++def _nvfp4_kt_tile(k4, ks, phys, page_off, mask_n, kv_head,
++                   n_kv_heads: tl.constexpr, page_size: tl.constexpr,
++                   head_dim: tl.constexpr, BLOCK_N: tl.constexpr):
++    """(head_dim, BLOCK_N) fp16 K tile from packed NVFP4 pages."""
++    hd2: tl.constexpr = head_dim // 2
++    hds: tl.constexpr = head_dim // 16
++    tok = phys * page_size + page_off                                    # [BLOCK_N]
++    base = tok * n_kv_heads + kv_head                                    # [BLOCK_N]
++    offs_b = tl.arange(0, hd2)
++    b = tl.load(k4 + base[:, None] * hd2 + offs_b[None, :],
++                mask = mask_n[:, None], other = 0)                       # [BLOCK_N, hd2]
++    lo = (b & 15).to(tl.int32)
++    hi = (b >> 4).to(tl.int32)
++    offs_s = tl.arange(0, hds)
++    s = tl.load(ks + base[:, None] * hds + offs_s[None, :], mask = mask_n[:, None])
++    s = tl.where(mask_n[:, None], s.to(tl.float16), 0.0)                # [BLOCK_N, hds]
++    se = tl.reshape(tl.broadcast_to(s[:, :, None], (BLOCK_N, hds, 8)), (BLOCK_N, hd2))
++    vlo = _nvfp4_decode(lo, se)
++    vhi = _nvfp4_decode(hi, se)
++    v = tl.reshape(tl.interleave(vlo, vhi), (BLOCK_N, head_dim))
++    return tl.trans(v)                                                   # [head_dim, BLOCK_N]
++
++
++@triton.jit
++def _nvfp4_v_tile(v4, vs, phys, page_off, mask_n, kv_head, dv0,
++                  n_kv_heads: tl.constexpr, page_size: tl.constexpr,
++                  head_dim: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_DV: tl.constexpr):
++    """(BLOCK_N, BLOCK_DV) fp16 V tile; dv0 (even) is the slice base of this program."""
++    bd2: tl.constexpr = BLOCK_DV // 2
++    tok = phys * page_size + page_off                                    # [BLOCK_N]
++    base = tok * n_kv_heads + kv_head                                    # [BLOCK_N]
++    bcol = dv0 // 2 + tl.arange(0, bd2)                                  # even-aligned pairs
++    b = tl.load(v4 + base[:, None] * (head_dim // 2) + bcol[None, :],
++                mask = mask_n[:, None], other = 0)                       # [BLOCK_N, bd2]
++    lo = (b & 15).to(tl.int32)
++    hi = (b >> 4).to(tl.int32)
++    scol = (dv0 // 2 + tl.arange(0, bd2)) // 8                           # block per even elem
++    s = tl.load(vs + base[:, None] * (head_dim // 16) + scol[None, :], mask = mask_n[:, None])
++    s = tl.where(mask_n[:, None], s.to(tl.float16), 0.0)                # [BLOCK_N, bd2]
++    vlo = _nvfp4_decode(lo, s)
++    vhi = _nvfp4_decode(hi, s)
++    return tl.reshape(tl.interleave(vlo, vhi), (BLOCK_N, BLOCK_DV))
++
++
+ def _get_h32(device):
+     if device not in _h32_cache:
+         h = torch.ones(1, 1, dtype = torch.float32)

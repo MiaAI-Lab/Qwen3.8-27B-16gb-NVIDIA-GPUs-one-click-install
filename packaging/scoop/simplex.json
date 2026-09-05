@@ -1,0 +1,35 @@
+{
+  "version": "1.0.0",
+  "description": "Chat and agent workspace running a local model on your own NVIDIA GPU.",
+  "homepage": "https://github.com/CHANGEME/simplex",
+  "license": "MIT",
+  "notes": [
+    "Simplex needs Python 3.11+ and an NVIDIA GPU with a current driver.",
+    "Run 'simplex' (or start.bat) once to set up: it picks a model size that",
+    "fits the card, installs into its own folder and downloads the weights.",
+    "Weights and the virtualenv live in the persist folder, so they survive updates."
+  ],
+  "suggest": {
+    "Python": "python"
+  },
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/CHANGEME/simplex/releases/download/v1.0.0/Simplex-1.0.0.zip",
+      "hash": "CHANGEME"
+    }
+  },
+  "extract_dir": "simplex",
+  "bin": [["start.bat", "simplex"]],
+  "shortcuts": [["start.bat", "Simplex"]],
+  "persist": ["models", "sessions", "workspace", "logs", ".venv", ".env", "providers.json"],
+  "checkver": {
+    "github": "https://github.com/CHANGEME/simplex"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/CHANGEME/simplex/releases/download/v$version/Simplex-$version.zip"
+      }
+    }
+  }
+}

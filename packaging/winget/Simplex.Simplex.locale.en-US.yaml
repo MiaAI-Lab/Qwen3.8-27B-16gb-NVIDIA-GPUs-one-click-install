@@ -1,0 +1,24 @@
+PackageIdentifier: CHANGEME.Simplex
+PackageVersion: 1.0.0
+PackageLocale: en-US
+Publisher: CHANGEME
+PublisherUrl: https://github.com/CHANGEME
+PackageName: Simplex
+PackageUrl: https://github.com/CHANGEME/simplex
+License: MIT
+ShortDescription: Chat and agent workspace running a local model on your own NVIDIA GPU.
+Description: >-
+  Simplex runs a quantised Qwen3.8-27B on one NVIDIA graphics card and gives it
+  a chat window and an agent mode that can read files, run commands and search
+  the web. Everything stays on the machine: there is no account, no cloud
+  inference and no telemetry. The first run picks a model size that fits the
+  card, installs what it needs into its own folder, and downloads the weights.
+Tags:
+  - ai
+  - llm
+  - local
+  - chat
+  - offline
+  - nvidia
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

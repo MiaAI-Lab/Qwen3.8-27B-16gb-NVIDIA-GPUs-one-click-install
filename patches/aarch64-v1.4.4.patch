@@ -1,0 +1,76 @@
+diff --git a/exllamav3/exllamav3_ext/bindings.cpp b/exllamav3/exllamav3_ext/bindings.cpp
+index 49fb689..d4791a0 100644
+--- a/exllamav3/exllamav3_ext/bindings.cpp
++++ b/exllamav3/exllamav3_ext/bindings.cpp
+@@ -24,8 +24,10 @@
+ #include "quant/exl3_gemm.cuh"
+ #include "quant/exl3_gemv.cuh"
+ #include "quant/exl3_gemv_int8.cuh"
++#if defined(__x86_64__) || defined(_M_X64)
+ #include "cpu/moe_mul1.h"
+ #include "cpu/moe_handoff.h"
++#endif
+ #include "quant/exl3_kernel_map.cuh"
+ #include "quant/util.cuh"
+ #include "quant/exl3_devctx.cuh"
+@@ -113,9 +115,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+     m.def("pg_gather", &pg_gather, "pg_gather");
+     m.def("pg_gather_small", &pg_gather_small, "pg_gather_small");
+     m.def("pg_all_reduce", &pg_all_reduce, "pg_all_reduce");
++#if defined(__x86_64__) || defined(_M_X64)
+     m.def("pg_all_reduce_cpu", &pg_all_reduce_cpu, "pg_all_reduce_cpu");
+     m.def("run_cpu_reduce_jobs", &run_cpu_reduce_jobs, "run_cpu_reduce_jobs");
+     m.def("end_cpu_reduce_jobs", &end_cpu_reduce_jobs, "end_cpu_reduce_jobs");
++#endif
+ 
+     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
+     m.def("test_distribution", &test_distribution, "test_distribution");
+@@ -134,6 +138,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+     m.def("g_get_cc", &g_get_cc, "g_get_cc");
+     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
+     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
++#if defined(__x86_64__) || defined(_M_X64)
+     m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
+     m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");
+     m.def("exl3_moe_cpu_forward", &exl3_moe_cpu_forward, "exl3_moe_cpu_forward",
+@@ -147,7 +152,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+           py::call_guard<py::gil_scoped_release>());
+     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
+     m.def("exl3_moe_cpu_has_avx512_vbmi", &exl3_moe_cpu_has_avx512_vbmi, "exl3_moe_cpu_has_avx512_vbmi");
+-    m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm");
++    #endif
++m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm");
+     m.def("hgemm", &hgemm, "hgemm");
+     m.def("rope", &rope, "rope");
+     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
+diff --git a/setup.py b/setup.py
+index ae33064..1c7298d 100644
+--- a/setup.py
++++ b/setup.py
+@@ -62,6 +62,26 @@ sources = [
+     if file.endswith(('.c', '.cpp', '.cu'))
+ ]
+ 
++# aarch64 port: these sources use x86-only intrinsics (__builtin_cpu_supports,
++# __builtin_ia32_pause, immintrin.h) and cannot build on ARM (e.g. DGX Spark /
++# GB10). They implement CPU GEMV/expert-offload and the x86 CPU tensor-parallel
++# all-reduce; neither is used when inference runs on the GPU.
++_X86_ONLY_SOURCES = [
++    "avx2_target.cpp",
++    "avx512_target.cpp",
++    "cpu/moe_handoff.cu",
++    "cpu/moe_mul1.cpp",
++    "parallel/all_reduce_cpu_avx2.cpp",
++    "parallel/all_reduce_cpu_avx512.cpp",
++    "parallel/all_reduce_cpu.cu",
++]
++if getattr(os.uname(), "machine", "x86_64") not in ("x86_64", "AMD64"):
++    sources = [
++        s_ for s_ in sources
++        if os.path.relpath(s_, sources_dir).replace(os.sep, "/") not in _X86_ONLY_SOURCES
++    ]
++    print(" !! aarch64 build: excluded %d x86-only CPU sources" % len(_X86_ONLY_SOURCES))
++
+ print (sources)
+ 
+ setup_kwargs = (

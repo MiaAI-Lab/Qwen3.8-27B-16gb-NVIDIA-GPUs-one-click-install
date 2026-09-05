@@ -1,0 +1,12 @@
+# winget version manifest. Publish with:
+#   winget validate --manifest packaging\winget
+#   winget install  --manifest packaging\winget        (local test)
+# then open a PR against microsoft/winget-pkgs.
+#
+# Replace every CHANGEME before publishing: the identifier's publisher half
+# must match a domain or GitHub account you control.
+PackageIdentifier: CHANGEME.Simplex
+PackageVersion: 1.0.0
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

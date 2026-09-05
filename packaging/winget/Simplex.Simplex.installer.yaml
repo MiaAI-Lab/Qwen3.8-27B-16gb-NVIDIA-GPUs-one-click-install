@@ -1,0 +1,18 @@
+PackageIdentifier: CHANGEME.Simplex
+PackageVersion: 1.0.0
+MinimumOSVersion: 10.0.19041.0
+InstallerType: inno
+Scope: user
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+UpgradeBehavior: install
+ProductCode: '{8E1C6A4E-6F1B-4C2E-9A7D-5B3F0E2A91C4}_is1'
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/CHANGEME/simplex/releases/download/v1.0.0/Simplex-1.0.0-setup.exe
+    # sha256 of the file above:  Get-FileHash .\dist\Simplex-1.0.0-setup.exe
+    InstallerSha256: CHANGEME0000000000000000000000000000000000000000000000000000000000
+ManifestType: installer
+ManifestVersion: 1.6.0
