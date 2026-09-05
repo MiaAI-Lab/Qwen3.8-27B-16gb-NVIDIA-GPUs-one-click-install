@@ -520,6 +520,49 @@ body.resizing * { cursor: col-resize !important; }
   color: var(--muted); margin: 16px 0 8px;
 }
 .group-label:first-child { margin-top: 0; }
+
+/* A foldable section of the model picker. The sidebar's .group-head is a
+   sticky full-bleed band cancelling that list's padding; this one lives in a
+   modal that scrolls as one piece, so it is the same idea at modal scale -
+   a real heading you can press, not small grey caps floating on the rows. */
+.pick-group + .pick-group { margin-top: 14px; }
+.pick-head {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  padding: 9px 12px; margin-bottom: 10px;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--panel-2); color: var(--text);
+  font-size: calc(11px * var(--text-scale)); font-weight: 700;
+  letter-spacing: .09em; text-transform: uppercase;
+  transition: color var(--fast), background var(--fast),
+              border-color var(--fast);
+}
+.pick-head:hover { background: color-mix(in srgb, var(--accent) 10%, var(--panel-2));
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+.pick-head:focus-visible { outline: none; box-shadow: var(--ring); }
+.pick-head .chev { width: 14px; height: 14px; color: var(--text-2);
+  transition: transform var(--med), color var(--fast); }
+.pick-head:hover .chev { color: var(--accent); }
+.pick-group.closed .pick-head { margin-bottom: 0; }
+.pick-group.closed .pick-head .chev { transform: rotate(-90deg); }
+.pick-head .t { flex: 1 1 auto; min-width: 0; }
+.pick-head .count {
+  flex: none; font-weight: 600; letter-spacing: 0;
+  font-size: calc(10px * var(--text-scale)); color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--panel);
+}
+.pick-head:hover .count { color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+/* 1fr -> 0fr is the only way to animate to a height nobody has measured */
+.pick-rows { display: grid; grid-template-rows: 1fr;
+  transition: grid-template-rows var(--med); }
+.pick-inner { overflow: hidden; min-height: 0; }
+.pick-group.closed .pick-rows { grid-template-rows: 0fr; }
+/* belt and braces for a browser without inert: clipped is not clickable */
+.pick-group.closed .pick-inner { pointer-events: none; }
+/* the last row's own margin is the gap to whatever follows the section */
+.pick-inner > :last-child { margin-bottom: 0; }
 .model-row .act { flex: none; }
 .model-row .badge { white-space: nowrap; }
 
@@ -854,54 +897,98 @@ body.resizing * { cursor: col-resize !important; }
 .think[open] .think-body { animation: reveal var(--med) both; }
 
 /* tool cards -------------------------------------------------------- */
+/* A tool call reads as a sentence - what it did, and to what. The name of the
+   function and a JSON dump of its arguments is a database row; this is the
+   line a person can skim, with everything else folded behind it. */
 .tool {
   margin: 12px 0; border: 1px solid var(--line); border-radius: var(--r-md);
   background: var(--panel); overflow: hidden; box-shadow: var(--shadow-1);
   animation: rise var(--med) both;
 }
 .tool > summary {
-  display: flex; align-items: center; gap: 10px; padding: 10px 13px; list-style: none;
-  font-size: calc(12.5px * var(--text-scale)); transition: background var(--fast);
+  display: flex; align-items: center; gap: 9px; padding: 10px 13px;
+  list-style: none; cursor: pointer;
+  font-size: calc(12.5px * var(--text-scale));
+  transition: background var(--fast);
 }
 .tool > summary:hover { background: var(--panel-2); }
 .tool > summary::-webkit-details-marker { display: none; }
-.tool .name { font-family: var(--mono); font-size: calc(11.5px * var(--text-scale)); color: var(--accent);
-  font-weight: 600; }
-.tool .arg { flex: 1; min-width: 0; color: var(--muted); font-size: calc(11.5px * var(--text-scale));
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool .tool-ico { width: 15px; height: 15px; flex: none; color: var(--text-2); }
+.tool .verb { flex: none; color: var(--text); font-weight: 600; }
+.tool .subject {
+  flex: 1 1 auto; min-width: 0; color: var(--text-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* a path, a command, a URL: things you read left to right, character by
+   character, and would rather not see kerned like prose */
+.tool[data-name="write_file"] .subject,
+.tool[data-name="edit_file"] .subject,
+.tool[data-name="read_file"] .subject,
+.tool[data-name="list_dir"] .subject,
+.tool[data-name="find_files"] .subject,
+.tool[data-name="web_fetch"] .subject { font-family: var(--mono);
+  font-size: calc(11.5px * var(--text-scale)); }
+.tool .meta {
+  flex: none; color: var(--muted); white-space: nowrap;
+  font-size: calc(11px * var(--text-scale)); font-variant-numeric: tabular-nums;
+}
+.tool .chev { width: 14px; height: 14px; flex: none; color: var(--muted);
+  transition: transform var(--med); }
+.tool[open] > summary .chev { transform: rotate(180deg); }
+/* A badge on every row is noise: a call that worked is the ordinary case and
+   says so by saying nothing. Only failure and work in progress get a mark. */
+.tool .state:empty { display: none; }
 .tool .state {
-  font-size: calc(10px * var(--text-scale)); font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+  flex: none;
+  font-size: calc(10px * var(--text-scale)); font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase;
   padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line);
   color: var(--muted); white-space: nowrap;
 }
-.tool .state.run { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+.tool .state.run { color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
   background: color-mix(in srgb, var(--warn) 12%, transparent); }
 .tool .state.run::before {
   content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
   background: currentColor; margin-right: 6px; vertical-align: 1px;
   animation: breathe 1.1s var(--ease) infinite;
 }
-.tool .state.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 38%, transparent);
-  background: color-mix(in srgb, var(--ok) 11%, transparent); }
-.tool .state.err { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+.tool .state.err { color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
   background: color-mix(in srgb, var(--danger) 11%, transparent); }
-/* A call still being written has no arguments to show yet, so it has no
-   disclosure triangle to offer and its count is the only thing moving. */
 .tool.pending { border-style: dashed;
   border-color: color-mix(in srgb, var(--warn) 32%, var(--line)); }
-.tool.pending > summary { cursor: default; }
-.tool.pending > summary:hover { background: none; }
-.tool.pending .arg { font-variant-numeric: tabular-nums; }
+.tool.failed { border-color: color-mix(in srgb, var(--danger) 38%, var(--line)); }
 .tool .io { padding: 0 13px 13px; }
 .tool[open] .io { animation: reveal var(--med) both; }
-.tool .lbl { font-size: calc(10px * var(--text-scale)); text-transform: uppercase; letter-spacing: .07em;
-  color: var(--muted); font-weight: 600; margin: 10px 0 5px; }
+/* A caption, not a heading. RESULT in small caps over every block was the
+   card shouting section names at a person who only wanted to know what
+   happened. */
+.tool .lbl { font-size: calc(11px * var(--text-scale)); color: var(--muted);
+  font-weight: 500; margin: 11px 0 5px; }
 .tool pre {
   margin: 0; padding: 11px 13px; max-height: 320px; overflow: auto;
   white-space: pre-wrap; word-break: break-word; background: var(--panel-2);
-  border: 1px solid var(--line-soft); border-radius: var(--r-sm); font-size: calc(11.5px * var(--text-scale));
-  line-height: 1.55;
+  border: 1px solid var(--line-soft); border-radius: var(--r-sm);
+  font-size: calc(11.5px * var(--text-scale)); line-height: 1.55;
 }
+.tool pre + .lbl { margin-top: 12px; }
+/* The file as it is being written. Taller than a finished block, because
+   watching it is the whole point, and pinned to the tail. */
+.tool .tool-live { max-height: 44vh; scroll-behavior: auto;
+  border-color: color-mix(in srgb, var(--warn) 26%, var(--line-soft)); }
+.tool .tool-text.was { background: color-mix(in srgb, var(--danger) 7%, var(--panel-2));
+  border-color: color-mix(in srgb, var(--danger) 22%, var(--line-soft)); }
+.tool .tool-out { color: var(--text-2); }
+.tool.failed .tool-out { background: color-mix(in srgb, var(--danger) 8%, var(--panel-2));
+  border-color: color-mix(in srgb, var(--danger) 26%, var(--line-soft)); }
+/* the leftovers: named values, one per line, not a JSON object to decode */
+.tool-args { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px;
+  margin: 11px 0 0; font-size: calc(11.5px * var(--text-scale)); }
+.tool-args dt { color: var(--muted); white-space: nowrap; }
+.tool-args dd { margin: 0; color: var(--text-2); font-family: var(--mono);
+  overflow-wrap: anywhere; }
+.tool .plan-list.mini { padding: 4px 0 0; max-height: none; }
 
 /* approvals --------------------------------------------------------- */
 .approval {

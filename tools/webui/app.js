@@ -484,61 +484,272 @@ function contentBlock(container) {
   return node;
 }
 
+/* How each tool introduces itself.
+
+   A card used to be the tool's name over a JSON dump of its arguments and a
+   blob of its output. That is a database row, not a sentence: the person
+   reading it wants to know that a file was written and which one, and only
+   sometimes what went into it. So every tool says what it is doing in words,
+   names the one thing it is doing it to, and keeps the rest folded away.
+
+   `text` is the argument worth reading as text rather than as a value - a
+   file's contents, a command, a script. It is the one that streams. */
+const TOOL_VIEW = {
+  write_file:  { icon: "file", doing: "Writing", done: "Wrote",
+                 subject: (a) => a.path, text: "content" },
+  edit_file:   { icon: "pencil", doing: "Editing", done: "Edited",
+                 subject: (a) => a.path, text: "new_text" },
+  read_file:   { icon: "file", doing: "Reading", done: "Read",
+                 subject: (a) => a.path },
+  list_dir:    { icon: "folder", doing: "Listing", done: "Listed",
+                 subject: (a) => a.path || "the workspace" },
+  find_files:  { icon: "search", doing: "Looking for", done: "Looked for",
+                 subject: (a) => a.pattern },
+  search_text: { icon: "search", doing: "Searching for", done: "Searched for",
+                 subject: (a) => a.query },
+  run_command: { icon: "terminal", doing: "Running", done: "Ran",
+                 subject: (a) => a.description || a.command,
+                 text: "command", mono: true },
+  run_python:  { icon: "terminal", doing: "Running", done: "Ran",
+                 subject: (a) => a.description || "a Python snippet",
+                 text: "code", lang: "python" },
+  job_output:  { icon: "terminal", doing: "Checking", done: "Checked",
+                 subject: (a) => `job ${a.job_id}` },
+  job_kill:    { icon: "stop", doing: "Stopping", done: "Stopped",
+                 subject: (a) => `job ${a.job_id}` },
+  web_search:  { icon: "globe", doing: "Searching the web for",
+                 done: "Searched the web for", subject: (a) => a.query },
+  web_fetch:   { icon: "globe", doing: "Fetching", done: "Fetched",
+                 subject: (a) => a.url },
+  update_plan: { icon: "list", doing: "Updating the plan",
+                 done: "Updated the plan", subject: () => "", plan: true,
+                 // the checklist above already is the result; printing
+                 // "[~] read the config" underneath it says it twice
+                 resultAs: (out) => (out.match(/\((\d+\/\d+) done\)/) || [])[1] },
+  ask_user:    { icon: "ask", doing: "Asking", done: "Asked",
+                 subject: (a) => a.question },
+};
+
+/* A tool nobody taught this UI about still has to read as a sentence. */
+function toolView(name) {
+  return TOOL_VIEW[name] || {
+    icon: "bolt", doing: "Running", done: "Ran",
+    subject: (a) => String(Object.values(a || {})[0] ?? "").slice(0, 160),
+  };
+}
+
+const BYTE_UNITS = ["bytes", "KB", "MB"];
+
+function sizeOf(chars) {
+  let n = chars, unit = 0;
+  while (n >= 1024 && unit < BYTE_UNITS.length - 1) { n /= 1024; unit += 1; }
+  return `${unit ? n.toFixed(1) : Math.round(n)} ${BYTE_UNITS[unit]}`;
+}
+
+/* The card's one line. Everything else about the call is behind the fold. */
+function toolSummary(view, subject, running) {
+  const summary = el("summary");
+  summary.append(icon(view.icon, "tool-ico"),
+                 el("span", "verb", running ? view.doing : view.done));
+  const what = el("span", "subject", subject || "");
+  what.title = subject || "";
+  summary.append(what, el("span", "meta", ""), el("span", "state", ""),
+                 icon("down", "chev"));
+  return summary;
+}
+
+function setToolMeta(card, text) {
+  const meta = card.querySelector(".meta");
+  if (meta) meta.textContent = text || "";
+}
+
+function setToolSubject(card, subject) {
+  const what = card.querySelector(".subject");
+  if (!what || !subject || what.textContent === subject) return;
+  what.textContent = subject;
+  what.title = subject;
+}
+
 /* A call the model is still writing.
 
-   The arguments of a tool call arrive as a stream of fragments and are only
-   complete when the whole reply ends, so a `write_file` carrying a large file
-   used to produce minutes of nothing on screen: the last content token, then
-   silence, then the finished card. This is the card during that gap - the name
-   as soon as it is known, and a character count that climbs. */
+   Tool arguments arrive as one JSON object built a token at a time and are
+   only parseable at the very last brace, so a write_file carrying a whole page
+   used to be minutes of a climbing character count and nothing else. The
+   server decodes the fragment as it goes now, so this shows the file being
+   written, live - open while it happens, and folded away once it lands. */
 function pendingToolCard(container, ev) {
+  const view = toolView(ev.name);
   const card = el("details", "tool pending");
   card.dataset.id = ev.id;
-  const summary = el("summary");
-  summary.append(el("span", "name", ev.name),
-                 el("span", "arg", ""),
-                 el("span", "state run", "writing"));
-  card.append(summary);
-  container.append(card);
-  return card;
-}
-
-function updatePendingToolCard(card, ev) {
-  if (!card) return;
-  card.querySelector(".name").textContent = ev.name;
-  card.querySelector(".arg").textContent =
-    `${ev.chars.toLocaleString()} characters`;
-}
-
-function toolCard(container, call) {
-  // reuse the placeholder if this call was announced while it was streaming,
-  // so the card does not jump or duplicate when the arguments finally land
-  // Not just the one matching this id: a server that sends the call id in a
-  // later fragment than the name announces progress under a provisional id, so
-  // the placeholder can be filed under a different one. Calls are executed one
-  // at a time, so any placeholder still standing here is stale.
-  container.querySelectorAll(".tool.pending").forEach((p) => p.remove());
-  const card = el("details", "tool");
-  card.dataset.id = call.id;
-  const summary = el("summary");
-  summary.append(el("span", "name", call.name), el("span", "arg", call.label || ""),
-                 el("span", "state run", "running"));
+  card.dataset.name = ev.name;
+  card.open = true;
+  const summary = toolSummary(view, "", true);
+  summary.querySelector(".state").className = "state run";
+  summary.querySelector(".state").textContent = "writing";
   const io = el("div", "io");
-  io.append(el("div", "lbl", "arguments"),
-            el("pre", null, JSON.stringify(call.args, null, 2)));
   card.append(summary, io);
   container.append(card);
   return card;
 }
 
+/* Each fragment says which argument it belongs to. The one worth watching gets
+   a live block; a short one - the path, a flag - is the card's subject line,
+   which is why it is worth decoding the arguments in order rather than waiting
+   for the end. */
+function updatePendingToolCard(card, ev) {
+  if (!card) return;
+  const view = toolView(ev.name);
+  const io = card.querySelector(".io");
+  (ev.parts || []).forEach(([field, add]) => {
+    if (!add) return;
+    if (field === view.text || (!view.text && add.length > 80)) {
+      let pre = io.querySelector(`.tool-live[data-field="${CSS.escape(field)}"]`);
+      if (!pre) {
+        pre = el("pre", "tool-live");
+        pre.dataset.field = field;
+        io.append(pre);
+      }
+      pre.append(document.createTextNode(add));
+      // follow the tail, but only while the person has not scrolled up in it
+      if (pre.scrollHeight - pre.scrollTop - pre.clientHeight < 60) {
+        pre.scrollTop = pre.scrollHeight;
+      }
+      return;
+    }
+    // a short scalar: the subject line, or a quiet chip beside it
+    const held = card.dataset[`arg_${field}`] || "";
+    card.dataset[`arg_${field}`] = held + add;
+    const args = {};
+    Object.keys(card.dataset).forEach((k) => {
+      if (k.startsWith("arg_")) args[k.slice(4)] = card.dataset[k];
+    });
+    const subject = view.subject(args);
+    if (subject) setToolSubject(card, subject);
+  });
+  setToolMeta(card, sizeOf(ev.chars));
+}
+
+function toolCard(container, call) {
+  // Reuse the card that was showing this call being written, rather than
+  // dropping it and building a new one: the arguments are the same text, and
+  // replacing the element mid-stream makes the card blink and jump back to the
+  // top of a file the person was reading.
+  // Not only the one matching this id: a server that sends the call id in a
+  // later fragment than the name announces progress under a provisional id, so
+  // the placeholder can be filed under a different one. Calls are executed one
+  // at a time, so any placeholder still standing here belongs to this call.
+  const view = toolView(call.name);
+  const args = call.args || {};
+  const pending = container.querySelector(".tool.pending");
+  const card = pending || el("details", "tool");
+  card.dataset.id = call.id;
+  card.dataset.name = call.name;
+  const subject = view.subject(args) || call.label || "";
+  const summary = toolSummary(view, subject, true);
+  summary.querySelector(".state").className = "state run";
+  summary.querySelector(".state").textContent = "running";
+  const io = el("div", "io");
+  toolDetail(io, view, args);
+  card.classList.remove("pending");
+  card.replaceChildren(summary, io);
+  // The size the person watched climb should still be there at the end.
+  if (view.text && typeof args[view.text] === "string") {
+    setToolMeta(card, sizeOf(args[view.text].length));
+  }
+  if (!pending) container.append(card);
+  return card;
+}
+
+/* What is behind the fold: the text the call is really about, then whatever
+   else it was given - as named values, not as a JSON object the reader has to
+   parse in their head. */
+function toolDetail(io, view, args) {
+  if (view.plan) { io.append(planList(args.todos || [])); return; }
+  const rest = { ...args };
+  if (view.text && typeof rest[view.text] === "string") {
+    const pre = el("pre", view.mono ? "tool-text mono" : "tool-text",
+                   rest[view.text]);
+    io.append(pre);
+    delete rest[view.text];
+  }
+  // edit_file is a before and after; showing only the after is half a story
+  if (typeof rest.old_text === "string") {
+    io.append(el("div", "lbl", "replacing"),
+              el("pre", "tool-text was", rest.old_text));
+    delete rest.old_text;
+  }
+  // Whatever the summary line already says is not worth repeating under it:
+  // a card that reads "Wrote arcanum-vault.html" does not need a row saying
+  // path: arcanum-vault.html.
+  const said = view.subject(args);
+  const keys = Object.keys(rest).filter((k) => rest[k] !== undefined
+                                            && rest[k] !== "" && k !== "description"
+                                            && String(rest[k]) !== said);
+  if (!keys.length) return;
+  const list = el("dl", "tool-args");
+  keys.forEach((k) => {
+    const value = rest[k];
+    list.append(el("dt", null, k.replace(/_/g, " ")),
+                el("dd", null, typeof value === "object"
+                  ? JSON.stringify(value) : String(value)));
+  });
+  io.append(list);
+}
+
+/* The plan, as a checklist. It is a list of things to do - the shape it has in
+   the plan bar at the top - and there is no reading of `{"status":"pending"}`
+   that beats a tick box. */
+function planList(items) {
+  const list = el("ul", "plan-list mini");
+  items.forEach((item) => {
+    const li = el("li", item.status === "completed" ? "done"
+      : item.status === "in_progress" ? "now" : "");
+    const mark = el("span", "mark");
+    if (item.status === "completed") mark.append(icon("check"));
+    if (item.status === "in_progress") mark.append(el("i"));
+    li.append(mark, el("span", null, item.content));
+    list.append(li);
+  });
+  return list;
+}
+
 function finishToolCard(card, ok, output, ms) {
   if (!card) return;
+  const view = toolView(card.dataset.name);
+  const verb = card.querySelector(".verb");
+  if (verb) verb.textContent = view.done;
   const badge = card.querySelector(".state");
-  badge.className = `state ${ok ? "ok" : "err"}`;
-  badge.textContent = ok ? (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : "done") : "failed";
+  // A green DONE on every row is noise: a call that worked is the ordinary
+  // case and says so by not saying anything. Only time worth knowing about,
+  // and failure, earn a mark.
+  badge.className = ok ? "state" : "state err";
+  badge.textContent = ok ? "" : "failed";
+  card.classList.toggle("failed", !ok);
+  const bits = [];
+  const meta = card.querySelector(".meta");
+  if (meta && meta.textContent) bits.push(meta.textContent);
+  if (ms >= 1000) bits.push(`${(ms / 1000).toFixed(1)}s`);
   const io = card.querySelector(".io");
-  io.append(el("div", "lbl", "result"), el("pre", null, output));
-  if (!ok) card.open = true;
+  // the live block was the argument arriving; keep the text, drop the tailing
+  io.querySelectorAll(".tool-live").forEach((pre) => {
+    pre.className = "tool-text";
+  });
+  // Some results are better said in the summary line than printed as a block:
+  // a tool that has already drawn its own answer does not need it in prose
+  // underneath.
+  const short = ok && view.resultAs && view.resultAs(String(output || ""));
+  if (short) {
+    bits.unshift(short);
+  } else if (String(output || "").trim()) {
+    if (io.childNodes.length) io.append(el("div", "lbl", "result"));
+    io.append(el("pre", "tool-out", output));
+  }
+  setToolMeta(card, bits.join("  ·  "));
+  // Folded once it lands - the point of watching a file being written is over
+  // when it has been. A failure stays open, because that is the one you have
+  // to read.
+  card.open = !ok;
+  card.classList.remove("pending");
 }
 
 function renderPlan(items) {
@@ -2329,11 +2540,54 @@ function browseModal() {
 
 /* Switching model means loading different weights into the same VRAM, so the
    server restarts into them. The UI waits for it to come back. */
+/* A section of the model picker that folds away.
+
+   The picker is two lists and one of them is nearly always the wrong one: a
+   chat answered by a provider has no use for seven local quants, and a chat on
+   local weights has no use for the provider list. So the section holding what
+   this chat actually uses opens and the other is folded - decided from what is
+   in force right now rather than from a remembered preference, because the
+   right answer changes with the chat you are in. */
+function pickerSection(box, title, count, open) {
+  const wrap = el("div", `pick-group${open ? "" : " closed"}`);
+  const head = el("button", "pick-head");
+  head.type = "button";
+  head.setAttribute("aria-expanded", open ? "true" : "false");
+  head.append(icon("down", "chev"), el("span", "t", title));
+  if (count) head.append(el("span", "count", String(count)));
+  const inner = el("div", "pick-inner");
+  head.onclick = () => {
+    const closed = wrap.classList.toggle("closed");
+    head.setAttribute("aria-expanded", closed ? "false" : "true");
+    fold(inner, closed);
+  };
+  const rows = el("div", "pick-rows");
+  rows.append(inner);
+  wrap.append(head, rows);
+  fold(inner, !open);
+  box.append(wrap);
+  return inner;                     // everything the section owns goes in here
+}
+
+/* A folded section is clipped, not removed - the rows inside it still have
+   their own boxes, so they stay in the tab order and a keyboard could reach a
+   button nobody can see. Clipping is a visual answer to a question that is
+   also about focus. */
+function fold(inner, closed) {
+  inner.inert = closed;
+  if (closed) inner.setAttribute("inert", ""); else inner.removeAttribute("inert");
+  inner.setAttribute("aria-hidden", closed ? "true" : "false");
+}
+
 async function modelModal() {
   let data;
   try {
     data = await api("/ui/models");
   } catch (e) { toast(e.message, true); return; }
+
+  // Which list is the one you came to look at. Anything but "local" is a
+  // provider, including a chat opened before any of this existed.
+  const onLocal = !state.provider || state.provider === "local";
 
   openModal("Model", (box) => {
     if (data.note) box.append(el("div", "muted-note", data.note));
@@ -2341,49 +2595,57 @@ async function modelModal() {
     // in the main UI now, and returning early here made every configured
     // provider - and the button to add one - invisible from it.
     if (data.remote?.length || data.models.length) {
-      box.append(el("div", "group-label", "This computer"));
-    }
-    if (!data.models.length) {
-      box.append(el("div", "muted-note",
-        "No models found under models/. Run start.bat and pick a profile to "
-        + "download one."));
-    }
-    data.models.forEach((model) => {
-      const row = el("button", `model-row${model.current ? " current" : ""}`);
-      const who = el("div", "who");
-      who.append(el("div", "name", model.name));
-      const bits = [];
-      if (model.bpw) bits.push(`${model.bpw} bpw`);
-      if (model.quality) bits.push(model.quality);
-      if (model.size_gb) bits.push(`${model.size_gb} GB`);
-      if (model.context) bits.push(`${Math.round(model.context / 1024)}k context`);
-      who.append(el("div", "meta", model.fits === false
-        ? model.why : bits.join("  ·  ")));
-      row.append(who);
-      if (model.current) row.append(el("span", "badge", "loaded"));
-      else if (model.fits === false) {
-        row.append(el("span", "badge no",
-                      model.complete === false ? "incomplete" : "too big"));
+      // With nothing on the other side there is nothing to fold away to, so a
+      // lone section stays open whichever it is.
+      const only = !data.remote?.length;
+      const here = pickerSection(box, "This computer", data.models.length,
+                                 onLocal || only);
+      if (!data.models.length) {
+        here.append(el("div", "muted-note",
+          "No models found under models/. Run start.bat and pick a profile to "
+          + "download one."));
       }
-      row.disabled = model.current || !data.can_switch || model.fits === false;
-      row.onclick = () => switchModel(model);
-      box.append(row);
-    });
-    if (data.can_switch) {
-      box.append(el("div", "muted-note",
-        "Switching restarts the server and reloads the weights - about a "
-        + "minute. Open conversations are kept."));
+      data.models.forEach((model) => {
+        const row = el("button", `model-row${model.current ? " current" : ""}`);
+        const who = el("div", "who");
+        who.append(el("div", "name", model.name));
+        const bits = [];
+        if (model.bpw) bits.push(`${model.bpw} bpw`);
+        if (model.quality) bits.push(model.quality);
+        if (model.size_gb) bits.push(`${model.size_gb} GB`);
+        if (model.context) bits.push(`${Math.round(model.context / 1024)}k context`);
+        who.append(el("div", "meta", model.fits === false
+          ? model.why : bits.join("  \u00b7  ")));
+        row.append(who);
+        if (model.current) row.append(el("span", "badge", "loaded"));
+        else if (model.fits === false) {
+          row.append(el("span", "badge no",
+                        model.complete === false ? "incomplete" : "too big"));
+        }
+        row.disabled = model.current || !data.can_switch || model.fits === false;
+        row.onclick = () => switchModel(model);
+        here.append(row);
+      });
+      // Inside the section, not after it: an explanation of rows you have
+      // folded away is just a loose sentence under a heading.
+      if (data.can_switch) {
+        here.append(el("div", "muted-note",
+          "Switching restarts the server and reloads the weights - about a "
+          + "minute. Open conversations are kept."));
+      }
     }
 
     if (data.remote?.length) {
-      box.append(el("div", "group-label", "Providers"));
+      const away = pickerSection(box, "Providers", data.remote.length,
+                                 !onLocal || !data.models.length);
       data.remote.forEach((entry) => {
         const row = el("button", `model-row${
           state.provider === entry.provider && state.model === entry.model
             ? " current" : ""}`);
         const who = el("div", "who");
         who.append(el("div", "name", entry.model),
-                   el("div", "meta", `${entry.provider_name}  ·  ${entry.base_url}`));
+                   el("div", "meta",
+                      `${entry.provider_name}  \u00b7  ${entry.base_url}`));
         row.append(who);
         if (state.provider === entry.provider && state.model === entry.model) {
           row.append(el("span", "badge", "in use"));
@@ -2394,9 +2656,9 @@ async function modelModal() {
           closeModal();
           toast(`This chat now uses ${entry.model}`);
         };
-        box.append(row);
+        away.append(row);
       });
-      box.append(el("div", "muted-note",
+      away.append(el("div", "muted-note",
         "A provider answers instantly - nothing is loaded into VRAM. Tools "
         + "still run on this computer, and approvals still apply."));
     }

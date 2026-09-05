@@ -12,7 +12,9 @@ Events yielded (dicts, one JSON object per SSE message):
 
   {"type": "reasoning", "delta": str}     model's <think> text
   {"type": "content",   "delta": str}     assistant text
-  {"type": "tool_progress", "id", "name", "chars"}   while it is being written
+  {"type": "tool_progress", "id", "name", "chars", "parts"}  while it is
+      being written - "parts" is [(argument, newly readable text), ...],
+      so the browser can show the file as it arrives
   {"type": "tool_call", "id", "name", "args", "label", "risk"}
   {"type": "approval",  "id", "name", "label", "args"}   waiting for the user
   {"type": "question",  "id", "question", "header", "options"}  ask_user
@@ -180,6 +182,9 @@ class ModelClient:
         calls: dict[int, dict] = {}
         # last (length, monotonic time) a partial was announced, per call slot
         announced: dict[int, tuple] = {}
+        # and the running decode of each slot's arguments, so the browser can
+        # show the file as it is written rather than a character count
+        previews: dict[int, ArgPreview] = {}
         splitter = ThinkSplitter()
         saw_reasoning_field = False
         with resp:
@@ -243,10 +248,13 @@ class ModelClient:
                                 was is None or grown - was[0] >= 1500
                                 or time.monotonic() - was[1] >= 0.5):
                             announced[idx] = (grown, time.monotonic())
+                            preview = previews.setdefault(idx, ArgPreview())
                             yield "tool_partial", {
                                 "id": slot["id"],
                                 "name": slot["function"]["name"],
-                                "chars": grown}
+                                "chars": grown,
+                                "parts": preview.feed(
+                                    slot["function"]["arguments"])}
                     if choice.get("finish_reason"):
                         # whatever the splitter was holding back is not a marker
                         for kind, piece in splitter.flush():
@@ -256,6 +264,100 @@ class ModelClient:
             yield kind, piece
         if calls:
             yield "tool_calls", [calls[i] for i in sorted(calls)]
+
+
+class ArgPreview:
+    """Reads a tool call's arguments as they arrive and hands back plain text.
+
+    The arguments are one JSON object built a token at a time, so nothing can
+    be parsed until the very last brace - which, for a write_file carrying a
+    whole HTML page, is minutes of nothing to show. This walks the fragment as
+    far as it safely can and stops on a half-written escape, remembering where
+    it stopped, so each call returns only what is newly readable.
+
+    It is deliberately not a JSON parser: it does not validate, and it does not
+    care about numbers or nesting. It answers one question - which key is being
+    written, and what does its text say so far.
+    """
+
+    ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f",
+               "n": "\n", "r": "\r", "t": "\t"}
+
+    def __init__(self):
+        self.at = 0              # how much of the raw fragment is consumed
+        self.in_string = False
+        self.is_value = False    # the string being read is a value, not a key
+        self.after_colon = False
+        self.key = ""            # the key whose value is being written
+        self.keybuf = []
+
+    def feed(self, raw):
+        """-> [(field, text), ...] for whatever became readable since the last
+        call. One fragment can carry the end of one value and the start of the
+        next, so this is a list of pieces rather than a single string: giving a
+        whole fragment the key that happened to be current when the walk
+        stopped would file a filename under the file's own contents."""
+        parts, buf = [], []
+        of = self.key
+
+        def flush():
+            if buf:
+                parts.append((of, "".join(buf)))
+                del buf[:]
+
+        def take(ch):
+            nonlocal of
+            if self.key != of:
+                flush()
+                of = self.key
+            buf.append(ch)
+
+        i, n = self.at, len(raw)
+        while i < n:
+            c = raw[i]
+            if self.in_string:
+                if c == "\\":
+                    if i + 1 >= n:
+                        break                       # escape still arriving
+                    nxt = raw[i + 1]
+                    if nxt == "u":
+                        if i + 6 > n:
+                            break                   # \uXXXX still arriving
+                        try:
+                            ch = chr(int(raw[i + 2:i + 6], 16))
+                        except ValueError:
+                            ch = ""
+                        step = 6
+                    else:
+                        ch, step = self.ESCAPES.get(nxt, nxt), 2
+                    take(ch) if self.is_value else self.keybuf.append(ch)
+                    i += step
+                    continue
+                if c == '"':
+                    self.in_string = False
+                    if not self.is_value:
+                        self.key = "".join(self.keybuf)
+                        self.keybuf = []
+                    i += 1
+                    continue
+                take(c) if self.is_value else self.keybuf.append(c)
+                i += 1
+                continue
+            if c == '"':
+                self.in_string = True
+                self.is_value = self.after_colon
+                if not self.is_value:
+                    self.keybuf = []
+                i += 1
+                continue
+            if c == ":":
+                self.after_colon = True
+            elif c in ",{":
+                self.after_colon = False
+            i += 1
+        self.at = i
+        flush()
+        return parts
 
 
 # --------------------------------------------------------------- helpers ----
@@ -281,6 +383,25 @@ def parse_args(raw):
 
 def _parse_args(raw):                    # kept for callers that want just args
     return parse_args(raw)[0]
+
+
+def looks_cut_off(raw, err):
+    """Did this arguments string stop in the middle rather than go wrong?
+
+    finish_reason is the official answer and it cannot be relied on: an
+    endpoint can end a reply mid-string and still report "stop", which is
+    exactly what a provider did on a 8,944-character write_file. The text
+    itself is better evidence - valid JSON never ends inside a string, so a
+    parse that failed at the very end of the buffer was cut, and one that
+    failed in the middle was malformed.
+    """
+    pos = getattr(err, "pos", None)
+    if pos is None:
+        return False
+    if str(err).startswith("Unterminated string"):
+        return True
+    return pos >= len(raw) - 2 and str(err).startswith(
+        ("Expecting", "Unterminated"))
 
 
 def repair_tool_calls(calls):
@@ -313,7 +434,10 @@ def repair_tool_calls(calls):
                     parsed = json.loads(raw)
                 except ValueError as e:
                     notes.append(f"{where}: {e} ({len(raw)} characters received)")
-                    by_id[call.get("id")] = f"{e} ({len(raw)} characters received)"
+                    by_id[call.get("id")] = {
+                        "why": f"{e} ({len(raw)} characters received)",
+                        "cut": looks_cut_off(raw, e),
+                        "chars": len(raw)}
                     fn["arguments"] = "{}"
                 else:
                     # Valid JSON, but "null" / "[1,2]" / "3" is not an argument
@@ -323,8 +447,9 @@ def repair_tool_calls(calls):
                     if not isinstance(parsed, dict):
                         kind = type(parsed).__name__
                         notes.append(f"{where}: arguments were {kind}, not an object")
-                        by_id[call.get("id")] = (
-                            f"the arguments were a JSON {kind}, not an object")
+                        by_id[call.get("id")] = {
+                            "why": f"the arguments were a JSON {kind}, not an "
+                                   "object", "cut": False, "chars": len(raw)}
                         fn["arguments"] = "{}"
         else:
             fn["arguments"] = json.dumps(raw if isinstance(raw, dict) else {})
@@ -495,13 +620,24 @@ def run_turn(client, messages, tool_list, ctx: ToolContext, *, mode="chat",
                 # are untouched and still run: dropping two good read_file calls
                 # because a third write_file was cut off loses real work and
                 # teaches the model that reading those files failed.
+                broke = broken_by_id[call.get("id")]
+                # "call it again" is the wrong advice for a reply that ran out
+                # of room: repeating the same 9,000-character argument fails
+                # the same way. Say that it was cut, how far it got, and how to
+                # get the rest across in pieces.
+                if truncated or broke["cut"]:
+                    hint = (f"the reply stopped in the middle of them after "
+                            f"{broke['chars']} characters, so the call never "
+                            "arrived complete. Sending it again unchanged will "
+                            "stop in the same place. Write it in pieces "
+                            "instead: create the file with the first part, "
+                            "then add each further part with edit_file")
+                else:
+                    hint = ("they were not valid JSON - emit the arguments as a "
+                            "JSON object and call it again")
                 ok, output = False, (
                     f"error: the arguments for {name} could not be read: "
-                    f"{broken_by_id[call.get('id')]}\nhint: "
-                    + ("they were cut off at the output limit - retry with less "
-                       "content per call" if truncated else
-                       "they were not valid JSON - emit the arguments as a JSON "
-                       "object and call it again"))
+                    f"{broke['why']}\nhint: {hint}")
             elif args_error:
                 ok, output = False, (
                     f"error: the arguments for {name} could not be read: "
@@ -561,7 +697,10 @@ def run_turn(client, messages, tool_list, ctx: ToolContext, *, mode="chat",
     else:
         note = (f"[stopped after {max_steps} tool steps]")
         convo.append({"role": "assistant", "content": note})
-        yield {"type": "content", "delta": "\n\n_" + note.strip("[]") + "_"}
+        # Asterisks, not underscores: the renderer reads only * for
+        # emphasis, on purpose, so that snake_case survives being
+        # written in prose. This line was showing its own markup.
+        yield {"type": "content", "delta": "\n\n*" + note.strip("[]") + "*"}
 
     tok_s = (usage_total["completion_tokens"] / gen_seconds) if gen_seconds > 0.05 else None
     yield {"type": "done", "messages": convo, "usage": usage_total,

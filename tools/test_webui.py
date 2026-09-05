@@ -4160,6 +4160,228 @@ def test_every_test_is_actually_run():
           not missing, ", ".join(missing))
 
 
+def test_arguments_can_be_read_as_they_arrive():
+    """A tool call's arguments are one JSON object built a token at a time, so
+    nothing can be parsed until the last brace - which for a write_file
+    carrying a whole page is minutes of a climbing character count and nothing
+    to look at. The decoder walks the half-written fragment instead, and has to
+    be exact under any chunking, because the text it hands back is shown."""
+    import random                                       # noqa: WPS433
+    import webui_agent as wa                            # noqa: WPS433
+
+    want = {"path": "arcanum.html",
+            "content": '<h1>Hi</h1>\nline "two"\ttabbed \u00e9 \\slash'}
+    whole = json.dumps(want)
+
+    def read(sizes):
+        preview, got, at = wa.ArgPreview(), {}, 0
+        for step in sizes:
+            at = min(len(whole), at + step)
+            for field, add in preview.feed(whole[:at]):
+                got[field] = got.get(field, "") + add
+        return got
+
+    for step in (1, 2, 3, 7, 40, 5000):
+        got = read([step] * (len(whole) // max(step, 1) + 2))
+        check(f"exact in {step}-character pieces", got == want, got)
+
+    random.seed(11)
+    ragged = all(read([random.randint(1, 9) for _ in range(len(whole))]) == want
+                 for _ in range(200))
+    check("...and under 200 random ragged chunkings", ragged)
+
+    # The point of all this: the filename is readable long before the file is.
+    early = wa.ArgPreview().feed(whole[:60])
+    check("the path is readable while the content is still arriving",
+          ("path", "arcanum.html") in early, early)
+    check("...and the content it has so far comes back under its own name",
+          any(f == "content" and t for f, t in early), early)
+
+    # One fragment can carry the end of one value and the start of the next.
+    # Labelling the whole thing with the key that happened to be current when
+    # the walk stopped filed a filename under the file's own contents.
+    both = wa.ArgPreview().feed(whole)
+    check("each piece is filed under the argument it belongs to",
+          [f for f, _ in both] == ["path", "content"], both)
+
+    # A half-written escape must not be decoded: half of an escape is a wrong
+    # character that has already been shown and can never be taken back.
+    needle = json.dumps("\u00e9")[1:-1]       # how json spells it: backslash u...
+    at = whole.index(needle) + 2              # ...cut just past the backslash
+    part = wa.ArgPreview()
+    so_far = "".join(t for f, t in part.feed(whole[:at]) if f == "content")
+    check("half of an escape is not guessed at",
+          not so_far.endswith(("u", needle[0])) and needle[0] not in so_far,
+          repr(so_far[-8:]))
+    check("...and the character arrives whole once the rest of it does",
+          "".join(t for f, t in part.feed(whole) if f == "content")
+          .startswith("\u00e9"))
+
+
+def test_a_cut_off_call_is_told_apart_from_a_malformed_one():
+    """finish_reason is the official answer to "was this cut off?" and it
+    cannot be relied on: the endpoint that produced this bug ended a reply in
+    the middle of an 8,944-character string and still reported "stop". The
+    text is better evidence - valid JSON never ends inside a string."""
+    import webui_agent as wa                            # noqa: WPS433
+
+    whole = json.dumps({"path": "a.html", "content": "x" * 200})
+    for label, raw, cut in (
+            ("stopped mid-string", whole[:120], True),
+            ("stopped right after a comma", whole[:whole.index(",") + 1], True),
+            ("malformed in the middle", '{"path": ,"content": "hi"}', False),
+            ("a list, not an object", "[1, 2, 3]", False)):
+        _, _, by_id = wa.repair_tool_calls(
+            [{"id": "c1", "function": {"name": "write_file", "arguments": raw}}])
+        check(f"{label} -> cut={cut}", by_id["c1"]["cut"] is cut, by_id["c1"])
+
+    kept, _, by_id = wa.repair_tool_calls(
+        [{"id": "c1", "function": {"name": "write_file", "arguments": whole}}])
+    check("a whole call is left alone",
+          not by_id and kept[0]["function"]["arguments"] == whole)
+    # the unreadable one is still neutralised, or the conversation is finished
+    broken, _, _ = wa.repair_tool_calls(
+        [{"id": "c1", "function": {"name": "write_file",
+                                   "arguments": whole[:120]}}])
+    check("...and a cut one is still stored as {}",
+          broken[0]["function"]["arguments"] == "{}")
+
+    src = (Path(__file__).parent / "webui_agent.py").read_text()
+    # "call it again" is the wrong advice for a reply that ran out of room:
+    # repeating the same argument fails in the same place.
+    check("a cut call is not told to simply repeat itself",
+          "Sending it again unchanged will" in src)
+    check("...it is told how to get the rest across",
+          "then add each further part with edit_file" in src)
+    check("...and how far it actually got", "{broke['chars']} characters" in src)
+
+
+def test_notes_are_written_in_the_dialect_the_renderer_reads():
+    """The renderer reads * for emphasis and deliberately ignores _, so that a
+    snake_case name written in prose survives. A server-side note that used
+    underscores printed its own markup on screen."""
+    agent = (Path(__file__).parent / "webui_agent.py").read_text()
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    check("the renderer emphasises with asterisks",
+          "<em>$2</em>" in js and "\\*([^*" in js)
+    check("...and leaves underscores alone, so snake_case is safe",
+          "_([^_" not in js)
+    for line in agent.splitlines():
+        if line.strip().startswith('yield {"type": "content", "delta":'):
+            check(f"a note does not emit raw _ markup: {line.strip()[:60]}",
+                  '"_' not in line and '_"' not in line, line.strip())
+
+
+def test_a_tool_call_reads_as_a_sentence():
+    """A card used to be the function's name over a JSON dump of its arguments
+    and a blob of output. That is a database row. The person reading it wants
+    to know that a file was written and which one - and only sometimes what
+    went into it."""
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+
+    check("every tool says what it does in words", "const TOOL_VIEW" in js)
+    for name in ("write_file", "edit_file", "read_file", "list_dir",
+                 "find_files", "search_text", "run_command", "run_python",
+                 "job_output", "job_kill", "web_search", "web_fetch",
+                 "update_plan", "ask_user"):
+        check(f"{name} introduces itself", f"{name}:" in js.split("TOOL_VIEW")[1]
+              .split("};")[0])
+    check("a tool nobody taught it about still reads as one",
+          "function toolView" in js and "Running" in js)
+
+    view = js.split("function toolView")[0].split("const TOOL_VIEW")[1]
+    check("write_file is 'Writing' then 'Wrote'",
+          'doing: "Writing", done: "Wrote"' in view)
+    check("...and names the file, not the argument object",
+          "subject: (a) => a.path" in view)
+    check("the argument worth reading as text is marked as such",
+          'text: "content"' in view)
+
+    # A green DONE on every row is noise: a call that worked is the ordinary
+    # case and says so by saying nothing.
+    fin = js.split("function finishToolCard")[1].split("\nfunction ")[0]
+    check("a call that worked wears no badge",
+          'badge.textContent = ok ? "" : "failed"' in fin)
+    check("...and one that failed does, and stays open",
+          "card.open = !ok" in fin)
+    css = (Path(__file__).parent / "webui" / "style.css").read_text()
+    check("an empty badge takes no room", ".tool .state:empty { display: none; }" in css)
+    check("the section captions stopped shouting",
+          "text-transform: uppercase" not in css.split(".tool .lbl {")[1].split("}")[0])
+
+    detail = js.split("function toolDetail")[1].split("\nfunction ")[0]
+    check("the plan is drawn as a checklist, not printed as JSON",
+          "planList(args.todos" in detail)
+    check("edit_file shows what it replaced, not only what it wrote",
+          "rest.old_text" in detail)
+    check("leftover arguments are named values, not a JSON blob",
+          'el("dl", "tool-args")' in detail)
+    check("...and what the summary already said is not repeated underneath",
+          "String(rest[k]) !== said" in detail)
+    check("a result the card has already drawn is not printed twice",
+          "resultAs" in js)
+
+
+def test_a_file_can_be_watched_as_it_is_written():
+    """The card used to show a character count and nothing else while a large
+    write_file streamed, which is the moment the person most wants to see what
+    is happening."""
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    pend = js.split("function pendingToolCard")[1].split("\nfunction ")[0]
+    check("the card is open while it is being written", "card.open = true" in pend)
+
+    upd = js.split("function updatePendingToolCard")[1].split("\nfunction ")[0]
+    check("the streamed text goes into a live block", "tool-live" in upd)
+    check("...appended, so nothing is re-rendered per fragment",
+          "pre.append(document.createTextNode(add))" in upd)
+    check("...and it follows the tail", "pre.scrollTop = pre.scrollHeight" in upd)
+    # Following the tail is only welcome while the person has not scrolled up
+    # to read something further back.
+    check("...unless the person has scrolled up in it",
+          "pre.scrollHeight - pre.scrollTop - pre.clientHeight < 60" in upd)
+    check("a short argument becomes the card's subject instead",
+          "setToolSubject(card, subject)" in upd)
+
+    card = js.split("function toolCard(")[1].split("\nfunction ")[0]
+    check("the finished call reuses the card that was streaming",
+          "const pending = container.querySelector" in card
+          and "const card = pending ||" in card)
+    check("...so the size the person watched climb is still there at the end",
+          "setToolMeta(card, sizeOf(" in card)
+
+    agent = (Path(__file__).parent / "webui_agent.py").read_text()
+    check("the server sends the decoded text, not only a count",
+          '"parts": preview.feed(' in agent)
+
+
+def test_the_model_picker_opens_on_the_list_you_are_using():
+    """The picker is two lists and one of them is nearly always the wrong one:
+    a chat answered by a provider has no use for seven local quants."""
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    check("its sections fold", "function pickerSection" in js)
+    body = js.split("async function modelModal")[1].split("\n/* Any OpenAI")[0]
+    check("which one opens is decided by what is answering this chat",
+          'const onLocal = !state.provider || state.provider === "local"' in body)
+    check("this computer opens when this computer is answering",
+          "onLocal || only" in body)
+    check("providers open when a provider is answering", "!onLocal ||" in body)
+    check("a lone section stays open, having nothing to fold away to",
+          "const only = !data.remote?.length" in body)
+    # An explanation of rows that have been folded away is a loose sentence
+    # under a heading.
+    check("each section's note is inside it",
+          'here.append(el("div", "muted-note"' in body)
+
+    fold = js.split("function fold(")[1].split("\n}")[0]
+    check("a folded section is clipped and out of the tab order",
+          "inert" in fold and "aria-hidden" in fold)
+    css = (Path(__file__).parent / "webui" / "style.css").read_text()
+    check("...with a fallback for a browser that has no inert",
+          ".pick-group.closed .pick-inner { pointer-events: none; }" in css)
+    check("folding animates rather than jumping",
+          ".pick-group.closed .pick-rows { grid-template-rows: 0fr; }" in css)
+
+
 def main():
     root = Path(__file__).resolve().parent.parent
     tmp = root / "workspace"
@@ -4272,6 +4494,12 @@ def main():
     test_the_effort_level_that_is_set_is_the_one_that_is_sent()
     test_the_thinking_level_belongs_to_the_conversation()
     test_levels_can_be_declared_from_the_menu()
+    test_arguments_can_be_read_as_they_arrive()
+    test_a_cut_off_call_is_told_apart_from_a_malformed_one()
+    test_notes_are_written_in_the_dialect_the_renderer_reads()
+    test_a_tool_call_reads_as_a_sentence()
+    test_a_file_can_be_watched_as_it_is_written()
+    test_the_model_picker_opens_on_the_list_you_are_using()
     test_every_test_is_actually_run()
     try:
         urllib.request.urlopen(urllib.request.Request(
