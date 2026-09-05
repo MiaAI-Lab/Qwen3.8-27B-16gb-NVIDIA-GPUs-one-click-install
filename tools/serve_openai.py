@@ -508,9 +508,64 @@ def tool_choice_directive(tool_choice, tools):
     return tools, None
 
 
+# Effort levels this model's chat template understands, probed once. The
+# template is the authority: Qwen3's raises on anything outside its own set
+# (xhigh / medium / low - note "high" is NOT one of them), and a template that
+# ignores reasoning_effort entirely must not be advertised as taking levels.
+_EFFORT_CANDIDATES = ("minimal", "low", "medium", "high", "xhigh", "max")
+_efforts_cache = None
+
+
+def supported_efforts(tokenizer):
+    """The subset of _EFFORT_CANDIDATES this template both accepts and acts on."""
+    global _efforts_cache
+    if _efforts_cache is not None:
+        return _efforts_cache
+    probe = [{"role": "user", "content": "hi"}]
+    try:
+        base = tokenizer.hf_render_chat_template(probe, add_generation_prompt = True,
+                                                 enable_thinking = True)
+    except Exception:                                    # noqa: BLE001
+        _efforts_cache = []
+        return _efforts_cache
+    ok, seen = [], set()
+    for level in _EFFORT_CANDIDATES:
+        try:
+            out = tokenizer.hf_render_chat_template(
+                probe, add_generation_prompt = True, enable_thinking = True,
+                reasoning_effort = level)
+        except Exception:                                # noqa: BLE001
+            continue                                     # the template refused it
+        ok.append(level)
+        seen.add(out)
+    # If every level renders identically the template is ignoring the argument,
+    # and offering the user a choice that changes nothing is worse than none.
+    _efforts_cache = ok if len(seen) > 1 else []
+    return _efforts_cache
+
+
+def template_effort(tokenizer, effort):
+    """Kwargs to pass through to the template for `effort`, or nothing.
+
+    "high" is the word the OpenAI API uses and the word the UI offers; this
+    template spells the same idea "xhigh" and raises on "high". Translate
+    rather than let a valid-looking request blow up in the renderer."""
+    if not effort:
+        return {}
+    levels = supported_efforts(tokenizer)
+    if not levels:
+        return {}
+    want = str(effort).strip().lower()
+    if want not in levels:
+        want = {"high": "xhigh", "xhigh": "high", "max": "xhigh",
+                "minimal": "low", "none": None, "off": None}.get(want)
+    return {"reasoning_effort": want} if want in levels else {}
+
+
 def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                   top_p, top_k, seed, tools, tool_choice = None, stop = None,
-                  on_text = None, enable_thinking = True, should_stop = None):
+                  on_text = None, enable_thinking = True, should_stop = None,
+                  reasoning_effort = None):
     """Blocking generation; returns (text, tool_calls, finish, p_toks, o_toks,
     reasoning, content)."""
     schemas = build_tool_schemas(tools)
@@ -542,7 +597,8 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                           for img in images]
         rendered = tokenizer.hf_render_chat_template(
             messages, add_generation_prompt = True,
-            enable_thinking = enable_thinking, tools = tools)
+            enable_thinking = enable_thinking, tools = tools,
+            **template_effort(tokenizer, reasoning_effort))
         n = rendered.count(IMAGE_TRIPLE)
         if n != len(embeddings):
             raise ValueError(f"chat template rendered {n} image slot(s) for "
@@ -554,7 +610,8 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
     else:
         input_ids = tokenizer.hf_chat_template(
             messages, add_generation_prompt = True,
-            enable_thinking = enable_thinking, tools = tools)
+            enable_thinking = enable_thinking, tools = tools,
+            **template_effort(tokenizer, reasoning_effort))
     prompt_toks = int(input_ids.shape[-1])
     from exllamav3.generator.sampler.presets import ComboSampler
     from exllamav3 import Job
@@ -624,13 +681,39 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
 
 
 async def models(request):
+    """The model's own entry - and what it can actually do.
+
+    This used to publish an id and a context length and nothing else, which
+    made the server opaque to every client that asks /models what it supports.
+    The one that hurts most is another copy of this kit pointing at this one as
+    a provider: it probes /models for reasoning levels and modalities, found
+    neither, and reported "this provider did not say which levels it takes" -
+    while the template on this side accepts three of them.
+
+    The key names are the ones webui_providers.efforts_from_model_row and
+    vision_from_model_row already look for, which are the shapes hosted APIs
+    use; nothing here is invented for this kit alone.
+    """
     ctx = stats.get("context_length")
-    return web.json_response({"object": "list", "data": [{
+    row = {
         "id": MODEL_ID,
         "object": "model",
         "owned_by": "exl3",
         **({"max_model_len": ctx} if ctx else {}),
-    }]})
+    }
+    tokenizer = request.app.get("tokenizer")
+    if tokenizer is not None:
+        try:
+            levels = supported_efforts(tokenizer)
+        except Exception:                            # noqa: BLE001
+            levels = []
+        if levels:
+            row["supported_reasoning_efforts"] = levels
+    row["architecture"] = {
+        "input_modalities": ["text", "image"] if vision["model"] else ["text"],
+        "output_modalities": ["text"],
+    }
+    return web.json_response({"object": "list", "data": [row]})
 
 
 async def health(request):
@@ -719,7 +802,8 @@ async def chat_completions(request):
                 generate_full, generator, tokenizer, req["messages"],
                 req["max_tokens"], req["temperature"], req["top_p"], req["top_k"],
                 req["seed"], req["tools"], req["tool_choice"], req["stop"],
-                None, req["enable_thinking"])
+                None, req["enable_thinking"], None,
+                req["reasoning_effort"])
         except AssertionError as e:
             return web.json_response(
                 {"error": {"message": f"context/cache: {e}", "type": "invalid_request_error"}},
@@ -774,6 +858,7 @@ async def chat_completions(request):
                     req["seed"], req["tools"], req["tool_choice"], req["stop"],
                     on_text = None if forced_choice else on_text,
                     enable_thinking = req["enable_thinking"],
+                    reasoning_effort = req["reasoning_effort"],
                     should_stop = gone.is_set)
                 loop.call_soon_threadsafe(
                     queue.put_nowait,
@@ -939,6 +1024,14 @@ def mount_ui(app, args):
         ui = chatui.build_ui(cfg, f"http://127.0.0.1:{args.port}/v1", MODEL_ID,
                              root = Path(root), context = args.cache_size,
                              vision = vision["model"] is not None)
+        # The template is the only thing that knows which effort levels mean
+        # anything here; the UI cannot ask it from the browser, and hardcoding
+        # a list would be a guess about somebody else's model. The tokenizer
+        # lives on the app, not in this scope.
+        try:
+            ui.efforts = supported_efforts(app["tokenizer"])
+        except Exception:                                # noqa: BLE001
+            ui.efforts = []
         chatui.mount(app, ui)
         return True
     except Exception as e:                # noqa: BLE001  (never fatal)

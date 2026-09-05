@@ -1140,7 +1140,8 @@ def test_ready_after_mount():
     before the port was bound, so it could promise an address that was not
     there."""
     src = (Path(__file__).parent / "serve_openai.py").read_text()
-    check("mount_ui reports whether it worked", "return True" in src.split("def mount_ui")[1][:1400])
+    check("mount_ui reports whether it worked",
+          "return True" in src.split("def mount_ui")[1][:2000])
     tail = src[src.index("def main()"):]
     check("the UI is mounted before Ready is defined",
           tail.index("mount_ui(app, args)") < tail.index("def ready_box"))
@@ -2366,6 +2367,475 @@ def test_sidebar_groups_by_kind():
     check("...and on a chat that is still working", ".session.live .dot" in css)
 
 
+def test_a_truncated_tool_call_cannot_brick_a_chat():
+    """max_tokens cutting a tool call in half must not end the conversation.
+
+    A model asked to write a whole file in one call streams the file into the
+    `content` argument. When the reply hits max_tokens the JSON stops mid-string,
+    and three things used to go wrong in sequence: _parse_args swallowed the
+    error and returned {}, so the tool reported "missing 2 required positional
+    arguments" and blamed the model for the server's truncation; finish_reason
+    "length" was yielded by the client and dropped by run_turn, so nothing said
+    what had happened; and the unparseable string was written into the history,
+    where the model server parses it again to render the chat template - so
+    every later request in that conversation failed with HTTP 400, permanently,
+    because the message was on disk."""
+    import json as _json, sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent))
+    import webui_agent as wa
+
+    cut = '{"path":"index.html","content":"<!doctype html>' + "x" * 9000
+
+    args, err = wa.parse_args(cut)
+    check("a truncated argument string reports why it failed", err and args == {})
+    check("...and says how much arrived",
+          f"{len(cut)} characters" in (err or ""), err)
+    check("a good argument string still parses",
+          wa.parse_args('{"path":"a.txt"}') == ({"path": "a.txt"}, None))
+
+    calls = [{"id": "c1", "type": "function",
+              "function": {"name": "write_file", "arguments": cut}}]
+    fixed, notes, _ = wa.repair_tool_calls(calls)
+    check("the broken call is made safe to store",
+          _json.loads(fixed[0]["function"]["arguments"]) == {})
+    check("...and the repair is reported", notes and "write_file" in notes[0])
+    good = [{"id": "c2", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'}}]
+    check("a healthy call is passed through untouched",
+          wa.repair_tool_calls(good) == (good, [], {}))
+
+    class Truncated:
+        def stream(self, messages, tools=None, sampling=None):
+            yield "content", "I'll write it in one shot. "
+            yield "finish", "length"
+            yield "tool_calls", [{"id": "call_0", "type": "function",
+                                  "function": {"name": "write_file",
+                                               "arguments": cut}}]
+
+    events = list(wa.run_turn(Truncated(), [{"role": "user", "content": "go"}],
+                              [], wa.ToolContext(), mode="agent",
+                              sampling={"max_tokens": 4096}, max_steps=3))
+    kinds = [e["type"] for e in events]
+    err_ev = next((e for e in events if e["type"] == "error"), None)
+    check("the user is told the output limit was hit", err_ev is not None)
+    check("...with the ceiling that was in force",
+          "max_tokens is 4096" in (err_ev or {}).get("message", ""))
+    check("...and what to do about it",
+          "Settings" in (err_ev or {}).get("message", ""))
+    done = next((e for e in events if e["type"] == "done"), None)
+    stored = (done or {}).get("messages", [])
+    unparseable = 0
+    for m in stored:
+        for c in (m.get("tool_calls") or []):
+            try:
+                _json.loads(c["function"]["arguments"])
+            except ValueError:
+                unparseable += 1
+    check("nothing unparseable reaches the conversation", unparseable == 0,
+          "this is what used to make every later request a 400")
+    check("the model is told too, so it can retry smaller",
+          any(m.get("role") == "tool" and "could not be read" in m.get("content", "")
+              for m in stored))
+    check("the broken call still gets a card, so nothing is drawn nowhere",
+          any(e["type"] == "tool_call" for e in events))
+    check("...and a failed result under the same id",
+          any(e["type"] == "tool_result" and not e["ok"] for e in events))
+
+
+def test_a_poisoned_session_heals_when_it_is_opened():
+    """Conversations saved before that fix must not stay broken for ever."""
+    import json as _json, sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent))
+    import webui_agent as wa
+
+    cut = '{"path":"a.html","content":"<!doctype' + "y" * 500
+    messages = [{"role": "user", "content": "go"},
+                {"role": "assistant", "content": None,
+                 "tool_calls": [{"id": "c1", "type": "function",
+                                 "function": {"name": "write_file",
+                                              "arguments": cut}}]}]
+    healed = wa.heal_messages(messages)
+    check("a poisoned history is repaired", healed is not None)
+    check("...without losing any messages", len(healed) == len(messages))
+    check("...and every stored call now parses",
+          all(_json.loads(c["function"]["arguments"]) is not None
+              for m in healed for c in (m.get("tool_calls") or [])))
+    check("a clean history is not rewritten for nothing",
+          wa.heal_messages([{"role": "user", "content": "hi"}]) is None)
+
+    app = (Path(__file__).parent / "webui_app.py").read_text()
+    check("the server heals on the way in", "heal_messages" in app)
+    tail = app.split("heal_messages")[1][:1400]
+    check("...and writes the repair back once", '"healed"' in tail)
+    check("...under the same lock the writers use, so a concurrent turn is "
+          "not reverted", "_save_locks" in tail)
+    check("...and an already-healed session is not walked again",
+          'session.get("healed")' in app)
+
+
+def test_a_long_tool_call_is_visible_while_it_streams():
+    """A call whose arguments take minutes to write must not look like a hang.
+
+    Tool-call fragments are accumulated and only yielded when the whole reply
+    ends, so a large `write_file` produced no events at all between the last
+    content token and the finished card."""
+    import json as _json, sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent))
+    import webui_agent as wa
+
+    def sse(obj):
+        return f"data: {_json.dumps(obj)}\n".encode()
+
+    lines = [sse({"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "call_0",
+         "function": {"name": "write_file", "arguments": ""}}]}}]})]
+    for _ in range(30):
+        lines.append(sse({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": "x" * 400}}]}}]}))
+    lines.append(sse({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}))
+    lines.append(b"data: [DONE]\n")
+
+    class FakeResp:
+        def __iter__(self):
+            return iter(lines)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    c = wa.ModelClient.__new__(wa.ModelClient)
+    c.base_url, c.api_key, c.model, c.timeout = "http://x/v1", "", "m", 5
+    c._post = lambda path, payload: FakeResp()
+    partials = [v for k, v in c.stream([{"role": "user", "content": "hi"}])
+                if k == "tool_partial"]
+    check("the call is announced while it is still being written", partials)
+    check("...as soon as it has a name", partials[0]["name"] == "write_file")
+    check("...with a count that climbs",
+          all(b["chars"] >= a["chars"] for a, b in zip(partials, partials[1:])))
+    check("...throttled, not one event per fragment", len(partials) < 30,
+          len(partials))
+
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    check("the browser draws a card for it", "function pendingToolCard" in js)
+    check("...and any placeholder still standing is cleared when one lands",
+          'querySelectorAll(".tool.pending")' in js)
+    check("...and again when the turn ends, for a call that never landed",
+          'querySelectorAll(".tool.pending")' in js.split("function finishTurn")[1][:400])
+
+
+def test_stray_br_is_a_line_break_not_text():
+    """Models reach for <br> mid-sentence. escapeHtml turned it into visible
+    text; only the void, attribute-less spellings come back."""
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    block = js.split("function inline(")[1].split("\nfunction ")[0]
+    check("the void spellings are restored", "&lt;br\\s*\\/?&gt;" in block)
+    check("...and nothing with attributes is", "onload" not in block)
+    check("code spans are lifted out before any of it runs",
+          block.index("HOLE_OPEN") < block.index("&lt;br"))
+    check("...and put back at the end", "holes[n] === undefined" in block)
+
+
+def test_the_renderer_cannot_be_made_to_emit_markup():
+    """Model output is untrusted - fetched pages, file contents, a provider.
+
+    `inline()` escapes everything up front and then generates HTML of its own,
+    which is where it went wrong: the link rule interpolated the href into an
+    attribute, and the autolink rule ran afterwards over the same string,
+    matched the URL sitting *inside* that attribute, and rewrote it as a whole
+    new anchor - injecting raw quotes into the middle of the tag. Everything
+    past those quotes was parsed as further attributes, and because "/"
+    separates attribute names, `http://e/onmouseover=...` became a live event
+    handler. That was arbitrary script in this page's origin, on hover, from
+    one line of model output - and it could POST to /ui/approve and approve the
+    agent's own file writes.
+
+    The rule that prevents it: nothing this function generates may be visible
+    to a later rule. Every produced tag goes into a hole first."""
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    block = js.split("function inline(")[1].split("\nfunction ")[0]
+
+    check("the link rule hides the anchor it builds",
+          "return hole(`<a href=" in block)
+    check("...including the label, so the autolink cannot open one inside it",
+          "${label}</a>" in block)
+    check("the autolink rule hides its anchor too",
+          block.count("hole(`<a href=") == 2)
+    check("...and cannot swallow a hole sentinel",
+          "[^\\s<)\\uE000\\uE001]" in block)
+    check("an href carrying a raw quote or bracket is not a link",
+          '/["\'<>]/.test(href)' in block)
+    check("nested holes are resolved to a fixed point", "pass < 4" in block)
+
+    # the sentinels cannot be typed by the text they protect
+    md = js.split("function markdown(")[1].split("\nfunction ")[0]
+    check("the private-use sentinels are stripped from the source first",
+          "[\\uE000-\\uE002]" in md)
+    check("...before anything is escaped or lifted",
+          md.index("[\\uE000-\\uE002]") < md.index("escapeHtml"))
+    check("no @@ placeholder survives anywhere in the renderer",
+          "@@CB" not in js and "@@CS" not in js)
+
+
+def test_a_turn_answers_every_call_it_announces():
+    """An assistant message carrying tool_calls must be followed by a tool
+    message for every one of those ids, or a strict endpoint rejects the whole
+    conversation from then on - the same permanent HTTP 400 a truncated
+    argument used to cause, and one heal_messages cannot repair because the
+    arguments themselves are valid. Stop landing mid-loop used to leave the
+    rest unanswered for good."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent))
+    import webui_agent as wa
+
+    mk = lambda cid, name, args: {"id": cid, "type": "function",
+                                  "function": {"name": name, "arguments": args}}
+
+    class Two:
+        def stream(self, messages, tools=None, sampling=None):
+            yield "tool_calls", [mk("c1", "read_file", '{"path":"a.txt"}'),
+                                 mk("c2", "read_file", '{"path":"b.txt"}')]
+
+    for label, budget in (("stopped before the loop", 1), ("stopped mid-loop", 4)):
+        seen = {"n": 0}
+
+        def cancelled(budget=budget, seen=seen):
+            seen["n"] += 1
+            return seen["n"] > budget
+
+        events = list(wa.run_turn(Two(), [{"role": "user", "content": "go"}],
+                                  [], wa.ToolContext(), mode="agent",
+                                  max_steps=2, cancelled=cancelled))
+        done = next(e for e in events if e["type"] == "done")
+        ids = [c["id"] for m in done["messages"]
+               for c in (m.get("tool_calls") or [])]
+        answered = [m["tool_call_id"] for m in done["messages"]
+                    if m.get("role") == "tool"]
+        check(f"{label}: every announced call is answered",
+              set(ids) == set(answered), (ids, answered))
+
+
+def test_only_a_real_truncation_blames_max_tokens():
+    """A model emitting a Python dict literal fails to parse in exactly the
+    same way as one cut off at the ceiling. Telling that user to raise
+    max_tokens sends them to fix a setting that is not the problem - and the
+    turn used to abort rather than let the model correct itself."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent))
+    import webui_agent as wa
+
+    mk = lambda cid, name, args: {"id": cid, "type": "function",
+                                  "function": {"name": name, "arguments": args}}
+
+    class Malformed:
+        def stream(self, messages, tools=None, sampling=None):
+            yield "finish", "stop"
+            yield "tool_calls", [mk("x", "read_file", "{'path': 'a.txt'}")]
+
+    events = list(wa.run_turn(Malformed(), [{"role": "user", "content": "go"}],
+                              [], wa.ToolContext(), mode="agent",
+                              sampling={"max_tokens": 16384}, max_steps=3))
+    check("bad JSON that is not a truncation says nothing about the limit",
+          not [e for e in events if e["type"] == "error"])
+    check("...it fails that one call instead",
+          any(e["type"] == "tool_result" and not e["ok"] for e in events))
+    check("...and the turn carries on so the model can correct itself",
+          sum(1 for e in events if e["type"] == "step") > 1)
+
+    # arguments that parse but are not an object
+    for raw, kind in (("", "empty"), ("   ", "blank"), ("null", "null"),
+                      ("[1,2]", "list"), ("3", "int")):
+        fixed, notes, by_id = wa.repair_tool_calls([mk("z", "list_dir", raw)])
+        stored = fixed[0]["function"]["arguments"]
+        check(f"{kind} arguments are stored as an object", stored == "{}", stored)
+
+    # shapes that used to raise
+    for bad in ([None], [{"id": "n"}], [{"function": {}}], "notalist", None):
+        try:
+            if isinstance(bad, list):
+                wa.repair_tool_calls(bad)
+            wa.heal_messages([{"role": "assistant", "tool_calls": bad}])
+            ok = True
+        except Exception as e:                       # noqa: BLE001
+            ok = f"{type(e).__name__}: {e}"
+        check(f"a malformed {str(bad)[:18]} does not raise", ok is True, ok)
+
+
+def test_menus_survive_the_click_that_opens_them():
+    """A document-level listener closes any open menu on a click outside it.
+
+    That listener sees the very click that opened the menu, because it bubbles
+    all the way up - so a menu opened from an onclick handler that does not
+    stop propagation opens and shuts in the same tick. The element is still in
+    the DOM with `hidden` set, which is what makes this so easy to miss: a test
+    that reads the menu's buttons finds them and passes, while nothing was ever
+    on screen. Every opener has to stop the click."""
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    closer = "if (!e.target.closest(\"#menu-pop\")) closeMenu();"
+    check("the document still closes menus on an outside click", closer in js)
+
+    for opener in ("function effortMenu(", "function permissionsMenu("):
+        body = js.split(opener)[1].split("\nfunction ")[0]
+        check(f"{opener.split('function ')[1].rstrip('(')} stops the opening click",
+              "stopPropagation()" in body)
+
+    # ...and the handlers bound to a click hand the event over to be stopped
+    check("the chips pass the event to their opener",
+          '$("#stat-effort").onclick = effortMenu;' in js
+          and '$("#stat-perm").onclick = permissionsMenu;' in js)
+
+    # sessionMenu is safe by two other routes, and both have to stay that way:
+    # the "more" button stops the click before calling it, and a right-click
+    # never produces a click event for the document listener to see.
+    check("the row's menu button stops the click for it",
+          "e.stopPropagation(); sessionMenu(e, row, s);" in js)
+    check("...and its other opener is contextmenu, which fires no click",
+          "row.oncontextmenu = (e) => sessionMenu(e, row, s);" in js)
+
+
+def test_thinking_is_visible_and_settable_from_the_composer():
+    """The effort setting used to exist only inside Settings, so a terse answer
+    gave you no way to tell whether it was the setting or the model."""
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    html = (Path(__file__).parent / "webui" / "index.html").read_text()
+
+    check("there is a chip for it beside the model", 'id="stat-effort"' in html)
+    check("...that says what the setting is", 'id="stat-effort-name"' in html)
+    check("...and looks like something you can open", 'id="stat-effort"' in html
+          and "chev" in html.split('id="stat-effort"')[1][:400])
+    check("it is kept in step with every other way of changing it",
+          js.count("refreshEffort()") >= 5)
+    check("an endpoint with no levels explains itself rather than looking empty",
+          "reported no effort levels" in js)
+    check("...and a menu can carry a line that is not a choice", "item.note" in js)
+
+    # permissions
+    check("a standing permission is shown in the composer", 'id="stat-perm"' in html)
+    check("...only when it is not the safe default", 'now === "ask"' in
+          js.split("function refreshPermissions")[1][:400])
+    check("...and loudest when everything is accepted",
+          'classList.toggle("hot"' in js)
+    app = (Path(__file__).parent / "webui_app.py").read_text()
+    check("the server reads the stance from the request, never from memory",
+          'settings.get("permissions"' in app)
+    check("...and turns it into names, so run_turn is unchanged",
+          "t.risk in (webui_tools.WRITE, webui_tools.EXEC)" in app)
+
+
+def test_the_server_describes_itself_on_models():
+    """Point one copy of this kit at another as a provider and it must be able
+    to discover what that one supports.
+
+    /v1/models published an id and a context length and nothing else, so the
+    probe that reads reasoning levels and modalities off a /models row found
+    neither - and the UI honestly reported "this provider did not say which
+    levels it takes" about a server whose own chat template accepts three.
+    The keys below are the ones the prober already understands, which are the
+    shapes hosted APIs use; none of them is private to this kit."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent))
+    import webui_providers as wp
+
+    src = (Path(__file__).parent / "serve_openai.py").read_text()
+    block = src.split("async def models(")[1].split("\nasync def ")[0]
+    check("the levels come from the template, not a hardcoded list",
+          "supported_efforts(tokenizer)" in block)
+    check("...and are published under a key the prober reads",
+          '"supported_reasoning_efforts"' in block)
+    check("modalities are published too", '"input_modalities"' in block)
+    check("a server with no tokenizer still answers",
+          'request.app.get("tokenizer")' in block)
+    check("...and a probe failure is not fatal to /models", "except Exception" in block)
+
+    # the round trip: what this server publishes, the prober must understand
+    row = {"id": "m", "object": "model", "max_model_len": 199936,
+           "supported_reasoning_efforts": ["low", "medium", "xhigh"],
+           "architecture": {"input_modalities": ["text", "image"],
+                            "output_modalities": ["text"]}}
+    check("a provider probe reads those levels back",
+          wp.efforts_from_model_row(row) == ["low", "medium", "xhigh"],
+          wp.efforts_from_model_row(row))
+    check("...and reads vision back", wp.vision_from_model_row(row) is True)
+    text_only = dict(row, architecture={"input_modalities": ["text"],
+                                        "output_modalities": ["text"]})
+    check("...and can tell text-only apart from silent",
+          wp.vision_from_model_row(text_only) is False
+          and wp.vision_from_model_row({"id": "m"}) is None)
+
+
+def test_a_provider_can_be_told_what_it_takes():
+    """An endpoint that says nothing is not an endpoint that says no.
+
+    Images already worked this way - `vision` is the user's answer, kept apart
+    from `vision_detected`, and the user's wins. Reasoning levels had a single
+    field, so pressing Test overwrote whatever the user had entered by hand
+    with whatever the probe found, which for many endpoints is nothing.
+
+    vLLM is the case that forces this: it accepts reasoning_effort through
+    chat_template_kwargs perfectly well, and its /models row mentions none of
+    it - so the probe will never find levels there, and without somewhere to
+    declare them the Thinking menu is permanently two entries long."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent))
+    import webui_providers as wp
+
+    src = (Path(__file__).parent / "webui_providers.py").read_text()
+    check("what the probe found has a field of its own",
+          '"efforts_detected"' in src)
+    check("...and Test writes to that one, not over the user's",
+          'stored["efforts_detected"] = caps["efforts"]' in src
+          and 'stored["efforts"] = caps["efforts"]' not in src)
+    check("both reach the browser", '"efforts_detected": list(' in src)
+
+    row = wp._clean({"id": "p", "name": "P", "base_url": "http://x/v1",
+                     "default_model": "m", "models": ["m"],
+                     "efforts": ["medium", "xhigh", "nonsense"]})
+    check("a declared list is kept, and validated",
+          row["efforts"] == ["medium", "xhigh"], row["efforts"])
+    check("...separately from what was detected", row["efforts_detected"] == [])
+
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    block = js.split("function availableEfforts()")[1].split("\nfunction ")[0]
+    check("the user's answer wins over the probe's", "p?.efforts?.length" in block)
+    check("...and the probe's is the fallback", "efforts_detected" in block)
+    check("the provider form offers the choice", '"Reasoning levels"' in js)
+
+
+def test_the_effort_level_that_is_set_is_the_one_that_is_sent():
+    """Whatever level is chosen goes to the endpoint, unfiltered.
+
+    This was a hardcoded ("low", "medium", "high"), and measurement on a real
+    vLLM + Qwen3 stack showed it wrong in both directions at once: "xhigh" was
+    dropped silently, so choosing Extra high sent nothing and changed nothing,
+    while "high" was forwarded happily and that template rejects it outright -
+    `Unexpected reasoning effort high. Supported types are xhigh (default),
+    medium, and low.` The list of valid levels belongs to the endpoint, and is
+    already answered where that is known: the local server probes its own
+    template, a provider declares them or is probed. Nothing in the middle
+    should have an opinion."""
+    app = (Path(__file__).parent / "webui_app.py").read_text()
+    block = app.split('thinking = str(settings.get')[1].split("with self._lock")[0]
+
+    check("no hardcoded set of levels survives",
+          '("low", "medium", "high")' not in block, block[:200])
+    check("any level that is set is forwarded",
+          'elif thinking and thinking != "default":' in block)
+    check("...as reasoning_effort", 'sampling["reasoning_effort"] = thinking' in block)
+
+    # off has to keep both spellings: vLLM takes "none" only at the top level
+    # and rejects it inside chat_template_kwargs; this kit reads the kwarg.
+    check("off still says it both ways",
+          '"enable_thinking": False' in block
+          and 'sampling["reasoning_effort"] = "none"' in block)
+
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    check("the menu does not present the levels as a ladder",
+          "Named modes, not a ladder" in js)
+    check("...because measurement showed the ordering does not hold",
+          "not guaranteed to think" in js)
+
+
 def test_no_undefined_globals():
     """No function may reference a module global that does not exist.
 
@@ -2671,8 +3141,24 @@ def test_effort_levels_come_from_the_endpoint():
     check("an endpoint offering nothing says so instead of showing dead switches",
           "did not report which effort levels" in js)
     app = (Path(__file__).parent / "webui_app.py").read_text()
-    check("this kit's own server advertises no levels, because it enforces none",
-          '"efforts": [],' in app)
+    srv = (Path(__file__).parent / "serve_openai.py").read_text()
+    # This used to advertise nothing at all, on the grounds that the engine
+    # cannot cut thinking short once it has started. True, but beside the
+    # point: the chat template acts on reasoning_effort when the prompt is
+    # rendered, which is before any of that - so the levels were inert only
+    # because the request never carried them that far.
+    check("the UI reports whatever the mounting server found",
+          '"efforts": list(self.efforts)' in app)
+    check("...and standalone, with no template to ask, that is nothing",
+          "self.efforts: list[str] = []" in app)
+    check("the levels come from the model's own chat template",
+          "def supported_efforts" in srv)
+    check("...a template that ignores the argument advertises none",
+          "len(seen) > 1" in srv)
+    check("the effort actually reaches the template now",
+          "template_effort(tokenizer, reasoning_effort)" in srv)
+    check("...and this template's spelling is not OpenAI's",
+          '"high": "xhigh"' in srv)
 
 
 def test_stop_reaches_the_gpu():
@@ -2879,8 +3365,12 @@ def test_slash_commands():
           "does not offer" in cmd or "did not say it takes" in cmd)
     check("only 'off' is described as exact",
           "this one is exact" in cmd and "not a limit" in cmd)
-    check("the settings panel points at the command",
-          "type /effort in the chat" in js)
+    # This used to point at the command, because the command was the only way
+    # to change a level for one conversation. The chip by the message box is
+    # the shorter route now - and, since the field only sets what a NEW chat
+    # starts on, saying where the per-chat control lives is the point of it.
+    check("the settings field says where a single chat is changed",
+          "use the chip by the message box" in js)
 
 
 def test_reasoning_from_any_endpoint():
@@ -3586,6 +4076,90 @@ def test_font_size_setting():
           ".textsize-row" in style_row)
 
 
+def test_the_thinking_level_belongs_to_the_conversation():
+    """A level used to be one global preference, so choosing "low" for a quick
+    question left every later chat on low until you remembered to put it back.
+    It is a property of the conversation you are in - the Settings entry is
+    only what a new one starts on."""
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    check("the chat carries its own level", "thinking: null" in js
+          or "state.thinking = null" in js)
+    check("...and what is in force is the chat's, then the default",
+          "function currentEffort" in js
+          and "state.thinking || state.settings.thinking" in js)
+    check("the turn is built from that, not from the raw settings",
+          "function turnSettings" in js and "turnSettings()" in js)
+    check("choosing one writes it to the conversation right away",
+          "function setEffort" in js
+          and 'body: JSON.stringify({ thinking: value === "default" ? "" : value })' in js)
+    check("opening a conversation restores its level",
+          "state.thinking = session.thinking || null" in js)
+    check("...and the Settings field is labelled as the default, not the level",
+          "Default thinking for new chats" in js)
+
+    app = (Path(__file__).parent / "webui_app.py").read_text()
+    check("the server accepts a level on a session", '"thinking"' in app)
+    check("...and stores it with the turn", '"thinking": thinking or None' in app)
+    # This once read `thinking in ("low", "medium", "high")`, which was wrong in
+    # both directions at once: it dropped xhigh and max on templates that have
+    # them, and forwarded "high" to templates that 400 on it. Whether a level is
+    # accepted is the endpoint's business; the UI only offers what it declared.
+    check("any declared level is forwarded, not a hardcoded three",
+          'elif thinking and thinking != "default":' in app)
+
+
+def test_levels_can_be_declared_from_the_menu():
+    """Which levels an endpoint takes cannot always be probed - vLLM accepts
+    reasoning_effort perfectly well and its /models row says nothing about it -
+    so it has to be answerable by hand, from the place you noticed the problem
+    rather than four clicks away in Settings."""
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    check("the six candidates are offered", "EFFORT_CANDIDATES" in js
+          and '"minimal", "low", "medium", "high", "xhigh", "max"' in js)
+    check("the editor opens from the chip's own menu", "function levelsEditor" in js
+          and "levelsEditor({ left:" in js)
+    check("a toggle saves to the provider", "function saveLevels" in js
+          and 'await api("/ui/providers"' in js)
+    check("...carrying no key, so the stored one is kept",
+          "{ ...provider, efforts: levels }" in js)
+
+    # The menu has to stay open while you toggle - it is a set, not a choice -
+    # and each row has to show its own new state, because nothing else redraws
+    # it while it is open.
+    body = js.split("function levelsEditor(")[1].split("\nfunction ")[0]
+    check("the rows are toggles that keep the menu open", "keep: true" in body)
+    check("...and repaint their own tick", "button.replaceChild(icon(" in body)
+    check("...marked so it can be read back", "button.dataset.on" in body)
+
+    # This is the bug that made the editor unreachable. The document listener
+    # closes a menu on any click outside it, and decides "outside" by walking
+    # the target's ancestors. A row that opens a second menu replaces the
+    # menu's children first, so by the time the click arrives at document the
+    # button it started on has no ancestors at all - closest() returns null,
+    # the click reads as outside, and the menu that had just opened was shut
+    # in the same tick. It was still in the DOM, `hidden`, which is why a test
+    # that only read its buttons passed while nothing was ever on screen.
+    opener = js.split("function openMenu(")[1].split("\nfunction ")[0]
+    check("a click on a row never reaches the document closer",
+          "e.stopPropagation();" in opener)
+    check("...and the row is handed its own button to repaint",
+          "item.run(button)" in opener)
+
+
+def test_every_test_is_actually_run():
+    """Thirteen tests written in one sitting were never called once: main() is
+    an explicit list, and adding the function is not adding the test. A test
+    that does not run is worse than no test, because it reads as cover."""
+    import re                                           # noqa: WPS433
+    src = Path(__file__).read_text()
+    defined = re.findall(r"^def (test_\w+)\(", src, re.M)
+    body = src[src.index("def main():"):]
+    called = set(re.findall(r"^\s+(test_\w+)\(", body, re.M))
+    missing = [name for name in defined if name not in called]
+    check(f"every one of the {len(defined)} tests is called from main()",
+          not missing, ", ".join(missing))
+
+
 def main():
     root = Path(__file__).resolve().parent.parent
     tmp = root / "workspace"
@@ -3683,6 +4257,22 @@ def main():
     test_bench_bat_checks_the_venv()
     test_webui_bat_runs_the_ui_without_a_model()
     test_font_size_setting()
+    test_sidebar_groups_by_kind()
+    test_a_truncated_tool_call_cannot_brick_a_chat()
+    test_a_poisoned_session_heals_when_it_is_opened()
+    test_a_long_tool_call_is_visible_while_it_streams()
+    test_stray_br_is_a_line_break_not_text()
+    test_the_renderer_cannot_be_made_to_emit_markup()
+    test_a_turn_answers_every_call_it_announces()
+    test_only_a_real_truncation_blames_max_tokens()
+    test_menus_survive_the_click_that_opens_them()
+    test_thinking_is_visible_and_settable_from_the_composer()
+    test_the_server_describes_itself_on_models()
+    test_a_provider_can_be_told_what_it_takes()
+    test_the_effort_level_that_is_set_is_the_one_that_is_sent()
+    test_the_thinking_level_belongs_to_the_conversation()
+    test_levels_can_be_declared_from_the_menu()
+    test_every_test_is_actually_run()
     try:
         urllib.request.urlopen(urllib.request.Request(
             BASE + "/ui/config", headers=UI_HEADERS), timeout=3).close()

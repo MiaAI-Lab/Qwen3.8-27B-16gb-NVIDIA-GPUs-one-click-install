@@ -12,6 +12,7 @@ Events yielded (dicts, one JSON object per SSE message):
 
   {"type": "reasoning", "delta": str}     model's <think> text
   {"type": "content",   "delta": str}     assistant text
+  {"type": "tool_progress", "id", "name", "chars"}   while it is being written
   {"type": "tool_call", "id", "name", "args", "label", "risk"}
   {"type": "approval",  "id", "name", "label", "args"}   waiting for the user
   {"type": "question",  "id", "question", "header", "options"}  ask_user
@@ -160,7 +161,8 @@ class ModelClient:
         return urllib.request.urlopen(req, timeout=self.timeout)
 
     def stream(self, messages, tools=None, sampling=None):
-        """Yield ('reasoning'|'content'|'tool_calls'|'finish'|'usage', value)."""
+        """Yield ('reasoning'|'content'|'tool_partial'|'tool_calls'|'finish'|
+        'usage', value)."""
         payload = {"model": self.model, "messages": messages, "stream": True,
                    "stream_options": {"include_usage": True},
                    **(sampling or {})}
@@ -176,6 +178,8 @@ class ModelClient:
             raise ToolError(f"cannot reach the model server at {self.base_url}: "
                             f"{e}") from e
         calls: dict[int, dict] = {}
+        # last (length, monotonic time) a partial was announced, per call slot
+        announced: dict[int, tuple] = {}
         splitter = ThinkSplitter()
         saw_reasoning_field = False
         with resp:
@@ -196,8 +200,12 @@ class ModelClient:
                     yield "usage", obj["usage"]
                 for choice in obj.get("choices", []):
                     delta = choice.get("delta") or {}
-                    # two spellings are in the wild: this kit and vLLM send
-                    # reasoning_content, OpenRouter and others send reasoning
+                    # Two spellings are in the wild and both are read. This
+                    # kit sends reasoning_content. vLLM used to, and renamed it
+                    # to `reasoning`; that rename is one-directional - it still
+                    # accepts reasoning_content on the way in and nothing maps
+                    # it back on the way out - so a current vLLM build will
+                    # never send the old name. OpenRouter also uses `reasoning`.
                     reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                     if reasoning:
                         saw_reasoning_field = True
@@ -223,6 +231,22 @@ class ModelClient:
                         if fn.get("arguments"):
                             # complete on this server, fragmented on others
                             slot["function"]["arguments"] += fn["arguments"]
+                        # The finished call is only yielded when the whole reply
+                        # ends, so a large argument - a file being written in one
+                        # call - is minutes of silence at the browser. Announce
+                        # the call as soon as it has a name, then every so often
+                        # as it grows, throttled so a fast stream does not turn
+                        # into one SSE frame per token.
+                        grown = len(slot["function"]["arguments"])
+                        was = announced.get(idx)
+                        if slot["function"]["name"] and (
+                                was is None or grown - was[0] >= 1500
+                                or time.monotonic() - was[1] >= 0.5):
+                            announced[idx] = (grown, time.monotonic())
+                            yield "tool_partial", {
+                                "id": slot["id"],
+                                "name": slot["function"]["name"],
+                                "chars": grown}
                     if choice.get("finish_reason"):
                         # whatever the splitter was holding back is not a marker
                         for kind, piece in splitter.flush():
@@ -236,16 +260,99 @@ class ModelClient:
 
 # --------------------------------------------------------------- helpers ----
 
-def _parse_args(raw):
+def parse_args(raw):
+    """(args, error). `error` is None when `raw` was understood.
+
+    A tool call whose arguments do not parse is not a call with no arguments,
+    and reporting it as one sends the model looking for a mistake it did not
+    make. The commonest cause by far is the generation hitting max_tokens in
+    the middle of a long string argument - writing a whole file in one call -
+    so the caller gets the reason and can say that instead."""
     if isinstance(raw, dict):
-        return raw
+        return raw, None
     if not raw:
-        return {}
+        return {}, None
     try:
         got = json.loads(raw)
-        return got if isinstance(got, dict) else {"value": got}
-    except ValueError:
-        return {}
+    except ValueError as e:
+        return {}, f"{e} ({len(raw)} characters received)"
+    return (got, None) if isinstance(got, dict) else ({"value": got}, None)
+
+
+def _parse_args(raw):                    # kept for callers that want just args
+    return parse_args(raw)[0]
+
+
+def repair_tool_calls(calls):
+    """Make a list of tool_calls safe to store in a conversation.
+
+    An arguments string that is not valid JSON must never reach the history:
+    the model server parses it again when it renders the chat template, so one
+    truncated call turns every later request in that conversation into an
+    HTTP 400 and the chat is finished - permanently, because the bad message is
+    saved to disk. Replacing the unparseable string with "{}" keeps the turn
+    readable and the conversation alive.
+
+    Returns (calls, [note, ...], {call_id: reason})."""
+    out, notes, by_id = [], [], {}
+    for call in calls or []:
+        if not isinstance(call, dict):
+            continue                      # not a call; there is nothing to keep
+        fn = dict((call.get("function") or {}))
+        where = fn.get("name") or "a tool call"
+        raw = fn.get("arguments")
+        if isinstance(raw, str):
+            if not raw.strip():
+                # "" and "   " are as unreadable as a truncated string, and are
+                # reachable: every slot is seeded with "" and only truthy
+                # fragments are appended, so a call the model made with no
+                # arguments at all arrives here empty.
+                fn["arguments"] = "{}"
+            else:
+                try:
+                    parsed = json.loads(raw)
+                except ValueError as e:
+                    notes.append(f"{where}: {e} ({len(raw)} characters received)")
+                    by_id[call.get("id")] = f"{e} ({len(raw)} characters received)"
+                    fn["arguments"] = "{}"
+                else:
+                    # Valid JSON, but "null" / "[1,2]" / "3" is not an argument
+                    # object. parse_args wraps those as {"value": ...}, which
+                    # reaches the tool as an unexpected keyword - so the shape
+                    # is checked here, on the raw parse, not on that wrapper.
+                    if not isinstance(parsed, dict):
+                        kind = type(parsed).__name__
+                        notes.append(f"{where}: arguments were {kind}, not an object")
+                        by_id[call.get("id")] = (
+                            f"the arguments were a JSON {kind}, not an object")
+                        fn["arguments"] = "{}"
+        else:
+            fn["arguments"] = json.dumps(raw if isinstance(raw, dict) else {})
+        out.append({**call, "function": fn})
+    return out, notes, by_id
+
+
+def heal_messages(messages):
+    """Repair stored tool calls whose arguments are not valid JSON.
+
+    Returns a new message list, or None when nothing needed repairing - so the
+    caller only rewrites the file when there was something to fix."""
+    out, changed = [], False
+    for m in messages:
+        calls = m.get("tool_calls") if isinstance(m, dict) else None
+        if not isinstance(calls, list):
+            out.append(m)                 # not a shape this knows how to repair
+            continue
+        if not calls:
+            out.append(m)
+            continue
+        fixed, notes, _ = repair_tool_calls(calls)
+        if not notes:
+            out.append(m)
+            continue
+        changed = True
+        out.append({**m, "tool_calls": fixed})
+    return out if changed else None
 
 
 def system_prompt(mode, tool_list, workspace=None):
@@ -294,6 +401,7 @@ def run_turn(client, messages, tool_list, ctx: ToolContext, *, mode="chat",
             break
         yield {"type": "step", "n": step, "max": max_steps}
         content_parts, reasoning_parts, calls = [], [], []
+        finish = None
         started = time.time()
         try:
             for kind, value in client.stream(convo, schemas, sampling):
@@ -307,6 +415,10 @@ def run_turn(client, messages, tool_list, ctx: ToolContext, *, mode="chat",
                     yield {"type": "reasoning", "delta": value}
                 elif kind == "tool_calls":
                     calls = value
+                elif kind == "tool_partial":
+                    yield {"type": "tool_progress", **value}
+                elif kind == "finish":
+                    finish = value
                 elif kind == "usage":
                     usage_total["completion_tokens"] += int(
                         value.get("completion_tokens") or 0)
@@ -323,6 +435,13 @@ def run_turn(client, messages, tool_list, ctx: ToolContext, *, mode="chat",
             return
 
         gen_seconds += time.time() - started
+
+        # A reply that stopped because it ran out of budget rather than
+        # because the model was finished. On a plain answer that is a truncated
+        # sentence; on a tool call it is a truncated JSON argument.
+        truncated = finish == "length"
+        calls, broken, broken_by_id = repair_tool_calls(calls)
+
         assistant = {"role": "assistant", "content": "".join(content_parts) or None}
         if reasoning_parts:
             assistant["reasoning_content"] = "".join(reasoning_parts)
@@ -330,22 +449,64 @@ def run_turn(client, messages, tool_list, ctx: ToolContext, *, mode="chat",
             assistant["tool_calls"] = calls
         convo.append(assistant)
 
-        if not calls or stop():
+        # Only say "output limit" when that is what actually happened. A model
+        # emitting Python-style dict literals produces exactly the same parse
+        # failure with finish_reason "stop", and telling that user to raise
+        # max_tokens sends them to fix a setting that is not the problem.
+        if truncated:
+            limit = (sampling or {}).get("max_tokens")
+            ceiling = f" (max_tokens is {limit})" if limit else ""
+            detail = ("; ".join(broken) if broken
+                      else "the answer was cut off before it finished")
+            yield {"type": "error", "message":
+                   f"The model hit its output limit{ceiling}: {detail}. Raise Max "
+                   f"new tokens in Settings > Generation, or ask for the work in "
+                   f"smaller pieces - writing a whole file in one call is what "
+                   f"usually runs into this."}
+
+        if not calls:
+            break
+        if stop():
+            # the assistant message with its tool_calls is already on the
+            # conversation; every one of them still needs an answer
+            for call in calls:
+                convo.append({"role": "tool", "tool_call_id": call.get("id"),
+                              "name": (call.get("function") or {}).get("name") or "",
+                              "content": "the user stopped the turn before this "
+                                         "call ran"})
             break
 
+        answered = set()
         for call in calls:
             if stop():
                 break
-            name = call["function"]["name"]
-            args = _parse_args(call["function"].get("arguments"))
+            name = (call.get("function") or {}).get("name") or ""
+            args, args_error = parse_args(
+                (call.get("function") or {}).get("arguments"))
             tool = tools_by_name.get(name)
             label = _label(tool, args) if tool else ""
-            yield {"type": "tool_call", "id": call["id"], "name": name,
+            yield {"type": "tool_call", "id": call.get("id"), "name": name,
                    "args": args, "label": label,
                    "risk": tool.risk if tool else SAFE}
 
             t0 = time.time()
-            if tool is None:
+            if broken_by_id.get(call.get("id")):
+                # This one call could not be read. The others in the same reply
+                # are untouched and still run: dropping two good read_file calls
+                # because a third write_file was cut off loses real work and
+                # teaches the model that reading those files failed.
+                ok, output = False, (
+                    f"error: the arguments for {name} could not be read: "
+                    f"{broken_by_id[call.get('id')]}\nhint: "
+                    + ("they were cut off at the output limit - retry with less "
+                       "content per call" if truncated else
+                       "they were not valid JSON - emit the arguments as a JSON "
+                       "object and call it again"))
+            elif args_error:
+                ok, output = False, (
+                    f"error: the arguments for {name} could not be read: "
+                    f"{args_error}")
+            elif tool is None:
                 ok, output = False, (
                     f"error: no such tool: {name}\nhint: available tools are "
                     f"{', '.join(tools_by_name) or 'none'}")
@@ -356,14 +517,14 @@ def run_turn(client, messages, tool_list, ctx: ToolContext, *, mode="chat",
                                          "which assumption you made")
                 else:
                     payload = question_payload(args)
-                    yield {"type": "question", "id": call["id"], **payload}
-                    ctx.ask = lambda p, cid=call["id"]: ask(cid, p)
+                    yield {"type": "question", "id": call.get("id"), **payload}
+                    ctx.ask = lambda p, cid=call.get("id"): ask(cid, p)
                     ok, output = _execute(tool, args, ctx)
             elif tool.risk in (WRITE, EXEC) and approve is not None \
                     and not (pre_approved and pre_approved(name)):
-                yield {"type": "approval", "id": call["id"], "name": name,
+                yield {"type": "approval", "id": call.get("id"), "name": name,
                        "label": label, "args": args, "risk": tool.risk}
-                if not approve(call["id"], tool, args):
+                if not approve(call.get("id"), tool, args):
                     ok, output = False, ("the user declined this call. Do not "
                                          "retry it; explain what you wanted to "
                                          "do, or try a different approach.")
@@ -372,13 +533,31 @@ def run_turn(client, messages, tool_list, ctx: ToolContext, *, mode="chat",
             else:
                 ok, output = _execute(tool, args, ctx)
 
-            convo.append({"role": "tool", "tool_call_id": call["id"],
+            answered.add(call.get("id"))
+            convo.append({"role": "tool", "tool_call_id": call.get("id"),
                           "name": name, "content": output})
-            yield {"type": "tool_result", "id": call["id"], "ok": ok,
+            yield {"type": "tool_result", "id": call.get("id"), "ok": ok,
                    "output": output, "ms": int((time.time() - t0) * 1000)}
             if ctx.plan_changed:
                 ctx.plan_changed = False
                 yield {"type": "plan", "items": list(ctx.plan)}
+
+        # Every id in an assistant message's tool_calls must be answered by a
+        # tool message, or the next request is rejected outright by any strict
+        # endpoint - the same permanent HTTP 400 that a truncated argument used
+        # to cause, and one that heal_messages cannot repair because the
+        # arguments themselves are perfectly valid. The loop above exits early
+        # on Stop, and used to leave the rest of the calls unanswered for good.
+        for call in calls:
+            if call.get("id") in answered:
+                continue
+            convo.append({"role": "tool", "tool_call_id": call.get("id"),
+                          "name": (call.get("function") or {}).get("name") or "",
+                          "content": "the user stopped the turn before this call "
+                                     "ran"})
+
+        if stop():
+            break
     else:
         note = (f"[stopped after {max_steps} tool steps]")
         convo.append({"role": "assistant", "content": note})

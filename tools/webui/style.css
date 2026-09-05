@@ -56,6 +56,11 @@
      of --panel-2. A section heading, a row under the pointer and the row you
      have open all have to be told apart at a glance, and mixing 6% of the
      accent into the panel is not a glance - it is a squint. */
+  /* The window chrome - sidebar and topbar. Derived from --panel until now,
+     which in the light theme made both of them white: the sidebar became the
+     largest white slab on screen while the conversation it framed was white
+     too, and nothing had a shape. It is its own step on the ladder now. */
+  --chrome: #10131b;
   --band: #1c2334;      /* section heading: neutral, so it cannot be mistaken
                            for a selected row */
   --row-hover: #1f2739;
@@ -65,14 +70,15 @@
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
     color-scheme: light;
-    --bg: #f4f6fb;
-    --bg-grad: radial-gradient(1100px 560px at 82% -14%, #e3e9ff 0%, transparent 60%),
-               radial-gradient(800px 460px at 4% 2%, #eaf0ff 0%, transparent 52%);
+    --bg: #e8ebf3;
+    --bg-grad: radial-gradient(1100px 560px at 82% -14%, #eef1fb 0%, transparent 62%),
+               radial-gradient(800px 460px at 4% 2%, #f0f3fc 0%, transparent 55%);
     --panel: #ffffff;
-    --panel-2: #f7f8fc;
+    --panel-2: #eef1f7;
+    --chrome: #dbe0ec;   /* sidebar and topbar: recessed, not white */
     --raise: #ffffff;
-    --line: #a3adc9;
-    --line-soft: #edf0f7;
+    --line: #c2cadb;
+    --line-soft: #d8dfeb;
     --text: #12151d;
     --text-2: #414a5e;
     --muted: #5d6577;   /* AA on the light surfaces */
@@ -85,22 +91,23 @@
     --shadow-1: 0 1px 2px rgba(16, 24, 40, .06);
     --shadow-2: 0 12px 28px -14px rgba(16, 24, 40, .22);
     --shadow-3: 0 26px 60px -24px rgba(16, 24, 40, .3);
-    --band: #e4e8f0;
-    --row-hover: #eceff6;
-    --row-on: #d7deff;
+    --band: #ccd3e2;
+    --row-hover: #e9edf6;
+    --row-on: #d3dcff;
   }
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #f4f6fb;
-  --bg-grad: radial-gradient(1100px 560px at 82% -14%, #e3e9ff 0%, transparent 60%),
-             radial-gradient(800px 460px at 4% 2%, #eaf0ff 0%, transparent 52%);
+  --bg: #e8ebf3;
+  --bg-grad: radial-gradient(1100px 560px at 82% -14%, #eef1fb 0%, transparent 62%),
+             radial-gradient(800px 460px at 4% 2%, #f0f3fc 0%, transparent 55%);
   --panel: #ffffff;
-  --panel-2: #f7f8fc;
+  --panel-2: #eef1f7;
+  --chrome: #dbe0ec;   /* sidebar and topbar: recessed, not white */
   --raise: #ffffff;
-  --line: #a3adc9;
-  --line-soft: #edf0f7;
+  --line: #c2cadb;
+  --line-soft: #d8dfeb;
   --text: #12151d;
   --text-2: #414a5e;
   --muted: #5d6577;   /* AA on the light surfaces */
@@ -113,9 +120,9 @@
   --shadow-1: 0 1px 2px rgba(16, 24, 40, .06);
   --shadow-2: 0 12px 28px -14px rgba(16, 24, 40, .22);
   --shadow-3: 0 26px 60px -24px rgba(16, 24, 40, .3);
-  --band: #e4e8f0;
-  --row-hover: #eceff6;
-  --row-on: #d7deff;
+  --band: #ccd3e2;
+  --row-hover: #e9edf6;
+  --row-on: #d3dcff;
 }
 
 /* ------------------------------------------------------------- basics -- */
@@ -219,13 +226,15 @@ textarea:focus, input:focus, textarea:focus-visible, input:focus-visible {
    half once the pin marker and the menu button have taken their share - is the
    default and what double-clicking the handle goes back to. The clamp is not
    decoration: below ~200px the rows stop being readable, and past ~520px the
-   thread is the thing being squeezed. */
-:root { --side-w: 292px; --side-w-min: 200px; --side-w-max: 520px; }
+   thread is the thing being squeezed. The clamp itself is SIDE_W in app.js -
+   the drag handler needs it in pixels - so it is deliberately not duplicated
+   here as custom properties nothing would read. */
+:root { --side-w: 292px; }
 
 #sidebar {
   position: relative;
   width: var(--side-w); flex: 0 0 var(--side-w); display: flex; flex-direction: column;
-  background: color-mix(in srgb, var(--panel) 82%, transparent);
+  background: color-mix(in srgb, var(--chrome) 82%, transparent);
   backdrop-filter: blur(14px);
   border-right: 1px solid var(--line-soft);
   z-index: 6;
@@ -483,6 +492,12 @@ body.resizing * { cursor: col-resize !important; }
 .menu .ico { width: 15px; height: 15px; color: var(--muted); }
 .menu button:hover .ico { color: inherit; }
 .menu hr { border: none; border-top: 1px solid var(--line-soft); margin: 4px 2px; }
+/* A line in a menu that is not a choice - it explains why the choices above
+   are so few. */
+.menu-note {
+  padding: 6px 11px 8px; max-width: 260px; color: var(--muted);
+  font-size: calc(11px * var(--text-scale)); line-height: 1.5;
+}
 
 .side-foot { border-top: 1px solid var(--line-soft); padding: 10px 14px 12px;
              display: flex; flex-direction: column; gap: 5px; }
@@ -549,7 +564,7 @@ body.resizing * { cursor: col-resize !important; }
 #topbar {
   display: flex; align-items: center; gap: 10px; padding: 11px 18px;
   border-bottom: 1px solid var(--line-soft);
-  background: color-mix(in srgb, var(--panel) 68%, transparent);
+  background: color-mix(in srgb, var(--chrome) 68%, transparent);
   backdrop-filter: blur(14px); z-index: 3;
 }
 .spacer { flex: 1; }
@@ -870,6 +885,13 @@ body.resizing * { cursor: col-resize !important; }
   background: color-mix(in srgb, var(--ok) 11%, transparent); }
 .tool .state.err { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent);
   background: color-mix(in srgb, var(--danger) 11%, transparent); }
+/* A call still being written has no arguments to show yet, so it has no
+   disclosure triangle to offer and its count is the only thing moving. */
+.tool.pending { border-style: dashed;
+  border-color: color-mix(in srgb, var(--warn) 32%, var(--line)); }
+.tool.pending > summary { cursor: default; }
+.tool.pending > summary:hover { background: none; }
+.tool.pending .arg { font-variant-numeric: tabular-nums; }
 .tool .io { padding: 0 13px 13px; }
 .tool[open] .io { animation: reveal var(--med) both; }
 .tool .lbl { font-size: calc(10px * var(--text-scale)); text-transform: uppercase; letter-spacing: .07em;
@@ -1096,6 +1118,35 @@ body.resizing * { cursor: col-resize !important; }
 .model-chip:focus-visible { outline: none; box-shadow: var(--ring); }
 .model-chip[disabled] { pointer-events: none; opacity: .55; }
 .model-chip .tag.remote { margin-left: 1px; }
+/* The two state chips beside the model. Quieter than it - they say what the
+   settings are, and only the model is something you change per question. */
+.model-chip.quiet { border-color: var(--line-soft); background: transparent;
+  color: var(--muted); padding-left: 8px; padding-right: 8px; }
+.model-chip.quiet:hover { background: var(--panel-2); color: var(--text-2); }
+.model-chip.quiet .ico { width: 13px; height: 13px; }
+.model-chip.quiet .chev { width: 12px; height: 12px; opacity: .8; }
+/* Standing permission is not a quiet setting: if the agent can write or run
+   without asking, that has to be visible from the composer, every turn. */
+.model-chip.warn {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  color: var(--warn); font-weight: 600;
+}
+.model-chip.warn .ico { color: var(--warn); width: 13px; height: 13px; }
+.model-chip.warn:hover {
+  background: color-mix(in srgb, var(--warn) 20%, transparent);
+  border-color: var(--warn); color: var(--warn);
+}
+.model-chip.warn.hot {
+  border-color: color-mix(in srgb, var(--danger) 50%, var(--line));
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+.model-chip.warn.hot .ico { color: var(--danger); }
+.model-chip.warn.hot:hover {
+  background: color-mix(in srgb, var(--danger) 20%, transparent);
+  border-color: var(--danger); color: var(--danger);
+}
 
 .hint {
   flex: 1; min-width: 120px; justify-content: flex-end; text-align: right;
@@ -1106,6 +1157,34 @@ body.resizing * { cursor: col-resize !important; }
   font-family: var(--mono); font-size: calc(10px * var(--text-scale)); padding: 1px 6px; border-radius: 5px;
   border: 1px solid var(--line); background: var(--panel-2); color: var(--text-2);
 }
+
+/* Command suggestions. Sits above the input rather than below it: the
+   composer is already at the bottom of the window, and a menu that opened
+   downwards would be off-screen. */
+.slash {
+  max-width: 800px; margin: 0 auto 8px; padding: 5px;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--panel); box-shadow: var(--shadow-3);
+  max-height: 260px; overflow-y: auto;
+  animation: pop 120ms var(--ease) both;
+}
+.slash[hidden] { display: none; }
+.slash-item {
+  display: flex; align-items: baseline; gap: 10px; width: 100%; text-align: left;
+  padding: 7px 10px; border: none; background: none; border-radius: var(--r-sm);
+  color: var(--text-2); transition: background var(--fast), color var(--fast);
+}
+.slash-item b {
+  font-family: var(--mono); font-size: calc(12px * var(--text-scale));
+  color: var(--accent); font-weight: 600; flex: none;
+}
+.slash-item span {
+  font-size: calc(11.5px * var(--text-scale)); color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.slash-item.on { background: var(--row-on); color: var(--text); }
+.slash-item.on span { color: var(--text-2); }
+.slash-item:hover { background: var(--row-hover); }
 
 .to-bottom {
   position: absolute; left: 50%; bottom: 118px; transform: translateX(-50%);
@@ -1193,14 +1272,23 @@ body.resizing * { cursor: col-resize !important; }
    the pointer every time you change section */
 .modal-box.wide { width: min(880px, 100%); height: min(620px, 86vh);
                   max-height: 86vh; }
-.modal-box.wide #modal-body { padding: 0; overflow: hidden; display: flex; }
+.modal-box.wide #modal-body {
+  padding: 0; overflow: hidden; display: flex;
+  /* The box has a fixed height; without this the body only grows to fit its
+     content and the rest of the box is left bare. The rail's own background
+     then stopped two thirds of the way down, which read as the rail ending
+     rather than as the body not filling its container. */
+  flex: 1 1 auto; min-height: 0;
+}
 
 .settings { display: flex; width: 100%; min-height: 0; }
 
 .set-nav {
   flex: 0 0 194px; display: flex; flex-direction: column; gap: 2px;
   padding: 12px 10px; border-right: 1px solid var(--line-soft);
-  background: color-mix(in srgb, var(--panel-2) 55%, transparent);
+  /* solid, not 55% of it: over a white dialog the tint disappeared and the
+     rail read as part of the pane rather than as the index to it */
+  background: var(--panel-2);
   overflow-y: auto;
 }
 .set-tab {
@@ -1358,11 +1446,27 @@ input[type=range]::-moz-range-thumb {
   #scrim.on { opacity: 1; pointer-events: auto; }
   .ws-chip { max-width: 30vw; }
   .speed { display: none; }
+  /* Below ~500px the row - menu, mode switch, workspace chip, install, theme,
+     settings - is wider than the window, and because body has overflow:hidden
+     there is no scroll to reach what falls off the end: Settings and the theme
+     toggle were simply gone in Agent mode. The mode switch keeps its icons and
+     drops its labels, and the chip yields first. */
+  .modes { flex: 0 1 auto; min-width: 0; }
+  .ws-chip { flex: 0 1 auto; min-width: 0; }
+  #topbar { gap: 4px; padding-left: 6px; padding-right: 6px; }
   .cards { grid-template-columns: 1fr; }
   #thread { padding: 20px 14px 6px; }
   #composer { padding: 10px 14px 14px; }
   .msg.user .body { max-width: 92%; }
   #welcome { margin-top: 3vh; }
+}
+@media (max-width: 520px) {
+  .mode span { display: none; }          /* the icons carry it from here */
+  .mode { padding-left: 12px; padding-right: 12px; }
+  .ws-chip { max-width: 22vw; }
+  #install-btn span { display: none; }
+}
+@media (max-width: 900px) {
   #welcome h1 { font-size: calc(22.5px * var(--text-scale)); }
   #welcome .sub { font-size: calc(13px * var(--text-scale)); margin-bottom: 22px; }
   .hero-mark { width: 48px; height: 48px; border-radius: 16px; margin-bottom: 16px; }

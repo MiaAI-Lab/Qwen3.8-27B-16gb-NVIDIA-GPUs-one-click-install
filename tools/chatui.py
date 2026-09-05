@@ -79,7 +79,8 @@ def mount(app, ui: ChatUI) -> None:
             return web.Response(status=result.status, body=result.body,
                                 content_type=result.content_type.split(";")[0],
                                 charset="utf-8" if "charset" in result.content_type
-                                else None)
+                                else None,
+                                headers=result.headers or None)
 
         resp = web.StreamResponse(headers=SSE_HEADERS)
         await resp.prepare(request)
@@ -140,6 +141,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(result.status)
             self.send_header("Content-Type", result.content_type)
             self.send_header("Content-Length", str(len(result.body)))
+            for key, value in (result.headers or {}).items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(result.body)
             return

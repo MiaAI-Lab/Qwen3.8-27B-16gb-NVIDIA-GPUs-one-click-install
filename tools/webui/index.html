@@ -154,6 +154,10 @@
 
     <footer id="composer">
       <div id="attachments"></div>
+      <!-- command suggestions, above the input: the composer is anchored to the
+           bottom of the window, so opening downwards would run off it -->
+      <div id="slash-pop" class="slash" hidden role="listbox"
+           aria-label="Commands"></div>
       <div class="input-shell">
         <button id="attach" class="icon ghost" title="Attach an image" aria-label="Attach an image">
           <svg class="ico"><use href="#i-clip"/></svg>
@@ -173,6 +177,17 @@
           <svg class="ico"><use href="#i-cpu"/></svg>
           <span id="stat-model-name">-</span>
           <b id="stat-remote" class="tag remote" hidden></b>
+          <svg class="ico chev"><use href="#i-down"/></svg>
+        </button>
+        <button id="stat-effort" class="model-chip quiet" title="How hard the model thinks">
+          <svg class="ico"><use href="#i-bolt"/></svg>
+          <span id="stat-effort-name">-</span>
+          <svg class="ico chev"><use href="#i-down"/></svg>
+        </button>
+        <button id="stat-perm" class="model-chip warn" hidden
+                title="What the agent may do without asking">
+          <svg class="ico"><use href="#i-shield"/></svg>
+          <span id="stat-perm-name">-</span>
           <svg class="ico chev"><use href="#i-down"/></svg>
         </button>
         <div class="hint" id="hint"></div>
