@@ -557,6 +557,32 @@ const TOOL_VIEW = {
                  subject: (a) => a.question },
 };
 
+/* A page the agent just wrote is something you want to look at, now, not go
+   hunting for in a folder. Anything the browser can render as a page counts. */
+const OPENABLE = /\.(html?|svg|pdf)$/i;
+
+function wroteAPage(name, args) {
+  if (name !== "write_file" && name !== "edit_file") return "";
+  const path = (args || {}).path || "";
+  return OPENABLE.test(path) ? path : "";
+}
+
+/* It opens in its own tab, from a route that serves it with an opaque origin -
+   the model wrote this page, and it must not be able to act as this UI. */
+function pageUrl(path) {
+  return `/ui/file?session=${encodeURIComponent(state.sessionId || "")}`
+       + `&path=${encodeURIComponent(path)}`;
+}
+
+function openPageLink(path, cls) {
+  const a = el("a", cls || "act");
+  a.href = pageUrl(path);
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  a.append(icon("globe"), el("span", null, `Open ${path.split(/[\\/]/).pop()}`));
+  return a;
+}
+
 /* A tool nobody taught this UI about still has to read as a sentence. */
 function toolView(name) {
   return TOOL_VIEW[name] || {
@@ -683,6 +709,20 @@ function toolCard(container, call) {
   const summary = toolSummary(view, subject, true);
   summary.querySelector(".state").className = "state run";
   summary.querySelector(".state").textContent = "running";
+  const page = wroteAPage(call.name, args);
+  if (page) {
+    // A file written and then appended to six times is one page, not seven.
+    // The link belongs on the last call that touched it - that is the version
+    // there is to look at.
+    // Across the whole thread, not just this message: a live turn puts every
+    // step in one body, but a reopened one gives each step its own, and seven
+    // identical links came back the moment the conversation was reopened.
+    const here = pageUrl(page);
+    ($("#thread") || container).querySelectorAll(".tool .open-page")
+      .forEach((old) => { if (old.getAttribute("href") === here) old.remove(); });
+    summary.insertBefore(openPageLink(page, "act open-page"),
+                         summary.querySelector(".state"));
+  }
   const io = el("div", "io");
   if (lost) {
     live.className = "tool-text";
@@ -1187,6 +1227,9 @@ function messageActions(body, stats) {
     else toast("Only the last answer can be retried");
   };
   row.append(retry);
+  // The thing the turn actually produced, one click from where it said so.
+  const page = body.dataset.page;
+  if (page) row.append(openPageLink(page, "act primary-act"));
   if (stats?.usage?.completion_tokens) {
     const bits = [`${stats.usage.completion_tokens.toLocaleString()} tokens`];
     if (stats.tok_s) bits.push(`${stats.tok_s} tok/s`);
@@ -1859,6 +1902,7 @@ function handleEvent(ev, body, cards, stats) {
       if (open) { open.dataset.closed = "1"; open.classList.remove("live"); }
       closeThink(body);
       cards.set(ev.id, toolCard(body, ev));
+      body.dataset.page = wroteAPage(ev.name, ev.args) || body.dataset.page || "";
       scrollDown();
       break;
     }
@@ -2365,9 +2409,20 @@ function renderStoredMessages(messages) {
   const thread = $("#thread");
   thread.replaceChildren();
   const cards = new Map();
+  // A reopened conversation should still offer the page it produced. The
+  // write is several messages above the answer, so the link is worked out
+  // once and hung on the last message that has actions to hang it from.
+  let made = "";
+  messages.forEach((m) => (m.tool_calls || []).forEach((c) => {
+    let args = {};
+    try { args = JSON.parse(c.function.arguments || "{}"); } catch (e) { args = {}; }
+    made = wroteAPage(c.function.name, args) || made;
+  }));
+  const lastSaid = messages.reduce(
+    (at, m, i) => (m.role === "assistant" && m.content ? i : at), -1);
   restoring = true;
   try {
-    messages.forEach((m) => {
+    messages.forEach((m, i) => {
       if (m.role === "user") {
         renderUserBody(newMessage("user"), m.content);
       } else if (m.role === "assistant") {
@@ -2387,6 +2442,7 @@ function renderStoredMessages(messages) {
           node.innerHTML = markdown(m.content);
           node.classList.remove("live");
           node.dataset.closed = "1";
+          if (i === lastSaid && made) body.dataset.page = made;
           messageActions(body);
         }
         (m.tool_calls || []).forEach((c) => {

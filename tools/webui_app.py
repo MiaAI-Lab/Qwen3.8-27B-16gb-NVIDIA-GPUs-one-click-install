@@ -267,6 +267,59 @@ class ChatUI:
         return Response(200, ctype, path.read_bytes(),
                         {"Cache-Control": "no-cache, must-revalidate"})
 
+    # A page the agent just wrote, opened from the conversation that wrote it.
+    # Everything here exists because the file is not ours: a model wrote it,
+    # and it is about to run in a browser.
+    VIEWABLE = {
+        ".html": "text/html", ".htm": "text/html", ".svg": "image/svg+xml",
+        ".css": "text/css", ".js": "text/javascript", ".json": "application/json",
+        ".txt": "text/plain", ".md": "text/plain", ".csv": "text/plain",
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp", ".avif": "image/avif",
+        ".ico": "image/x-icon", ".pdf": "application/pdf",
+        ".mp4": "video/mp4", ".webm": "video/webm",
+        ".mp3": "audio/mpeg", ".wav": "audio/wav",
+    }
+    # Scripts may run - a page that cannot run its own JS is not a preview of
+    # anything - but the document gets an opaque origin, so it can neither read
+    # this UI's storage nor call /ui/* as the user. Without this, opening a
+    # model's HTML would hand it the same origin as the chat: it could delete
+    # conversations or read providers.json, keys and all, from a page the
+    # person only meant to look at.
+    SANDBOX = ("sandbox allow-scripts allow-popups allow-forms allow-modals; "
+               "base-uri 'none'; form-action 'none'")
+
+    def _workspace_file(self, query):
+        sid, rel = query.get("session"), query.get("path") or ""
+        session = self._load(sid) if sid else None
+        root = Path((session or {}).get("workspace") or self.default_workspace)
+        if not rel or any(part.startswith(".") for part in Path(rel).parts):
+            return Response(404, "text/plain", b"not found")
+        suffix = Path(rel).suffix.lower()
+        if suffix not in self.VIEWABLE:
+            # Not a refusal to be worked around: this route exists to look at
+            # what the agent made, and the workspace is a real folder with
+            # real secrets in it. Anything else is read through the agent.
+            return Response(403, "text/plain",
+                            f"{suffix or 'this kind of file'} is not viewable "
+                            f"here".encode())
+        try:
+            target = webui_tools.Workspace(root).resolve(rel)
+        except Exception:                               # noqa: BLE001
+            return Response(404, "text/plain", b"not found")
+        if not target.is_file():
+            return Response(404, "text/plain", b"not found")
+        ctype = self.VIEWABLE[suffix]
+        if ctype.startswith(("text/", "image/svg", "application/json")):
+            ctype += "; charset=utf-8"
+        headers = {
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+            "Content-Security-Policy": self.SANDBOX,
+        }
+        return Response(200, ctype, target.read_bytes(), headers)
+
     # ---------------------------------------------------------- sessions ----
 
     def _path(self, sid):
@@ -906,6 +959,8 @@ class ChatUI:
                               "model": self.model_id,
                               "base_url": self.model_base},
                 })
+            if path == "/ui/file":
+                return self._workspace_file(query)
             if path == "/ui/browse":
                 return self._browse(query.get("path"))
             return Response(404, "text/plain", b"not found")

@@ -4278,6 +4278,80 @@ def test_a_cut_off_call_is_told_apart_from_a_malformed_one():
           (banner or {}).get("message"))
 
 
+def test_a_page_the_agent_wrote_can_be_opened_but_not_trusted():
+    """Asking for "a single HTML file" and then being told where it is on disk
+    is a strange place to stop, so the conversation offers to open it. That
+    means serving a file a model wrote, to a browser - and if it were served
+    on this UI's own origin it could read providers.json, keys and all, or
+    delete conversations, from a page the person only meant to look at."""
+    import shutil, tempfile                             # noqa: WPS433
+    from webui_app import ChatUI                        # noqa: WPS433
+
+    root = Path(tempfile.mkdtemp(prefix="page-"))
+    try:
+        work = root / "workspace"
+        (work / "sub").mkdir(parents=True)
+        (work / "made.html").write_text("<h1>hi</h1>", encoding="utf-8")
+        (work / "sub" / "deep.html").write_text("<p>deep</p>", encoding="utf-8")
+        (work / "notes.md").write_text("notes", encoding="utf-8")
+        (work / ".env").write_text("KEY=secret", encoding="utf-8")
+        (work / "secrets.env").write_text("KEY=secret", encoding="utf-8")
+        (root / "above.html").write_text("<p>not yours</p>", encoding="utf-8")
+        ui = ChatUI(root=root, cfg={}, model_base="http://127.0.0.1:1/v1",
+                    model_id="m")
+
+        def get(path):
+            return ui.handle("GET", "/ui/file", {"path": path}, b"")
+
+        ok = get("made.html")
+        check("a page it wrote is served", ok.status == 200 and b"hi" in ok.body)
+        check("...as html", ok.content_type.startswith("text/html"))
+        check("a page in a subfolder too", get("sub/deep.html").status == 200)
+        check("and other things worth looking at", get("notes.md").status == 200)
+
+        # The workspace is a real folder with real secrets in it.
+        for bad in (".env", "sub/../.env", "../above.html", "/etc/passwd",
+                    "../../etc/passwd", "", "."):
+            got = get(bad)
+            check(f"refused: {bad!r}", got.status in (403, 404), got.status)
+        check("a file whose name merely ends in .env is refused too",
+              get("secrets.env").status == 403)
+        check("...and the refusal says what this route is for",
+              b"not viewable" in get("secrets.env").body)
+
+        # Scripts must run - a page that cannot run its own JS is not a preview
+        # of anything - but not as this UI.
+        csp = ok.headers.get("Content-Security-Policy", "")
+        check("the page is sandboxed", "sandbox" in csp)
+        check("...it may run its own scripts", "allow-scripts" in csp)
+        check("...but never as this origin", "allow-same-origin" not in csp)
+        check("...and cannot retarget the page it came from",
+              "base-uri 'none'" in csp and "form-action 'none'" in csp)
+        check("the type is not sniffed into something else",
+              ok.headers.get("X-Content-Type-Options") == "nosniff")
+        check("a rewritten file is never served from cache",
+              ok.headers.get("Cache-Control") == "no-store")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    check("the conversation offers the page it made",
+          "function wroteAPage" in js and "const OPENABLE" in js)
+    check("...for the shapes a browser can show as a page",
+          "html?|svg|pdf" in js)
+    check("...only for a call that actually wrote one",
+          'name !== "write_file" && name !== "edit_file"' in js)
+    check("it opens in its own tab, with no handle back to this one",
+          'a.target = "_blank"' in js and 'a.rel = "noopener noreferrer"' in js)
+    # A file written and then appended to six times is one page, not seven.
+    check("one link per file, across the whole thread",
+          '($("#thread") || container).querySelectorAll(".tool .open-page")' in js)
+    check("and the finished turn offers it where the answer ends",
+          "const page = body.dataset.page;" in js)
+    check("...including a conversation reopened later",
+          "if (i === lastSaid && made) body.dataset.page = made;" in js)
+
+
 def test_the_reply_ceiling_is_not_the_thing_that_decides_what_fits():
     """Max new tokens is a ceiling, not an allocation: a limit never reached
     costs nothing, and one that is reached costs the whole tool call, because
@@ -4862,6 +4936,7 @@ def main():
     test_levels_can_be_declared_from_the_menu()
     test_arguments_can_be_read_as_they_arrive()
     test_a_cut_off_call_is_told_apart_from_a_malformed_one()
+    test_a_page_the_agent_wrote_can_be_opened_but_not_trusted()
     test_the_reply_ceiling_is_not_the_thing_that_decides_what_fits()
     test_a_ceiling_nobody_chose_moves_when_the_default_moves()
     test_an_approval_asks_in_words_a_person_can_judge()

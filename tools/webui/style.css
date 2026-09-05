@@ -989,6 +989,25 @@ body.resizing * { cursor: col-resize !important; }
 .tool-args dd { margin: 0; color: var(--text-2); font-family: var(--mono);
   overflow-wrap: anywhere; }
 .tool .plan-list.mini { padding: 4px 0 0; max-height: none; }
+/* the page the call just wrote, one click from the line that says it wrote it */
+.tool .open-page {
+  flex: none; display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 9px; border-radius: 999px; text-decoration: none;
+  border: .5px solid color-mix(in srgb, var(--accent) 45%, var(--line));
+  color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, transparent);
+  font-size: calc(10.5px * var(--text-scale)); letter-spacing: .04em;
+  transition: background var(--fast), border-color var(--fast);
+}
+.tool .open-page:hover { background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border-color: var(--accent); }
+.tool .open-page .ico { width: 12px; height: 12px; }
+.msg-actions .primary-act {
+  text-decoration: none; color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.msg-actions .primary-act:hover { color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 20%, transparent); }
 
 /* approvals --------------------------------------------------------- */
 .approval {
