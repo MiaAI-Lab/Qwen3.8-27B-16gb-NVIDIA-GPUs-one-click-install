@@ -583,6 +583,80 @@ function openPageLink(path, cls) {
   return a;
 }
 
+/* The moment the thing you asked for exists.
+
+   A row of small grey buttons is the wrong shape for it: Copy and Retry are
+   things you might do, and this is the answer. So it is its own card, the
+   width of the reply, and it shows the page rather than describing it - the
+   preview is the real file, rendered, which is also the fastest way to see
+   that it came out right. */
+function pageReadyCard(path, bytes) {
+  const name = path.split(/[\\/]/).pop();
+  const card = el("a", "page-ready");
+  card.href = pageUrl(path);
+  card.target = "_blank";
+  card.rel = "noopener noreferrer";
+  card.title = `Open ${name} in a new tab`;
+
+  const shot = el("span", "shot");
+  shot.dataset.src = pageUrl(path);
+  const meta = el("span", "meta");
+  meta.append(el("span", "eyebrow", "Ready"),
+              el("span", "name", name),
+              el("span", "sub", kindOf(name)));
+  const go = el("span", "go");
+  go.append(icon("send"));
+  card.append(el("span", "ring"), shot, meta, go);
+  mountPreview(shot);
+  if (bytes) sizeInto(meta.querySelector(".sub"), card.href, kindOf(name));
+  return card;
+}
+
+const KINDS = { html: "HTML page", htm: "HTML page", svg: "SVG drawing",
+                pdf: "PDF document" };
+
+function kindOf(name) {
+  return KINDS[(name.split(".").pop() || "").toLowerCase()] || "File";
+}
+
+/* The real page, rendered small. It is mounted only while the card is on
+   screen: a transcript with a dozen of these must not be a dozen pages all
+   running their own animation loops behind a scrollbar. */
+function mountPreview(shot) {
+  const calm = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const show = () => {
+    if (shot.firstChild) return;
+    const frame = el("iframe");
+    frame.src = shot.dataset.src;
+    frame.setAttribute("sandbox", "allow-scripts");   // belt and braces
+    frame.setAttribute("scrolling", "no");
+    frame.setAttribute("tabindex", "-1");
+    frame.setAttribute("aria-hidden", "true");
+    frame.loading = "lazy";
+    shot.append(frame);
+  };
+  if (calm || !("IntersectionObserver" in window)) { show(); return; }
+  const watch = new IntersectionObserver((rows) => {
+    rows.forEach((row) => {
+      if (row.isIntersecting) show();
+      else shot.replaceChildren();
+    });
+  }, { rootMargin: "200px" });
+  watch.observe(shot);
+}
+
+/* The size is the file's own, read from the response rather than guessed from
+   what the model happened to send: appends mean the last write is not the
+   file. The body is cancelled the moment the headers land. */
+async function sizeInto(node, url, kind) {
+  try {
+    const res = await fetch(url);
+    const len = Number(res.headers.get("content-length")) || 0;
+    res.body?.cancel();
+    if (len) node.textContent = `${kind}  ·  ${sizeOf(len)}`;
+  } catch (e) { /* the name and the kind are enough */ }
+}
+
 /* A tool nobody taught this UI about still has to read as a sentence. */
 function toolView(name) {
   return TOOL_VIEW[name] || {
@@ -1206,6 +1280,11 @@ function messageActions(body, stats) {
   const raw = [...body.querySelectorAll(".stream-content")]
     .map(rawOf).join("\n\n").trim();
   if (!raw) return;
+  // Above the row, not in it: what the turn produced is the answer, and Copy
+  // and Retry are things you might do next.
+  if (body.dataset.page && !body.querySelector(".page-ready")) {
+    body.append(pageReadyCard(body.dataset.page, true));
+  }
   const row = el("div", "msg-actions");
   const copy = el("button", "act");
   copy.append(icon("copy"), el("span", null, "Copy"));
@@ -1227,9 +1306,6 @@ function messageActions(body, stats) {
     else toast("Only the last answer can be retried");
   };
   row.append(retry);
-  // The thing the turn actually produced, one click from where it said so.
-  const page = body.dataset.page;
-  if (page) row.append(openPageLink(page, "act primary-act"));
   if (stats?.usage?.completion_tokens) {
     const bits = [`${stats.usage.completion_tokens.toLocaleString()} tokens`];
     if (stats.tok_s) bits.push(`${stats.tok_s} tok/s`);

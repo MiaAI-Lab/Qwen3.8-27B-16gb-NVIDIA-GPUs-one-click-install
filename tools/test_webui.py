@@ -4278,6 +4278,56 @@ def test_a_cut_off_call_is_told_apart_from_a_malformed_one():
           (banner or {}).get("message"))
 
 
+def test_the_finished_file_arrives_as_an_event():
+    """A row of small grey buttons is the wrong shape for the thing you asked
+    for: Copy and Retry are what you might do next, and this is the answer. So
+    the file gets its own card, the width of the reply - and it shows the page
+    rather than describing it, which is also the fastest way to see that it
+    came out right."""
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    css = (Path(__file__).parent / "webui" / "style.css").read_text()
+    card = js.split("function pageReadyCard(")[1].split("\nconst KINDS")[0]
+
+    check("it is a card, above the row of things you might do next",
+          "body.append(pageReadyCard(" in js
+          and ".msg-actions .primary-act" not in css)
+    check("...and still a real link", 'card.target = "_blank"' in card
+          and 'card.rel = "noopener noreferrer"' in card)
+    check("...that says what it is", '"Ready"' in card and "kindOf(name)" in card)
+    check("only one per reply",
+          '!body.querySelector(".page-ready")' in js)
+
+    # The preview is the file itself, rendered - which is the point, and also
+    # the reason it has to be kept in its box.
+    check("the preview is the real page", "shot.dataset.src" in js
+          and 'el("iframe")' in js)
+    check("...sandboxed in its own right, not only by the response",
+          'frame.setAttribute("sandbox", "allow-scripts")' in js)
+    check("...and out of the tab order, since the card is the link",
+          'frame.setAttribute("tabindex", "-1")' in js)
+    check("...unmounted when it scrolls away",
+          "IntersectionObserver" in js and "shot.replaceChildren();" in js)
+    check("...and simply shown when there is no observer to ask",
+          'if (calm || !("IntersectionObserver" in window)) { show(); return; }' in js)
+
+    # Appends mean the last write is not the file, so the size is the file's
+    # own - read from the response and then dropped.
+    check("the size is the file's, not the last write's",
+          "function sizeInto" in js and 'res.headers.get("content-length")' in js)
+    check("...and the body is thrown away once the headers land",
+          "res.body?.cancel();" in js)
+
+    ready = css.split(".page-ready {")[1].split("\n}")[0]
+    check("it arrives rather than appearing", "ready-in" in ready)
+    check("...with one light crossing it, once",
+          "ready-shine 1.5s var(--ease) .2s 1" in css)
+    check("the ring is the same idea as the running row",
+          "mask-composite: exclude" in css.split(".page-ready .ring {")[1].split("}")[0]
+          and "edge-run" in css.split(".page-ready .ring::before")[1].split("}")[0])
+    check("nothing moves for someone who asked for less motion",
+          ".page-ready, .page-ready::after, .page-ready .ring::before," in css)
+
+
 def test_three_themes_and_a_background_that_does_not_band():
     """A wide, shallow ramp across a dark screen is where 8-bit colour runs out
     of steps and the eye reads the steps as stripes. And OLED is not "dark
@@ -4452,8 +4502,9 @@ def test_a_page_the_agent_wrote_can_be_opened_but_not_trusted():
     # A file written and then appended to six times is one page, not seven.
     check("one link per file, across the whole thread",
           '($("#thread") || container).querySelectorAll(".tool .open-page")' in js)
-    check("and the finished turn offers it where the answer ends",
-          "const page = body.dataset.page;" in js)
+    check("and the finished turn hands it over as its own card",
+          "function pageReadyCard" in js
+          and "body.append(pageReadyCard(body.dataset.page, true));" in js)
     check("...including a conversation reopened later",
           "if (i === lastSaid && made) body.dataset.page = made;" in js)
 
@@ -5042,6 +5093,7 @@ def main():
     test_levels_can_be_declared_from_the_menu()
     test_arguments_can_be_read_as_they_arrive()
     test_a_cut_off_call_is_told_apart_from_a_malformed_one()
+    test_the_finished_file_arrives_as_an_event()
     test_three_themes_and_a_background_that_does_not_band()
     test_work_in_progress_looks_like_it()
     test_a_page_the_agent_wrote_can_be_opened_but_not_trusted()

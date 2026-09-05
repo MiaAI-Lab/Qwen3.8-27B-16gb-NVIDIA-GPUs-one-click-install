@@ -1139,13 +1139,133 @@ body.resizing * { cursor: col-resize !important; }
 .tool .open-page:hover { background: color-mix(in srgb, var(--accent) 18%, transparent);
   border-color: var(--accent); }
 .tool .open-page .ico { width: 12px; height: 12px; }
-.msg-actions .primary-act {
-  text-decoration: none; color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
+
+
+/* the file is ready ------------------------------------------------- */
+/* The moment the thing you asked for exists. It gets the width of the reply
+   and a picture of itself, because a row of grey buttons is the wrong shape
+   for an answer - and the preview is the real page, so it is also the fastest
+   way to see that it came out right. */
+.page-ready {
+  position: relative; display: flex; align-items: center; gap: 15px;
+  margin: 14px 0 4px; padding: 13px 15px; border-radius: var(--r-lg);
+  text-decoration: none; color: inherit; overflow: hidden; isolation: isolate;
+  background:
+    linear-gradient(120deg,
+      color-mix(in srgb, var(--accent) 13%, var(--panel)) 0%,
+      var(--panel) 46%,
+      color-mix(in srgb, var(--accent-2) 10%, var(--panel)) 100%);
+  box-shadow: var(--shadow-2), 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
+  animation: ready-in .62s var(--ease) both, ready-sweep 1.5s var(--ease) .2s 1;
+  transition: transform var(--med), box-shadow var(--med);
 }
-.msg-actions .primary-act:hover { color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 20%, transparent); }
+.page-ready:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-3),
+              0 0 0 1px color-mix(in srgb, var(--accent) 52%, transparent),
+              0 14px 40px -18px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+.page-ready:active { transform: translateY(0); }
+.page-ready:focus-visible { outline: none;
+  box-shadow: var(--shadow-2), var(--ring); }
+
+/* A ring that turns: the same conic-masked-to-the-border trick the running
+   chat row uses, so "this is live" reads the same way everywhere. */
+.page-ready .ring {
+  position: absolute; inset: 0; z-index: 0; padding: 1px;
+  border-radius: inherit; overflow: hidden; pointer-events: none;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor; mask-composite: exclude;
+  opacity: .55; transition: opacity var(--med);
+}
+.page-ready:hover .ring { opacity: 1; }
+.page-ready .ring::before {
+  content: ""; position: absolute; left: 50%; top: 50%;
+  width: 180%; aspect-ratio: 1; transform: translate(-50%, -50%);
+  background: conic-gradient(from 0deg,
+    transparent 0 40%,
+    color-mix(in srgb, #fff 70%, var(--accent)) 50%, transparent 60%,
+    transparent 88%,
+    color-mix(in srgb, var(--accent-2) 80%, #fff) 96%, transparent 100%);
+  animation: edge-run 5.5s linear infinite;
+}
+
+/* the page itself, rendered small and inert */
+.page-ready .shot {
+  position: relative; z-index: 1; flex: none;
+  width: 132px; height: 86px; border-radius: var(--r-sm); overflow: hidden;
+  background: var(--panel-2);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .04);
+  transition: transform var(--med), border-color var(--med);
+}
+.page-ready:hover .shot { transform: scale(1.03);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+.page-ready .shot iframe {
+  width: 1200px; height: 782px; border: 0; pointer-events: none;
+  transform: scale(.11); transform-origin: 0 0;
+  animation: fade-in var(--slow) both;
+}
+
+.page-ready .meta { position: relative; z-index: 1;
+  display: grid; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.page-ready .eyebrow {
+  font-size: calc(10px * var(--text-scale)); font-weight: 700;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--accent);
+  display: flex; align-items: center; gap: 6px;
+}
+/* a dot that keeps its own time, so the card is never quite still */
+.page-ready .eyebrow::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 60%, transparent);
+  animation: ready-pulse 2.4s var(--ease) infinite;
+}
+.page-ready .name {
+  font-family: var(--mono); font-size: calc(14px * var(--text-scale));
+  font-weight: 600; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.page-ready .sub {
+  font-size: calc(11.5px * var(--text-scale)); color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.page-ready .go {
+  position: relative; z-index: 1; flex: none;
+  width: 38px; height: 38px; border-radius: 50%; display: grid;
+  place-items: center; color: var(--accent-ink);
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  box-shadow: 0 6px 18px -8px color-mix(in srgb, var(--accent) 80%, transparent);
+  transition: transform var(--med), box-shadow var(--med);
+}
+.page-ready .go .ico { width: 16px; height: 16px; }
+.page-ready:hover .go { transform: translateX(3px) scale(1.06);
+  box-shadow: 0 10px 26px -8px color-mix(in srgb, var(--accent) 90%, transparent); }
+
+/* the one-off light that crosses it as it arrives */
+.page-ready::after {
+  content: ""; position: absolute; inset: 0; z-index: 2; pointer-events: none;
+  background: linear-gradient(104deg, transparent 34%,
+    color-mix(in srgb, #fff 40%, transparent) 50%, transparent 66%);
+  transform: translateX(-130%);
+  animation: ready-shine 1.5s var(--ease) .2s 1;
+}
+@keyframes ready-in {
+  from { opacity: 0; transform: translateY(10px) scale(.985); }
+}
+@keyframes ready-sweep { from { filter: brightness(1.18); } }
+@keyframes ready-shine { to { transform: translateX(130%); } }
+@keyframes ready-pulse {
+  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+  70%  { box-shadow: 0 0 0 7px color-mix(in srgb, var(--accent) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .page-ready, .page-ready::after, .page-ready .ring::before,
+  .page-ready .eyebrow::before { animation: none; }
+  .page-ready::after { display: none; }
+}
 
 /* approvals --------------------------------------------------------- */
 .approval {
