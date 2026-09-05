@@ -644,11 +644,23 @@ function toolCard(container, call) {
   const card = pending || el("details", "tool");
   card.dataset.id = call.id;
   card.dataset.name = call.name;
-  const subject = view.subject(args) || call.label || "";
+  // A call whose arguments could not be read arrives here with none - the
+  // server replaces an unparseable string with {} so it can never poison the
+  // conversation. But the person just watched ten thousand characters of it
+  // arrive, and this block is the only copy of them that exists. Throwing it
+  // away at the exact moment it turns out to matter is the wrong instinct.
+  const live = pending && pending.querySelector(".tool-live");
+  const lost = live && !(view.text && typeof args[view.text] === "string");
+  const subject = view.subject(args) || call.label
+    || (pending && pending.querySelector(".subject")?.textContent) || "";
   const summary = toolSummary(view, subject, true);
   summary.querySelector(".state").className = "state run";
   summary.querySelector(".state").textContent = "running";
   const io = el("div", "io");
+  if (lost) {
+    live.className = "tool-text";
+    io.append(el("div", "lbl", "what arrived before it stopped"), live);
+  }
   toolDetail(io, view, args);
   card.classList.remove("pending");
   card.replaceChildren(summary, io);

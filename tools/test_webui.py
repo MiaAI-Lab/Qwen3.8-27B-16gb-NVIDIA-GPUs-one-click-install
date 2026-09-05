@@ -2419,7 +2419,8 @@ def test_a_truncated_tool_call_cannot_brick_a_chat():
     err_ev = next((e for e in events if e["type"] == "error"), None)
     check("the user is told the output limit was hit", err_ev is not None)
     check("...with the ceiling that was in force",
-          "max_tokens is 4096" in (err_ev or {}).get("message", ""))
+          "Max new tokens is 4096" in (err_ev or {}).get("message", ""),
+          (err_ev or {}).get("message"))
     check("...and what to do about it",
           "Settings" in (err_ev or {}).get("message", ""))
     done = next((e for e in events if e["type"] == "done"), None)
@@ -4246,14 +4247,183 @@ def test_a_cut_off_call_is_told_apart_from_a_malformed_one():
     check("...and a cut one is still stored as {}",
           broken[0]["function"]["arguments"] == "{}")
 
-    src = (Path(__file__).parent / "webui_agent.py").read_text()
-    # "call it again" is the wrong advice for a reply that ran out of room:
-    # repeating the same argument fails in the same place.
-    check("a cut call is not told to simply repeat itself",
-          "Sending it again unchanged will" in src)
-    check("...it is told how to get the rest across",
-          "then add each further part with edit_file" in src)
-    check("...and how far it actually got", "{broke['chars']} characters" in src)
+    # What the model is actually handed. "Call it again" is the wrong advice
+    # for a reply that ran out of room - repeating the same argument fails in
+    # the same place - so this asserts the message, not how it is spelled in
+    # the source: an earlier version of this check grepped the file and went on
+    # passing while the sentence drifted across two string literals.
+    class Cut:
+        def stream(self, messages, tools=None, sampling=None):
+            yield "tool_calls", [{"id": "c1", "type": "function",
+                                  "function": {"name": "write_file",
+                                               "arguments": whole[:120]}}]
+            yield "finish", "stop"          # the endpoint does not own up to it
+
+    events = list(wa.run_turn(Cut(), [{"role": "user", "content": "go"}], [],
+                              wa.ToolContext(), mode="agent",
+                              sampling={"max_tokens": 4096}, max_steps=2))
+    said = " ".join(e.get("output", "") for e in events
+                    if e.get("type") == "tool_result")
+    check("the model is told the call was cut, not that it was malformed",
+          "stopped in the middle of them" in said, said[:160])
+    check("...and not to simply send the same thing again",
+          "stop in the same place" in said, said[:160])
+    check("...but to write the file in pieces",
+          "add each further part with edit_file" in said, said[:160])
+    check("...and how far it got, and how much room there was",
+          "120 characters" in said and "4096 tokens" in said, said[:200])
+    banner = next((e for e in events if e.get("type") == "error"), None)
+    check("the person is told too, even though the endpoint said 'stop'",
+          banner is not None and "did not report" in banner["message"],
+          (banner or {}).get("message"))
+
+
+def test_a_cut_off_call_keeps_what_arrived():
+    """The server replaces an unreadable arguments string with {} so it can
+    never poison the conversation - which means the finished call arrives at
+    the browser with nothing in it. The person had just watched ten thousand
+    characters of that file arrive, and the card was throwing them away at the
+    exact moment they turned out to matter."""
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    card = js.split("function toolCard(")[1].split("\nfunction ")[0]
+    check("the text that arrived is kept when the arguments are not readable",
+          "const live = pending && pending.querySelector" in card
+          and "const lost = live &&" in card)
+    check("...and labelled as what it is",
+          '"what arrived before it stopped"' in card)
+    check("the subject survives too, having been decoded before the cut",
+          'pending.querySelector(".subject")?.textContent' in card)
+
+    agent = (Path(__file__).parent / "webui_agent.py").read_text()
+    # The banner used to fire only on finish_reason == "length". The endpoint
+    # that caused this ended a reply inside a 10,582-character string and still
+    # reported "stop", so the banner never appeared and the person was left
+    # with a failed call and no reason for it.
+    check("the banner follows the evidence, not only finish_reason",
+          "if truncated or cut:" in agent)
+    check("...and says which of the two it saw",
+          "The endpoint did not report" in agent and "usual cause" in agent)
+    check("both name the limit that was hit",
+          "Max new tokens is {limit}" in agent
+          and "This reply could be at most {room} tokens." in agent)
+
+    # Better than reporting it well is not walking into it.
+    check("the agent is told up front that a whole file has to fit in one reply",
+          "A whole file has to fit in one reply" in agent)
+    check("...and what to do instead",
+          "append the rest with\n  edit_file" in agent)
+
+
+def test_a_browser_that_leaves_is_not_an_error():
+    """A browser hangs up constantly and legitimately: a refresh, a closed tab,
+    Stop aborting the fetch part-way through a streamed turn. The write in
+    flight then fails, and only two of the three shapes that takes were caught.
+    Windows raises the third - WinError 10053 arrives as
+    ConnectionAbortedError - so every ordinary refresh printed a nine-frame
+    traceback into the console the person is reading as their log.
+
+    This cannot happen on this machine, so it is provoked directly rather than
+    waited for: each shape is raised from the socket the handler writes to.
+    """
+    import io as _io                                    # noqa: WPS433
+    import chatui                                       # noqa: WPS433
+
+    class Gone(_io.RawIOBase):
+        """A socket whose peer left. Every write fails, as one does."""
+
+        def __init__(self, blow_up):
+            self.blow_up = blow_up
+
+        def write(self, data):
+            raise self.blow_up("the peer went away")
+
+        def writable(self):
+            return True
+
+        def flush(self):
+            pass
+
+    class Fake(chatui._Handler):
+        def __init__(self, blow_up, events):
+            self.wfile = Gone(blow_up)
+            self.rfile = _io.BytesIO(b"")
+            self.path = "/ui/chat"
+            self.headers = {}
+            self.client_address = ("127.0.0.1", 1)
+            self.close_connection = False
+            self.requestline = "POST /ui/chat HTTP/1.1"
+            self.request_version = "HTTP/1.1"
+            self.command = "POST"
+            self._events = events
+            self.sent = []
+
+        def send_response(self, *a, **k):
+            self.sent.append(a)
+
+        def send_header(self, *a, **k):
+            pass
+
+        def end_headers(self):
+            pass
+
+        # stand in for the app: one streamed turn, and one static file
+        @property
+        def ui(self):
+            events, this = self._events, self
+            class _Ui:
+                def handle(self, *a, **k):
+                    return (chatui.Stream(events) if events
+                            else chatui.Response(200, "text/plain", b"x" * 99))
+            return _Ui()
+
+    def stream():
+        for i in range(50):
+            yield {"type": "content", "delta": f"piece {i}"}
+
+    # All three are ConnectionError; the Windows one is the one that got out.
+    for blow_up in (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        for what, events in (("a streamed turn", stream()), ("a static file", None)):
+            handler = Fake(blow_up, events)
+            try:
+                handler._dispatch("POST")
+                ok, why = True, ""
+            except Exception as e:                      # noqa: BLE001
+                ok, why = False, f"{type(e).__name__}: {e}"
+            check(f"{blow_up.__name__} while sending {what} is not an error",
+                  ok, why)
+            check("...and the connection is not read from again",
+                  handler.close_connection is True)
+
+    # A real fault must still be reported: swallowing everything here would
+    # hide a bug in the UI behind a message about the browser.
+    class Boom(Fake):
+        @property
+        def ui(self):
+            class _Ui:
+                def handle(self, *a, **k):
+                    raise ValueError("a real bug")
+            return _Ui()
+
+    try:
+        Boom(BrokenPipeError, None)._dispatch("POST")
+        got = "nothing"
+    except ValueError:
+        got = "ValueError"
+    except Exception as e:                              # noqa: BLE001
+        got = type(e).__name__
+    check("a genuine fault still comes through", got == "ValueError", got)
+
+    # ...and the same forgiveness one level up, where socketserver prints its
+    # own traceback for whatever escapes - including its teardown writes.
+    src = (Path(__file__).parent / "chatui.py").read_text()
+    check("the server does not print a traceback for a client that left",
+          "class _Server(ThreadingHTTPServer)" in src
+          and "def handle_error" in src
+          and "isinstance(sys.exc_info()[1], ConnectionError)" in src)
+    check("...and that is the server actually used",
+          "_Server((args.host, args.port), _Handler)" in src)
+    check("the async mount forgives the same three",
+          "except (ConnectionError, asyncio.CancelledError):" in src)
 
 
 def test_notes_are_written_in_the_dialect_the_renderer_reads():
@@ -4496,6 +4666,8 @@ def main():
     test_levels_can_be_declared_from_the_menu()
     test_arguments_can_be_read_as_they_arrive()
     test_a_cut_off_call_is_told_apart_from_a_malformed_one()
+    test_a_cut_off_call_keeps_what_arrived()
+    test_a_browser_that_leaves_is_not_an_error()
     test_notes_are_written_in_the_dialect_the_renderer_reads()
     test_a_tool_call_reads_as_a_sentence()
     test_a_file_can_be_watched_as_it_is_written()

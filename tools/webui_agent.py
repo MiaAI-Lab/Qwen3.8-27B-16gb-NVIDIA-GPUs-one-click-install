@@ -65,6 +65,12 @@ How to work:
   nothing and stop you from guessing. Never rewrite a file you have not read.
 - Change files with edit_file when the change is local, write_file when the
   file is new or replaced wholesale.
+- A whole file has to fit in one reply, arguments and all. For anything long -
+  a page with its own CSS and script, a module of a few hundred lines - write a
+  first write_file with the opening section and then append the rest with
+  edit_file, a few dozen lines at a time. A reply that runs out of room in the
+  middle of write_file's content loses the entire call, so this is faster than
+  finding out it did not fit.
 - run_command and run_python run for real on this machine, in a fresh shell
   each time - nothing persists between calls, so pass workdir instead of cd.
   The user approves each one, so make each call worth the interruption and say
@@ -578,16 +584,30 @@ def run_turn(client, messages, tool_list, ctx: ToolContext, *, mode="chat",
         # emitting Python-style dict literals produces exactly the same parse
         # failure with finish_reason "stop", and telling that user to raise
         # max_tokens sends them to fix a setting that is not the problem.
-        if truncated:
+        # A call that stopped in the middle of its own arguments is the same
+        # problem whether or not the endpoint owned up to it, and the one that
+        # produced this bug did not: it ended a reply inside a 10,582-character
+        # string and still reported "stop". So the banner follows the evidence
+        # as well as the flag - while still saying which of the two it saw,
+        # because "the endpoint says it hit the limit" and "it looks like it
+        # did" are different claims and only one of them is certain.
+        cut = [why for why in broken_by_id.values() if why.get("cut")]
+        if truncated or cut:
             limit = (sampling or {}).get("max_tokens")
-            ceiling = f" (max_tokens is {limit})" if limit else ""
+            ceiling = f" (Max new tokens is {limit})" if limit else ""
             detail = ("; ".join(broken) if broken
                       else "the answer was cut off before it finished")
+            if truncated:
+                lede = f"The model hit its output limit{ceiling}"
+            else:
+                lede = (f"The reply stopped in the middle of a tool call's "
+                        f"arguments{ceiling}. The endpoint did not report "
+                        f"hitting a limit, but that is the usual cause")
             yield {"type": "error", "message":
-                   f"The model hit its output limit{ceiling}: {detail}. Raise Max "
-                   f"new tokens in Settings > Generation, or ask for the work in "
-                   f"smaller pieces - writing a whole file in one call is what "
-                   f"usually runs into this."}
+                   f"{lede}: {detail}. Raise Max new tokens in "
+                   f"Settings > Generation, or ask for the work in smaller "
+                   f"pieces - writing a whole file in one call is what usually "
+                   f"runs into this."}
 
         if not calls:
             break
@@ -626,12 +646,15 @@ def run_turn(client, messages, tool_list, ctx: ToolContext, *, mode="chat",
                 # the same way. Say that it was cut, how far it got, and how to
                 # get the rest across in pieces.
                 if truncated or broke["cut"]:
+                    room = (sampling or {}).get("max_tokens")
+                    ceiling = (f" This reply could be at most {room} tokens."
+                               if room else "")
                     hint = (f"the reply stopped in the middle of them after "
                             f"{broke['chars']} characters, so the call never "
-                            "arrived complete. Sending it again unchanged will "
-                            "stop in the same place. Write it in pieces "
-                            "instead: create the file with the first part, "
-                            "then add each further part with edit_file")
+                            f"arrived complete.{ceiling} Sending it again "
+                            "unchanged will stop in the same place. Write it "
+                            "in pieces instead: create the file with the first "
+                            "part, then add each further part with edit_file")
                 else:
                     hint = ("they were not valid JSON - emit the arguments as a "
                             "JSON object and call it again")

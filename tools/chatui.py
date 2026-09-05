@@ -103,7 +103,7 @@ def mount(app, ui: ChatUI) -> None:
                 if event is None:
                     break
                 await resp.write(sse(event))
-        except (ConnectionResetError, asyncio.CancelledError):
+        except (ConnectionError, asyncio.CancelledError):
             # The tab was closed. That ends this *view* of the turn, not the
             # turn: it keeps running in the session, finishes its tools, saves
             # its answer, and is replayed when the browser comes back. Only
@@ -131,6 +131,27 @@ class _Handler(BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
     def _dispatch(self, method):
+        """One request, with the client allowed to leave at any point.
+
+        A browser hangs up constantly and legitimately - a refresh, a closed
+        tab, Stop aborting the fetch part-way through a streamed turn - and the
+        write that was in flight fails. Only two of the three shapes that takes
+        were caught, and Windows raises the third: WinError 10053 arrives as
+        ConnectionAbortedError, so an ordinary refresh printed a nine-frame
+        traceback into the console the person is using as their log.
+
+        All three are ConnectionError. None of them is a fault, and none of
+        them touches the turn: it keeps running in its session, finishes its
+        tools, saves its answer, and is replayed when the browser comes back.
+        """
+        try:
+            self._respond(method)
+        except ConnectionError as e:
+            self.close_connection = True     # the socket is gone; do not read on
+            if os.environ.get("CHATUI_VERBOSE"):
+                self.log_message("client went away: %s", e)
+
+    def _respond(self, method):
         parsed = urlparse(self.path)
         query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
         length = int(self.headers.get("Content-Length") or 0)
@@ -151,15 +172,12 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
-        try:
-            for event in result.events:
-                chunk = sse(event)
-                self.wfile.write(f"{len(chunk):X}\r\n".encode())
-                self.wfile.write(chunk + b"\r\n")
-                self.wfile.flush()
-            self.wfile.write(b"0\r\n\r\n")
-        except (BrokenPipeError, ConnectionResetError):
-            pass                           # the turn carries on without a viewer
+        for event in result.events:
+            chunk = sse(event)
+            self.wfile.write(f"{len(chunk):X}\r\n".encode())
+            self.wfile.write(chunk + b"\r\n")
+            self.wfile.flush()
+        self.wfile.write(b"0\r\n\r\n")
 
     def do_GET(self):
         self._dispatch("GET")
@@ -169,6 +187,23 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._dispatch("DELETE")
+
+
+class _Server(ThreadingHTTPServer):
+    """The same forgiveness one level up.
+
+    socketserver prints "Exception occurred during processing of request from"
+    and a full traceback for anything that escapes a handler - including the
+    writes it does itself, on teardown, after the client has gone. A browser
+    that closed its tab is not an error worth a traceback in a console someone
+    is reading as a log."""
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return
+        super().handle_error(request, client_address)
 
 
 def load_env(path: Path) -> dict:
@@ -337,7 +372,7 @@ def main() -> int:
             print(f"  {said}", flush=True)
 
     try:
-        server = ThreadingHTTPServer((args.host, args.port), _Handler)
+        server = _Server((args.host, args.port), _Handler)
     except OSError as e:
         print(f"\n  Cannot use port {args.port}: {e}")
         print("  Something else is holding it. Close it, or start with "
