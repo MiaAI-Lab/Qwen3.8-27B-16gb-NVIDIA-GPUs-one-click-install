@@ -40,6 +40,13 @@ source .env
 # .env is sourced as shell vars; the model-download subprocess needs the HF
 # token in its environment, so export it if set.
 if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; fi
+# Pin CUDA to the nvidia-smi GPU the setup page / PROFILE picked. Without
+# CUDA_DEVICE_ORDER=PCI_BUS_ID, CUDA device 0 is the fastest card, not smi 0.
+if [ -n "${CUDA_DEVICE_ORDER:-}" ]; then export CUDA_DEVICE_ORDER; fi
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    export CUDA_VISIBLE_DEVICES
+    export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
+fi
 
 # --- bootstrap: build the venv + install the engine on first run ----------
 # Re-enters if the venv is missing OR the install is incomplete (e.g. a

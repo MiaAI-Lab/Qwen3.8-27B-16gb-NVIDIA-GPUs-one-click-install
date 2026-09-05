@@ -258,8 +258,10 @@ def plan(total_gib: float, want_vision: bool | None = None) -> tuple[float, list
 # -------------------------------------------------------------- hardware -----
 
 class GPU:
-    def __init__(self, name="", total_gib=0.0, cc=0.0, driver=""):
+    def __init__(self, name="", total_gib=0.0, cc=0.0, driver="", index=0, uuid=""):
         self.name, self.total_gib, self.cc, self.driver = name, total_gib, cc, driver
+        self.index = int(index or 0)
+        self.uuid = uuid or ""
 
     @property
     def arch(self) -> str:
@@ -275,32 +277,128 @@ class GPU:
         return "pre-Pascal" if c else "unknown"
 
 
-def detect_gpu() -> GPU:
-    """GPU 0 via nvidia-smi: name, total VRAM (GiB), compute capability, driver."""
+def _parse_smi_gpu_line(raw: str, index: int, with_cc: bool) -> GPU | None:
+    """One nvidia-smi CSV row. Names can contain commas, so numbers are taken from the end."""
+    parts = [x.strip() for x in raw.split(",")]
+    if with_cc:
+        if len(parts) < 5:
+            return None
+        uuid = parts[-1]
+        driver = parts[-2]
+        cc_s = parts[-3]
+        mem_s = parts[-4]
+        name = ",".join(parts[:-4]).strip()
+        cc = float(cc_s) if cc_s.replace(".", "", 1).isdigit() else 0.0
+    else:
+        if len(parts) < 3:
+            return None
+        uuid = parts[-1]
+        mem_s = parts[-2]
+        name = ",".join(parts[:-2]).strip()
+        driver, cc = "", 0.0
     try:
-        r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,compute_cap,driver_version",
-                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10)
-        if r.returncode == 0 and r.stdout.strip():
-            parts = [x.strip() for x in r.stdout.strip().splitlines()[0].split(",")]
-            # the name itself may contain commas: take the last three fields as numbers
-            driver = parts[-1]
-            cc = float(parts[-2]) if parts[-2].replace(".", "").isdigit() else 0.0
-            mib = float(parts[-3])
-            name = ",".join(parts[:-3]).strip()
-            if mib > 0:
-                return GPU(name, mib / 1024, cc, driver)
-    except (FileNotFoundError, ValueError, IndexError, subprocess.TimeoutExpired):
-        pass
-    # older drivers do not know compute_cap: fall back to name + memory only
+        mib = float(mem_s)
+    except ValueError:
+        return None
+    if mib <= 0:
+        return None
+    return GPU(name, mib / 1024, cc, driver, index=index, uuid=uuid)
+
+
+def list_gpus() -> list[GPU]:
+    """Every NVIDIA GPU nvidia-smi can see, in PCI / nvidia-smi index order.
+
+    CUDA's default device order is fastest-first, which is *not* this list: on a
+    5080+5090 box nvidia-smi index 0 is the 5080 and CUDA device 0 is the 5090.
+    Callers that pin a card must also set CUDA_DEVICE_ORDER=PCI_BUS_ID so the
+    two numberings agree. An empty list means no readable NVIDIA GPU.
+    """
+    queries = (
+        "index,name,memory.total,compute_cap,driver_version,uuid",
+        "index,name,memory.total,uuid",   # older drivers: no compute_cap
+    )
+    for q, with_cc in ((queries[0], True), (queries[1], False)):
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return []
+        if r.returncode != 0 or not (r.stdout or "").strip():
+            continue
+        out: list[GPU] = []
+        for i, line in enumerate((r.stdout or "").splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            # index is the first field; keep nvidia-smi's number even if a card is skipped
+            try:
+                idx_s, rest = line.split(",", 1)
+                idx = int(idx_s.strip())
+            except ValueError:
+                idx, rest = i, line
+            g = _parse_smi_gpu_line(rest, idx, with_cc)
+            if g is not None:
+                out.append(g)
+        if out:
+            return out
+    return []
+
+
+def detect_gpu(cfg: dict | None = None) -> GPU:
+    """The GPU this process will load on.
+
+    Honours CUDA_VISIBLE_DEVICES / CUDA_DEVICE_ORDER already in the environment,
+    then CUDA_VISIBLE_DEVICES and CUDA_DEVICE_ORDER from `.env` (`cfg`), then
+    nvidia-smi GPU 0. A saved CUDA_VISIBLE_DEVICES of a UUID or an nvidia-smi
+    index is resolved against list_gpus(). Missing / unreadable → empty GPU.
+    """
+    gpus = list_gpus()
+    if not gpus:
+        return GPU()
+    env_vis = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
+    cfg_vis = ((cfg or {}).get("CUDA_VISIBLE_DEVICES") or "").strip()
+    vis = env_vis or cfg_vis
+    if vis:
+        token = vis.split(",")[0].strip()
+        picked = _gpu_from_visible(gpus, token)
+        if picked is not None:
+            return picked
+    return gpus[0]
+
+
+def _gpu_from_visible(gpus: list[GPU], token: str) -> GPU | None:
+    if not token:
+        return None
+    if token.startswith("GPU-") or len(token) > 8 and "-" in token:
+        for g in gpus:
+            if g.uuid == token or g.uuid.endswith(token):
+                return g
+        return None
     try:
-        r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
-                           capture_output=True, text=True, timeout=10)
-        if r.returncode == 0 and r.stdout.strip():
-            name, mem = [x.strip() for x in r.stdout.strip().splitlines()[0].rsplit(",", 1)]
-            return GPU(name, float(mem) / 1024, 0.0, "")
-    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
-        pass
-    return GPU()
+        idx = int(token)
+    except ValueError:
+        needle = token.lower()
+        hits = [g for g in gpus if needle in g.name.lower()]
+        return hits[0] if len(hits) == 1 else None
+    for g in gpus:
+        if g.index == idx:
+            return g
+    return None
+
+
+def cuda_pin_for(g: GPU) -> dict[str, str]:
+    """Env the server process needs so CUDA device 0 is this nvidia-smi GPU.
+
+    CUDA_DEVICE_ORDER=PCI_BUS_ID makes CUDA numbering match nvidia-smi.
+    CUDA_VISIBLE_DEVICES is the nvidia-smi index (a single card). UUID would
+    also work, but the index is what the setup page shows and what people
+    already copy from nvidia-smi.
+    """
+    return {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": str(g.index),
+    }
 
 
 def gpu_support(g: GPU) -> tuple[str, list[str]]:
@@ -470,9 +568,9 @@ def write_env(path: Path, updates: dict[str, str]) -> None:
             raise
 
 
-def env_updates(o: dict, gpu_name: str) -> dict[str, str]:
+def env_updates(o: dict, gpu_name: str, gpu: GPU | None = None) -> dict[str, str]:
     model_id = Path(o["model_dir"]).name.lower()
-    return {
+    out = {
         "PROFILE": f"{o['quant']}bpw-{round(o['ctx'] / 1000)}k",
         "PROFILE_GPU": gpu_name.replace("=", " ").split("  [")[0] or "unknown",
         "MODEL_DIR": o["model_dir"],
@@ -486,6 +584,9 @@ def env_updates(o: dict, gpu_name: str) -> dict[str, str]:
         "GPU_MEM_GB": f"{min(o['budget'], o['need'] + 1.5):.1f}",
         "VISION": "auto" if o["vision"] else "off",
     }
+    if gpu is not None and gpu.name:
+        out.update(cuda_pin_for(gpu))
+    return out
 
 
 # ------------------------------------------------------------------- UI ------
@@ -670,12 +771,39 @@ def ask_vram() -> float:
 
 # ----------------------------------------------------------------- main ------
 
+def ask_gpu(gpus: list[GPU], auto: bool = False) -> GPU:
+    """When more than one NVIDIA GPU is present, ask which one to load on.
+
+    CUDA's default order is fastest-first, so 'just use GPU 0' silently puts
+    the model on the 5090 of a 5080+5090 box. The numbers here are nvidia-smi
+    indices; the pin written to .env makes CUDA agree.
+    """
+    if not gpus:
+        return GPU()
+    if len(gpus) == 1 or auto:
+        return gpus[0]
+    print("  More than one NVIDIA GPU:")
+    for g in gpus:
+        status, _notes = gpu_support(g)
+        tag = "  (cannot run this kit)" if status == "unsupported" else ""
+        print(f"    [{g.index}]  {g.name}  {g.total_gib:.0f} GB{tag}")
+    default = gpus[0].index
+    ans = timed_input(f"  ? Which GPU should Simplex use?  [Enter = {default}]: ", 60)
+    if not ans:
+        return gpus[0]
+    picked = _gpu_from_visible(gpus, ans.strip())
+    return picked if picked is not None else gpus[0]
+
+
 def run(force: bool = False, auto: bool = False, vram: float | None = None, list_only: bool = False,
         cc_override: float | None = None) -> int:
     cfg = read_env(ENV_FILE)
     if not force and not list_only and cfg.get("PROFILE") and cfg["PROFILE"].lower() != "ask":
         return 0   # already chosen
-    g = detect_gpu()
+    gpus = list_gpus()
+    g = detect_gpu(cfg) if cfg.get("CUDA_VISIBLE_DEVICES") else (gpus[0] if gpus else GPU())
+    if not auto and not list_only and not vram and len(gpus) > 1 and not cfg.get("CUDA_VISIBLE_DEVICES"):
+        g = ask_gpu(gpus, auto)
     if vram:
         g.total_gib = float(vram)
         g.name = g.name or f"(assumed {vram} GB)"
@@ -753,13 +881,14 @@ def run(force: bool = False, auto: bool = False, vram: float | None = None, list
     if o.get("kind") == "keep":
         if not cfg.get("PROFILE") or cfg["PROFILE"].lower() == "ask":
             try:
-                write_env(ENV_FILE, {"PROFILE": "current", "PROFILE_GPU": gpu_name or "unknown"})
+                write_env(ENV_FILE, {"PROFILE": "current", "PROFILE_GPU": gpu_name or "unknown",
+                                     **cuda_pin_for(g)})
             except PermissionError:
                 print("  ! .env is locked or read-only (another program has it open?) - could not note the")
                 print("    choice; this menu will show again next start. Add PROFILE=current to .env to stop it.")
         print("  OK  keeping the current settings")
         return 0
-    upd = env_updates(o, gpu_name)
+    upd = env_updates(o, gpu_name, g)
     try:
         write_env(ENV_FILE, upd)
     except PermissionError:

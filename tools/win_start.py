@@ -1138,6 +1138,15 @@ def main() -> int:
     # UTF-8, so say so rather than letting an accented path arrive as mojibake.
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
+    # Windows start.bat never `source`s .env. CUDA_VISIBLE_DEVICES in .env is
+    # otherwise a comment CUDA never sees, and CUDA's default order is
+    # fastest-first (5090 before 5080). Copy the pin into the child.
+    if cfg.get("CUDA_DEVICE_ORDER"):
+        env["CUDA_DEVICE_ORDER"] = cfg["CUDA_DEVICE_ORDER"]
+    elif cfg.get("CUDA_VISIBLE_DEVICES"):
+        env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    if cfg.get("CUDA_VISIBLE_DEVICES"):
+        env["CUDA_VISIBLE_DEVICES"] = cfg["CUDA_VISIBLE_DEVICES"]
 
     rt = Runtime()
     rt.url = f"http://127.0.0.1:{port}/"

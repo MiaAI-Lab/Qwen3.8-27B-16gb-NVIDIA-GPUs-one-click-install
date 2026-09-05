@@ -68,7 +68,11 @@ function renderFacts(p) {
   const g = p.gpu || {};
   const cells = [];
   const vram = g.vram_gib ? g.vram_gib.toFixed(1) + " GB" : "not detected";
-  cells.push(["Graphics card", g.name || "not detected", g.name ? "" : "bad"]);
+  const cardLabel = g.name
+    ? ((g.index || g.index === 0) && (p.gpus || []).length > 1
+        ? `[${g.index}] ${g.name}` : g.name)
+    : "not detected";
+  cells.push(["Graphics card", cardLabel, g.name ? "" : "bad"]);
   cells.push(["Video memory", vram, g.vram_gib ? "" : "bad"]);
   if (g.arch && g.arch !== "unknown") cells.push(["Generation", g.arch, g.support === "slow" ? "warn" : ""]);
   if (g.driver) cells.push(["Driver", g.driver, ""]);
@@ -78,6 +82,48 @@ function renderFacts(p) {
 
   $("#facts").innerHTML = cells.map(([k, v, cls]) =>
     `<div class="fact ${cls}"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("");
+  renderGpuChoice(p);
+}
+
+async function setGpu(index) {
+  const box = $("#gpu-choice");
+  const btns = box ? box.querySelectorAll("[data-gpu]") : [];
+  btns.forEach((b) => { b.disabled = true; });
+  try {
+    ui.chosen = null;                 // VRAM changed, so the quant menu must re-pick
+    apply(await post("/setup/gpu", { index }));
+  } catch (e) {
+    toast(e.message);
+    btns.forEach((b) => { b.disabled = false; });
+  }
+}
+
+function renderGpuChoice(p) {
+  const box = $("#gpu-choice");
+  if (!box) return;
+  const gpus = p.gpus || [];
+  if (gpus.length < 2) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  box.classList.remove("hidden");
+  const current = (p.gpu && (p.gpu.index || p.gpu.index === 0)) ? p.gpu.index : gpus[0].index;
+  box.innerHTML = `
+    <b>Which GPU</b> - CUDA otherwise picks the fastest card, not the one nvidia-smi
+    lists first. On a 5080 + 5090 that silently loads the 5090.
+    <span class="s-seg">
+      ${gpus.map((g) => {
+        const unsupported = g.support === "unsupported";
+        const on = g.index === current;
+        const label = `[${g.index}] ${g.name} · ${g.vram_gib} GB`;
+        return `<button type="button" class="btn${on ? " primary" : ""}"
+            data-gpu="${g.index}" ${unsupported ? "disabled" : ""}>${esc(label)}</button>`;
+      }).join("")}
+    </span>`;
+  box.querySelectorAll("[data-gpu]").forEach((b) => {
+    b.onclick = () => setGpu(Number(b.dataset.gpu));
+  });
 }
 
 function esc(s) {

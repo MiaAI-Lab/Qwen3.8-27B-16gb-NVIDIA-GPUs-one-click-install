@@ -2106,6 +2106,80 @@ def test_simulation_mode():
           "start Simplex again" in js)
 
 
+def test_multi_gpu_pin_matches_nvidia_smi():
+    """Two cards: CUDA's default order is fastest-first, nvidia-smi is PCI.
+
+    On a 5080+5090, smi GPU 0 is the 5080 and CUDA device 0 is the 5090. The
+    kit used to plan for smi 0 and then load on CUDA 0. The pin is
+    CUDA_DEVICE_ORDER=PCI_BUS_ID plus CUDA_VISIBLE_DEVICES=<smi index>, written
+    into .env and copied into the Windows child (start.bat never sources .env).
+    """
+    import profiles                                     # noqa: WPS433
+    import setup_core                                   # noqa: WPS433
+
+    a = profiles.GPU("NVIDIA GeForce RTX 5080", 15.92, 12.0, "581.29", index=0, uuid="GPU-aaaa")
+    b = profiles.GPU("NVIDIA GeForce RTX 5090", 31.84, 12.0, "581.29", index=1, uuid="GPU-bbbb")
+    real_list, real_detect = profiles.list_gpus, profiles.detect_gpu
+    try:
+        profiles.list_gpus = lambda: [a, b]
+        profiles.detect_gpu = lambda cfg=None: a
+        pin = profiles.cuda_pin_for(a)
+        check("the pin uses PCI order so CUDA numbering matches nvidia-smi",
+              pin["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID", pin)
+        check("and CUDA_VISIBLE_DEVICES is the nvidia-smi index, not 'the fast one'",
+              pin["CUDA_VISIBLE_DEVICES"] == "0", pin)
+
+        # env_updates only writes the pin when a real GPU is handed in, so a
+        # single-GPU box does not grow two extra .env lines
+        _, options = profiles.plan(16.0, False)
+        o = options[0]
+        bare = profiles.env_updates(o, "Fake")
+        check("a profile with no GPU does not invent a CUDA pin",
+              "CUDA_VISIBLE_DEVICES" not in bare, bare)
+        pinned = profiles.env_updates(o, a.name, a)
+        check("handing the GPU in writes both pin keys next to the profile",
+              pinned.get("CUDA_VISIBLE_DEVICES") == "0"
+              and pinned.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID", pinned)
+
+        # detect_gpu honours a saved index / uuid from .env
+        profiles.detect_gpu = real_detect
+        picked = profiles._gpu_from_visible([a, b], "1")
+        check("an index of 1 resolves to the 5090", picked is b)
+        picked = profiles._gpu_from_visible([a, b], "GPU-aaaa")
+        check("a UUID resolves to that card", picked is a)
+        picked = profiles._gpu_from_visible([a, b], "rtx 5080")
+        check("a unique name fragment resolves", picked is a)
+
+        # setup_core.probe lists every card and marks the selected one
+        profiles.detect_gpu = lambda cfg=None: a
+        data = setup_core.probe({})
+        check("probe lists both cards", len(data.get("gpus") or []) == 2, data.get("gpus"))
+        check("and marks smi 0 as selected when that is the pin",
+              data["gpus"][0]["selected"] and not data["gpus"][1]["selected"],
+              data["gpus"])
+        check("the facts GPU carries the nvidia-smi index",
+              data["gpu"].get("index") == 0, data["gpu"])
+    finally:
+        profiles.list_gpus, profiles.detect_gpu = real_list, real_detect
+
+    js = (Path(__file__).parent / "webui" / "setup.js").read_text()
+    html = (Path(__file__).parent / "webui" / "setup.html").read_text()
+    web = (Path(__file__).parent / "setup_web.py").read_text()
+    win = (Path(__file__).parent / "win_start.py").read_text()
+    sh = (Path(__file__).resolve().parent.parent / "start.sh").read_text()
+    check("the setup page has a Which GPU toggle",
+          "renderGpuChoice" in js and 'id="gpu-choice"' in html)
+    check("setup.js posts the card to /setup/gpu",
+          '"/setup/gpu"' in js or "'/setup/gpu'" in js)
+    check("the setup server has that endpoint", '"/setup/gpu"' in web)
+    check("win_start copies CUDA_VISIBLE_DEVICES from .env into the child",
+          'env["CUDA_VISIBLE_DEVICES"]' in win and "PCI_BUS_ID" in win)
+    check("start.sh exports the pin after sourcing .env",
+          "export CUDA_VISIBLE_DEVICES" in sh and "PCI_BUS_ID" in sh)
+    check("the toggle stays hidden on a one-card box",
+          "gpus.length < 2" in js)
+
+
 def test_vision_toggle_is_cheap_and_clearable():
     """The three images buttons must re-plan the menu and nothing else.
 
@@ -3653,6 +3727,7 @@ def main():
     test_claimed_minimum_vram_is_honest()
     test_no_invalid_escape_sequences()
     test_simulation_mode()
+    test_multi_gpu_pin_matches_nvidia_smi()
     test_vision_toggle_is_cheap_and_clearable()
     test_rename_accepts_spaces()
     test_webui_restarts_itself()

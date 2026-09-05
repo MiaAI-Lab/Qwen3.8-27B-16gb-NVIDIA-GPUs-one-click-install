@@ -173,6 +173,17 @@ class Setup:
         self.menu = core.options_for(self.cfg, 0.0, want_vision)
         self._emit("vision", vision=want_vision, state=self.state())
 
+    def set_gpu(self, index: int) -> None:
+        """Pin the install to nvidia-smi GPU `index` and rebuild the menu for it.
+
+        Cheap: nvidia-smi already ran for the facts row. Re-probe so the quant
+        list matches the chosen card's VRAM, not leftover GPU 0.
+        """
+        self.cfg = core.select_gpu(self.cfg, index)
+        self.probe_data = core.probe(self.cfg)
+        self.menu = core.options_for(self.cfg, 0.0, getattr(self, "want_vision", None))
+        self._emit("gpu", index=int(index), state=self.state())
+
     def refresh(self, want_vision=_KEEP) -> None:
         self.probe_data = core.probe(self.cfg)
         if want_vision is not Setup._KEEP:
@@ -471,6 +482,14 @@ def make_handler(setup: Setup):
                     # skips the machine probe that refresh has to do.
                     want = body.get("vision", None)
                     setup.set_vision(None if want is None else bool(want))
+                    return self._json(setup.state())
+                if path == "/setup/gpu":
+                    # Same shape as /setup/vision: pick a card without a full
+                    # refresh. Body is {"index": <nvidia-smi index>}.
+                    if body.get("index") is None:
+                        return self._json({"error": "index is required",
+                                           "hint": "Pass the nvidia-smi GPU number."}, 400)
+                    setup.set_gpu(int(body["index"]))
                     return self._json(setup.state())
                 if path == "/setup/refresh":
                     setup.refresh()

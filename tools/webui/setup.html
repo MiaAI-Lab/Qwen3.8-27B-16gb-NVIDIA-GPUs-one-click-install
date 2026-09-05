@@ -66,6 +66,10 @@ h1 { font-family: var(--display); font-size: 27px; line-height: 1.2; margin: 0 0
   background: var(--accent-soft); color: var(--accent); vertical-align: 2px; }
 .s-badge.have { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
 
+#gpu-choice { margin: 12px 0 0; padding: 12px 14px; border: 1px solid var(--line-soft);
+  border-radius: 10px; background: var(--panel-2, transparent); }
+#gpu-choice .s-seg { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; }
+
 /* the images question, above the quant menu */
 #vision-choice { margin: 4px 0 14px; padding: 12px 14px; border: 1px solid var(--line-soft);
   border-radius: 10px; background: var(--panel-2, transparent); }
@@ -201,6 +205,7 @@ input.text:focus { outline: none; border-color: var(--accent); box-shadow: var(-
     <div class="s-card">
       <h2>What's on this PC</h2>
       <div class="facts" id="facts"></div>
+      <div id="gpu-choice" class="hidden"></div>
     </div>
 
     <div class="s-card">

@@ -229,8 +229,9 @@ def probe(cfg: dict) -> dict:
     import profiles
     import wheels
 
-    gpu = profiles.detect_gpu()
+    gpu = profiles.detect_gpu(cfg)
     support, notes = profiles.gpu_support(gpu)
+    gpus = profiles.list_gpus()
     ok_venv, venv_reason = venv_ready()
     have_weights, model_path = weights_ready(cfg)
     tags = wheels.interpreter_tags(VENV_PY if VENV_PY.is_file() else sys.executable)
@@ -238,7 +239,13 @@ def probe(cfg: dict) -> dict:
 
     return {
         "gpu": {"name": gpu.name, "vram_gib": round(gpu.total_gib, 1), "cc": gpu.cc,
-                "arch": gpu.arch, "driver": gpu.driver, "support": support, "notes": notes},
+                "arch": gpu.arch, "driver": gpu.driver, "support": support, "notes": notes,
+                "index": gpu.index, "uuid": gpu.uuid},
+        "gpus": [{"name": g.name, "vram_gib": round(g.total_gib, 1), "cc": g.cc,
+                  "arch": g.arch, "driver": g.driver, "index": g.index, "uuid": g.uuid,
+                  "support": profiles.gpu_support(g)[0],
+                  "selected": g.index == gpu.index and bool(gpu.name)}
+                 for g in gpus],
         "python": {"version": ".".join(str(x) for x in sys.version_info[:3]),
                    "found": _system_python() is not None, "tag": tags.get("py", "")},
         "disk_free_gb": round(_disk_free_gb(ROOT), 1),
@@ -260,7 +267,7 @@ def options_for(cfg: dict, vram_gib: float = 0.0, want_vision=None) -> dict:
     option with the automatic rule while the console asked, so the two front
     doors to the same install disagreed."""
     import profiles
-    gpu = profiles.detect_gpu()
+    gpu = profiles.detect_gpu(cfg)
     total = vram_gib or gpu.total_gib
     if total <= 0:
         # same shape as the normal return - the page reads these keys
@@ -322,7 +329,8 @@ def apply_choice(cfg: dict, quant_id: str, vram_gib: float = 0.0, want_vision=No
         raise SetupError(f"{quant_id} is not one of the profiles that fit this GPU.",
                          "Reload the page - the list is built from the card that is installed.")
     gpu_name = data.get("gpu") or "unknown"
-    updates = profiles.env_updates(chosen, gpu_name)
+    gpu = profiles.detect_gpu(cfg)
+    updates = profiles.env_updates(chosen, gpu_name, gpu if gpu.name else None)
     try:
         profiles.write_env(ENV_FILE, updates)
     except PermissionError as e:
@@ -330,6 +338,37 @@ def apply_choice(cfg: dict, quant_id: str, vram_gib: float = 0.0, want_vision=No
                          "Close any editor holding .env and try again.") from e
     merged = dict(cfg)
     merged.update(updates)
+    return merged
+
+
+def select_gpu(cfg: dict, index: int) -> dict:
+    """Pin Simplex to nvidia-smi GPU `index` and rebuild the quant menu for it.
+
+    Writes CUDA_DEVICE_ORDER=PCI_BUS_ID and CUDA_VISIBLE_DEVICES=<index> so the
+    Windows launcher (which does not `source .env`) and CUDA agree on numbering.
+    Re-probes after the pin so the facts/menu on the setup page are for the
+    chosen card, not leftover GPU 0.
+    """
+    import profiles
+    gpus = profiles.list_gpus()
+    picked = next((g for g in gpus if g.index == int(index)), None)
+    if picked is None:
+        raise SetupError(
+            f"GPU {index} is not on this machine.",
+            "Reload the page - the list is built from nvidia-smi.")
+    status, notes = profiles.gpu_support(picked)
+    if status == "unsupported":
+        raise SetupError(
+            f"{picked.name} cannot run this kit.",
+            " ".join(notes) or "Pick a different card.")
+    pin = profiles.cuda_pin_for(picked)
+    try:
+        profiles.write_env(ENV_FILE, pin)
+    except PermissionError as e:
+        raise SetupError("Could not write .env - the file is open in another program.",
+                         "Close any editor holding .env and try again.") from e
+    merged = dict(cfg)
+    merged.update(pin)
     return merged
 
 
