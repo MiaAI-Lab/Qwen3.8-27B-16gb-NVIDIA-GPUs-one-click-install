@@ -740,6 +740,10 @@ function finishToolCard(card, ok, output, ms) {
   const bits = [];
   const meta = card.querySelector(".meta");
   if (meta && meta.textContent) bits.push(meta.textContent);
+  // A call with no text argument of its own - a read, a listing - has nothing
+  // to measure until its result arrives. "Read a file" and "read 40KB of
+  // file" are different facts, and the second one is the useful one.
+  else if (String(output || "").length > 400) bits.push(sizeOf(output.length));
   if (ms >= 1000) bits.push(`${(ms / 1000).toFixed(1)}s`);
   const io = card.querySelector(".io");
   // the live block was the argument arriving; keep the text, drop the tailing

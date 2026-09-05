@@ -191,6 +191,7 @@ class ModelClient:
         # and the running decode of each slot's arguments, so the browser can
         # show the file as it is written rather than a character count
         previews: dict[int, ArgPreview] = {}
+        tools_started = False
         splitter = ThinkSplitter()
         saw_reasoning_field = False
         with resp:
@@ -228,7 +229,19 @@ class ModelClient:
                         else:
                             for kind, piece in splitter.feed(delta["content"]):
                                 yield kind, piece
-                    for tc in delta.get("tool_calls") or []:
+                    tcs = delta.get("tool_calls") or []
+                    if tcs and not tools_started:
+                        tools_started = True
+                        # A tool call ends the content run, so whatever the
+                        # splitter is holding belongs above the card. It keeps a
+                        # few characters back in case they are the start of a
+                        # <think> marker split across chunks, and released them
+                        # only at finish_reason - which arrives after the call.
+                        # The sentence they came from was cut in half around the
+                        # card: "...no external refere", card, "nces."
+                        for kind, piece in splitter.flush():
+                            yield kind, piece
+                    for tc in tcs:
                         idx = tc.get("index", len(calls))
                         slot = calls.setdefault(
                             idx, {"id": tc.get("id") or f"call_{idx}",
@@ -718,7 +731,10 @@ def run_turn(client, messages, tool_list, ctx: ToolContext, *, mode="chat",
         if stop():
             break
     else:
-        note = (f"[stopped after {max_steps} tool steps]")
+        # A dead end the person can do something about: whatever the
+        # agent was part-way through is still part-way through, and the
+        # conversation carries on from here if they ask it to.
+        note = (f"[stopped after {max_steps} tool steps - the work may be unfinished; say 'continue' to carry on]")
         convo.append({"role": "assistant", "content": note})
         # Asterisks, not underscores: the renderer reads only * for
         # emphasis, on purpose, so that snake_case survives being

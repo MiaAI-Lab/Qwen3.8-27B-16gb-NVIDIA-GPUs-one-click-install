@@ -4278,6 +4278,76 @@ def test_a_cut_off_call_is_told_apart_from_a_malformed_one():
           (banner or {}).get("message"))
 
 
+def test_a_sentence_is_not_cut_in_half_by_a_tool_call():
+    """The splitter holds a few characters back in case they are the start of
+    a <think> marker arriving in two pieces, and released them at
+    finish_reason - which comes after the tool call. So the tail of every
+    sentence landed below the card it belonged above, mid-word: the transcript
+    read "...no external refere", card, "nces."."""
+    import io                                           # noqa: WPS433
+    import webui_agent as wa                            # noqa: WPS433
+
+    class Splits:
+        """Content, then a tool call, the way an endpoint really sends it."""
+
+        def _post(self, path, payload):
+            frames = []
+            for piece in ["The file is written. Checking it is really one ",
+                          "file with no external references."]:
+                frames.append({"choices": [{"index": 0,
+                                            "delta": {"content": piece}}]})
+            frames.append({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "c1", "type": "function",
+                 "function": {"name": "read_file",
+                              "arguments": '{"path":"a.html"}'}}]}}]})
+            frames.append({"choices": [{"index": 0, "delta": {},
+                                        "finish_reason": "tool_calls"}]})
+            body = b"".join(b"data: " + json.dumps(f).encode() + b"\n\n"
+                            for f in frames) + b"data: [DONE]\n\n"
+            return io.BytesIO(body)
+
+    client = wa.ModelClient.__new__(wa.ModelClient)
+    client.base_url, client.api_key, client.model = "http://x/v1", "", "m"
+    client.timeout = 5
+    client._post = Splits()._post
+
+    order = [(kind, value) for kind, value in client.stream([], None, None)]
+    said, before_call = [], True
+    for kind, value in order:
+        if kind in ("tool_partial", "tool_calls"):
+            before_call = False
+        elif kind == "content":
+            said.append((value, before_call))
+    text = "".join(v for v, _ in said)
+    check("every character of the sentence still arrives",
+          text == "The file is written. Checking it is really one file with "
+                  "no external references.", text)
+    check("...and all of it before the tool call, not around it",
+          all(first for _, first in said),
+          [v for v, first in said if not first])
+
+
+def test_the_step_budget_fits_the_way_files_are_written():
+    """Eight rounds was a sensible budget when a step meant "read a file, then
+    answer". The agent is now told to write a long file by opening it and
+    appending the rest, and a page with its own CSS and script is a dozen
+    appends by itself - the build stopped two thirds through and left a half
+    written file behind."""
+    app = (Path(__file__).parent / "webui_app.py").read_text()
+    check("a turn has room for a build made of appends",
+          'cfg.get("AGENT_MAX_STEPS") or 24' in app)
+    env = (Path(__file__).parent.parent / ".env.example").read_text()
+    check("...and the shipped setting agrees with the code",
+          "AGENT_MAX_STEPS=24" in env)
+    check("...and says why it is not smaller", "half written" in env)
+
+    agent = (Path(__file__).parent / "webui_agent.py").read_text()
+    # Running out of steps is a dead end the person can do something about.
+    check("running out of steps says the work may be unfinished",
+          "the work may be unfinished" in agent)
+    check("...and how to carry on", "say 'continue' to carry on" in agent)
+
+
 def test_a_cut_off_call_keeps_what_arrived():
     """The server replaces an unreadable arguments string with {} so it can
     never poison the conversation - which means the finished call arrives at
@@ -4666,6 +4736,8 @@ def main():
     test_levels_can_be_declared_from_the_menu()
     test_arguments_can_be_read_as_they_arrive()
     test_a_cut_off_call_is_told_apart_from_a_malformed_one()
+    test_a_sentence_is_not_cut_in_half_by_a_tool_call()
+    test_the_step_budget_fits_the_way_files_are_written()
     test_a_cut_off_call_keeps_what_arrived()
     test_a_browser_that_leaves_is_not_an_error()
     test_notes_are_written_in_the_dialect_the_renderer_reads()

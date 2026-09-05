@@ -161,7 +161,13 @@ class ChatUI:
         self._lock = threading.Lock()
         self.default_workspace = str(
             Path(cfg.get("AGENT_WORKSPACE") or (self.root / "workspace")).expanduser())
-        self.max_steps = int(cfg.get("AGENT_MAX_STEPS") or 8)
+        # Eight was a sensible budget when a step meant "read a file,
+        # then answer". It is not one now: the agent is told to write a
+        # long file by opening it and appending the rest, and a page
+        # with its own CSS and script is a dozen appends on its own. A
+        # build that stops two thirds of the way through leaves a half
+        # written file behind, which is worse than being slow.
+        self.max_steps = int(cfg.get("AGENT_MAX_STEPS") or 24)
         # The server usually binds 0.0.0.0 so other devices can reach /v1. The
         # UI is a different matter: agent mode writes files and runs commands
         # on this machine, and there is no login. So it answers only the
