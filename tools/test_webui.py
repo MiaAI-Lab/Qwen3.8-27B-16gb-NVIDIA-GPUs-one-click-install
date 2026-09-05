@@ -4278,6 +4278,70 @@ def test_a_cut_off_call_is_told_apart_from_a_malformed_one():
           (banner or {}).get("message"))
 
 
+def test_an_approval_asks_in_words_a_person_can_judge():
+    """This is the one moment where someone has to decide something on the
+    agent's behalf, and it was the least readable thing on screen: the
+    function's name jammed against its description - "run_python Check raw
+    bytes for mangled CSS names" - over the arguments as escaped JSON, so the
+    script being approved arrived full of \\n and \\". The button offering to
+    stop asking was labelled with the function name, which is the one word in
+    the sentence a person has no way to judge."""
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    body = js.split("function approvalCard(")[1].split("\nasync function ")[0]
+
+    check("it asks in a sentence", "The agent wants to ${view.asks" in body)
+    for tool, asks, noun in (
+            ("run_python", "run a Python script on this computer", "running Python"),
+            ("run_command", "run a command on this computer", "running commands"),
+            ("write_file", "write a file", "writing files"),
+            ("edit_file", "change a file", "editing files")):
+        view = js.split("TOOL_VIEW")[1].split("};")[0]
+        check(f"{tool} says what it wants in words", f'asks: "{asks}"' in view)
+        check(f"...and names itself as a kind of thing", f'noun: "{noun}"' in view)
+    check("a tool with no sentence of its own still reads as one",
+          '"run something on this computer"' in body and '"change a file"' in body)
+
+    check("the button is not labelled with a function name",
+          "Always allow ${noun}" in body and "Always allow ${ev.name}" not in js)
+    check("...and neither is the verdict it leaves behind",
+          "`Allowed - ${noun} will not ask again" in body)
+
+    # The approval lives inside the card for the very call it is about, and
+    # that card already shows the command, the script, the file.
+    check("it does not print the call a second time",
+          "const shown = !!card;" in body and "if (!shown) {" in body)
+    check("...and nothing renders the arguments as JSON any more",
+          "JSON.stringify(ev.args" not in js)
+
+    # A byte count is a fact about a file, not about a 68-character command.
+    check("a size is only shown where a size means something",
+          "body.length > 400" in js and "ev.chars > 400" in js)
+
+
+def test_thinking_lands_where_it_happened():
+    """The block was found with querySelector(".think") - the FIRST one in the
+    message - and prepended. So in an agent turn every later burst of thinking
+    was poured back into a window pinned above step one, still growing while
+    the work scrolled past underneath it."""
+    js = (Path(__file__).parent / "webui" / "app.js").read_text()
+    block = js.split("function thinkBlock(")[1].split("\n/* A run of thinking is over")[0]
+    check("a new run of thinking gets its own block",
+          "const all = container.querySelectorAll(\".think\");" in block
+          and "all[all.length - 1]" in block)
+    check("...and lands below what it follows, not above it",
+          "container.append(node);" in block and "container.prepend(node)" not in js)
+    check("a block that has been closed is not reopened",
+          'if (node && node.dataset.closed) node = null;' in block)
+
+    close = js.split("function closeThink(")[1].split("\n}")[0]
+    check("saying something ends the run of thinking",
+          'node.dataset.closed = "1";' in close)
+    check("...and so does reaching for a tool",
+          js.count("closeThink(body);") >= 3, js.count("closeThink(body);"))
+    check("every block is settled at the end, not only the first",
+          'body.querySelectorAll(".think").forEach(settleThinkBlock);' in js)
+
+
 def test_a_sentence_is_not_cut_in_half_by_a_tool_call():
     """The splitter holds a few characters back in case they are the start of
     a <think> marker arriving in two pieces, and released them at
@@ -4736,6 +4800,8 @@ def main():
     test_levels_can_be_declared_from_the_menu()
     test_arguments_can_be_read_as_they_arrive()
     test_a_cut_off_call_is_told_apart_from_a_malformed_one()
+    test_an_approval_asks_in_words_a_person_can_judge()
+    test_thinking_lands_where_it_happened()
     test_a_sentence_is_not_cut_in_half_by_a_tool_call()
     test_the_step_budget_fits_the_way_files_are_written()
     test_a_cut_off_call_keeps_what_arrived()

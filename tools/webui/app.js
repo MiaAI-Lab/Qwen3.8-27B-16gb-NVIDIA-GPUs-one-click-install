@@ -398,8 +398,17 @@ function followThink(pane) {
   pane.scrollTop = pane.scrollHeight;
 }
 
+/* A run of thinking, in the place it happened.
+
+   This used to find the first .think in the message and pour every later burst
+   back into it - and it prepended that block, so in an agent turn the model's
+   thinking for step six was appended to a window pinned above step one, still
+   growing while the work scrolled past underneath it. Thinking is part of the
+   sequence: each run gets its own block, below whatever it follows. */
 function thinkBlock(container, live) {
-  let node = container.querySelector(".think");
+  const all = container.querySelectorAll(".think");
+  let node = all[all.length - 1];
+  if (node && node.dataset.closed) node = null;
   if (!node) {
     node = el("details", "think");
     node.open = thinkOpenPref();
@@ -418,10 +427,21 @@ function thinkBlock(container, live) {
       setThinkOpenPref(node.open);
     });
     node.dataset.started = String(Date.now());
-    container.prepend(node);
+    container.append(node);
   }
   node.classList.toggle("live", !!live);
   return node.querySelector(".think-body");
+}
+
+/* A run of thinking is over when the model starts saying something or reaches
+   for a tool. Whatever it thinks after that is new thinking, and belongs in a
+   new block underneath - not back in the one above. */
+function closeThink(container) {
+  const all = container.querySelectorAll(".think");
+  const node = all[all.length - 1];
+  if (!node || node.dataset.closed) return;
+  node.dataset.closed = "1";
+  settleThinkBlock(node);
 }
 
 /* The block stops being live: name what it did and how long it took, so it
@@ -496,9 +516,11 @@ function contentBlock(container) {
    file's contents, a command, a script. It is the one that streams. */
 const TOOL_VIEW = {
   write_file:  { icon: "file", doing: "Writing", done: "Wrote",
-                 subject: (a) => a.path, text: "content" },
+                 subject: (a) => a.path, text: "content",
+                 asks: "write a file", noun: "writing files" },
   edit_file:   { icon: "pencil", doing: "Editing", done: "Edited",
-                 subject: (a) => a.path, text: "new_text" },
+                 subject: (a) => a.path, text: "new_text",
+                 asks: "change a file", noun: "editing files" },
   read_file:   { icon: "file", doing: "Reading", done: "Read",
                  subject: (a) => a.path },
   list_dir:    { icon: "folder", doing: "Listing", done: "Listed",
@@ -509,14 +531,19 @@ const TOOL_VIEW = {
                  subject: (a) => a.query },
   run_command: { icon: "terminal", doing: "Running", done: "Ran",
                  subject: (a) => a.description || a.command,
-                 text: "command", mono: true },
+                 text: "command", mono: true,
+                 asks: "run a command on this computer",
+                 noun: "running commands" },
   run_python:  { icon: "terminal", doing: "Running", done: "Ran",
                  subject: (a) => a.description || "a Python snippet",
-                 text: "code", lang: "python" },
+                 text: "code", lang: "python",
+                 asks: "run a Python script on this computer",
+                 noun: "running Python" },
   job_output:  { icon: "terminal", doing: "Checking", done: "Checked",
                  subject: (a) => `job ${a.job_id}` },
   job_kill:    { icon: "stop", doing: "Stopping", done: "Stopped",
-                 subject: (a) => `job ${a.job_id}` },
+                 subject: (a) => `job ${a.job_id}`,
+                 asks: "stop a running job", noun: "stopping jobs" },
   web_search:  { icon: "globe", doing: "Searching the web for",
                  done: "Searched the web for", subject: (a) => a.query },
   web_fetch:   { icon: "globe", doing: "Fetching", done: "Fetched",
@@ -626,7 +653,7 @@ function updatePendingToolCard(card, ev) {
     const subject = view.subject(args);
     if (subject) setToolSubject(card, subject);
   });
-  setToolMeta(card, sizeOf(ev.chars));
+  if (ev.chars > 400) setToolMeta(card, sizeOf(ev.chars));
 }
 
 function toolCard(container, call) {
@@ -664,9 +691,14 @@ function toolCard(container, call) {
   toolDetail(io, view, args);
   card.classList.remove("pending");
   card.replaceChildren(summary, io);
-  // The size the person watched climb should still be there at the end.
-  if (view.text && typeof args[view.text] === "string") {
-    setToolMeta(card, sizeOf(args[view.text].length));
+  // The size the person watched climb should still be there at the end - but
+  // only where a size means something. "68 bytes" next to a shell command is
+  // a measurement of the wrong thing.
+  const body = view.text ? args[view.text] : null;
+  if (typeof body === "string" && body.length > 400) {
+    setToolMeta(card, sizeOf(body.length));
+  } else if (typeof body === "string") {
+    setToolMeta(card, "");
   }
   if (!pending) container.append(card);
   return card;
@@ -859,15 +891,35 @@ function approvalCard(container, ev, cards) {
     card.open = true;
     container = card.querySelector(".io");
   }
+  const view = toolView(ev.name);
+  const args = ev.args || {};
   const box = el("div", "approval");
   box.dataset.call = ev.id;
+  // The approval sits inside the card for the very call it is about, and that
+  // card already shows the command, the script, the file. Repeating it here -
+  // as escaped JSON, no less - asked the person to read the same thing twice
+  // and to prefer the unreadable copy.
+  const shown = !!card;
+
+  // This is the one moment where the person has to decide something on the
+  // agent's behalf, so it has to be readable at a glance. It used to open with
+  // the function's name jammed against its description - "run_python Check raw
+  // bytes for mangled CSS names" - over the arguments as escaped JSON, so the
+  // script you were being asked to approve arrived full of \n and \" and was
+  // the hardest thing on screen to actually read.
   const head = el("h4");
-  head.append(icon("shield"),
-    el("span", null, ev.risk === "exec"
-      ? "The agent wants to run something on this machine"
-      : "The agent wants to change a file"));
-  box.append(head, el("div", "sub", `${ev.name}  ${ev.label || ""}`),
-             el("pre", null, JSON.stringify(ev.args, null, 2)));
+  head.append(icon("shield"), el("span", null,
+    `The agent wants to ${view.asks
+      || (ev.risk === "exec" ? "run something on this computer"
+                             : "change a file")}`));
+  box.append(head);
+  if (!shown) {
+    const subject = view.subject(args) || ev.label || "";
+    if (subject) box.append(el("div", "sub", subject));
+    const what = el("div", "io");
+    toolDetail(what, view, args);
+    box.append(what);
+  }
 
   const row = el("div", "row");
   const decide = async (decision, label, yes) => {
@@ -882,11 +934,14 @@ function approvalCard(container, ev, cards) {
       });
     } catch (e) { toast("Could not send that decision", true); }
   };
+  // The button used to be labelled with the function's name, which is the one
+  // word in the sentence the person has no way to judge.
+  const noun = view.noun || "this";
   const allow = el("button", "btn primary", "Allow once");
   allow.onclick = () => decide("allow", "Allowed", true);
-  const always = el("button", "btn", `Always allow ${ev.name}`);
+  const always = el("button", "btn", `Always allow ${noun}`);
   always.onclick = () => decide("always",
-    `Allowed - ${ev.name} will not ask again this session`, true);
+    `Allowed - ${noun} will not ask again in this chat`, true);
   const deny = el("button", "btn danger", "Deny");
   deny.onclick = () => decide("deny", "Denied", false);
   row.append(allow, always, deny);
@@ -938,8 +993,7 @@ function finishTurn(body, stats) {
   body.querySelectorAll(".tool.pending").forEach((card) => card.remove());
   $("#speed").classList.remove("live");
   body.querySelector(".typing")?.remove();
-  const think = body.querySelector(".think");
-  if (think) settleThinkBlock(think);
+  body.querySelectorAll(".think").forEach(settleThinkBlock);
   flushContent(body);
   announce("Reply finished");
   messageActions(body, stats);
@@ -1784,13 +1838,13 @@ function handleEvent(ev, body, cards, stats) {
     }
     case "content": {
       body.querySelector(".typing")?.remove();
-      body.querySelector(".think")?.classList.remove("live");
+      closeThink(body);
       appendDelta(contentBlock(body), ev.delta);
       break;
     }
     case "tool_progress": {
       body.querySelector(".typing")?.remove();
-      body.querySelector(".think")?.classList.remove("live");
+      closeThink(body);
       const open = body.querySelector(".stream-content:last-of-type");
       if (open) { open.dataset.closed = "1"; open.classList.remove("live"); }
       let card = body.querySelector(
@@ -1803,7 +1857,7 @@ function handleEvent(ev, body, cards, stats) {
       body.querySelector(".typing")?.remove();
       const open = body.querySelector(".stream-content:last-of-type");
       if (open) { open.dataset.closed = "1"; open.classList.remove("live"); }
-      body.querySelector(".think")?.classList.remove("live");
+      closeThink(body);
       cards.set(ev.id, toolCard(body, ev));
       scrollDown();
       break;
