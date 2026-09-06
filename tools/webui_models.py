@@ -118,7 +118,7 @@ def settings_for(root: Path, model_dir: str, cfg: dict) -> dict:
     if not p or quant is None:
         return updates                       # unknown quant: keep the rest as-is
     try:
-        gpu = p.detect_gpu()
+        gpu = p.detect_gpu(cfg)
         # profiles.GPU exposes total_gib, not .memory. Reading the wrong name
         # used to raise and land in the except below, which is what actually
         # produced this function's documented "no nvidia-smi" behaviour. Reading

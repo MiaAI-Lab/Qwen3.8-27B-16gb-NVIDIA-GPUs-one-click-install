@@ -322,8 +322,10 @@ def list_gpus() -> list[GPU]:
             r = subprocess.run(
                 ["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=10)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return []
+        except FileNotFoundError:
+            return []                  # no nvidia-smi at all: nothing to retry
+        except subprocess.TimeoutExpired:
+            continue                   # a wedged query still leaves the shorter one worth trying
         if r.returncode != 0 or not (r.stdout or "").strip():
             continue
         out: list[GPU] = []
@@ -370,21 +372,23 @@ def detect_gpu(cfg: dict | None = None) -> GPU:
 def _gpu_from_visible(gpus: list[GPU], token: str) -> GPU | None:
     if not token:
         return None
-    if token.startswith("GPU-") or len(token) > 8 and "-" in token:
+    if token.startswith("GPU-"):
         for g in gpus:
-            if g.uuid == token or g.uuid.endswith(token):
+            if g.uuid == token or g.uuid.startswith(token) or g.uuid.endswith(token):
                 return g
         return None
     try:
         idx = int(token)
     except ValueError:
-        needle = token.lower()
-        hits = [g for g in gpus if needle in g.name.lower()]
-        return hits[0] if len(hits) == 1 else None
-    for g in gpus:
-        if g.index == idx:
-            return g
-    return None
+        pass
+    else:
+        for g in gpus:
+            if g.index == idx:
+                return g
+        return None
+    needle = token.lower()
+    hits = [g for g in gpus if needle in g.name.lower()]
+    return hits[0] if len(hits) == 1 else None
 
 
 def cuda_pin_for(g: GPU) -> dict[str, str]:
@@ -881,14 +885,16 @@ def run(force: bool = False, auto: bool = False, vram: float | None = None, list
     if o.get("kind") == "keep":
         if not cfg.get("PROFILE") or cfg["PROFILE"].lower() == "ask":
             try:
-                write_env(ENV_FILE, {"PROFILE": "current", "PROFILE_GPU": gpu_name or "unknown",
-                                     **cuda_pin_for(g)})
+                keep = {"PROFILE": "current", "PROFILE_GPU": gpu_name or "unknown"}
+                if gpus and g.name:
+                    keep.update(cuda_pin_for(g))
+                write_env(ENV_FILE, keep)
             except PermissionError:
                 print("  ! .env is locked or read-only (another program has it open?) - could not note the")
                 print("    choice; this menu will show again next start. Add PROFILE=current to .env to stop it.")
         print("  OK  keeping the current settings")
         return 0
-    upd = env_updates(o, gpu_name, g)
+    upd = env_updates(o, gpu_name, g if gpus and g.name else None)
     try:
         write_env(ENV_FILE, upd)
     except PermissionError:

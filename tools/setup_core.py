@@ -362,6 +362,11 @@ def select_gpu(cfg: dict, index: int) -> dict:
             f"{picked.name} cannot run this kit.",
             " ".join(notes) or "Pick a different card.")
     pin = profiles.cuda_pin_for(picked)
+    if (cfg.get("CUDA_VISIBLE_DEVICES") or "").strip() != pin["CUDA_VISIBLE_DEVICES"] \
+            and (cfg.get("PROFILE") or "").lower() not in ("", "ask"):
+        # The profile already in .env was sized for the card we are leaving.
+        # Re-pick on the next start rather than run its budget on this one.
+        pin = dict(pin, PROFILE="ask")
     try:
         profiles.write_env(ENV_FILE, pin)
     except PermissionError as e:

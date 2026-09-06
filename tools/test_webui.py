@@ -239,7 +239,7 @@ def test_model_planning():
     try:
         for vram, quant, expect in ((16, "2.0bpw", True), (16, "4.0bpw", False),
                                     (24, "4.0bpw", True), (24, "6.0bpw", True)):
-            profiles.detect_gpu = lambda v=vram: profiles.GPU(
+            profiles.detect_gpu = lambda cfg=None, v=vram: profiles.GPU(
                 name="Fake", total_gib=v, cc=8.9, driver="580")
             name = f"models/Qwen3.8-27B-EXL3-{quant}"
             try:
@@ -2181,6 +2181,65 @@ def test_multi_gpu_pin_matches_nvidia_smi():
           "gpus.length < 2" in js)
 
 
+def test_gpu_pin_does_not_outlive_its_card():
+    """The review fixes for the Which GPU toggle, each with the bug it undoes.
+
+    1. detect_gpu() grew a cfg parameter. Every stub that replaces it in this
+       suite must accept one - `lambda v=vram:` silently binds cfg to v and
+       turns total_gib into a dict, which surfaces hundreds of lines later as
+       "'<=' not supported between instances of 'dict' and 'int'".
+    2. A name fragment longer than 8 characters containing a hyphen used to be
+       treated as a UUID and resolved to nothing.
+    3. Switching cards left GPU_MEM_GB / CONTEXT_SIZE sized for the old one, so
+       a 32 GB plan could be aimed at 16 GB of VRAM.
+    4. A --vram fake or a box with no readable card must not be handed a pin:
+       CUDA_VISIBLE_DEVICES=0 there points at a GPU that is not present.
+    """
+    import profiles                                     # noqa: WPS433
+    import setup_core                                   # noqa: WPS433
+    import tempfile                                     # noqa: WPS433
+
+    src = Path(__file__).read_text()
+    stubs = [ln.strip() for ln in src.splitlines()
+             if ln.strip().startswith("profiles.detect_gpu = lambda")]
+    check("every detect_gpu stub in this file accepts the cfg argument",
+          all("lambda cfg" in ln for ln in stubs),
+          [ln for ln in stubs if "lambda cfg" not in ln])
+    mock = (Path(__file__).parent / "setup_mock.py").read_text()
+    check("...and so does the one in setup_mock",
+          "detect_gpu = lambda cfg" in mock)
+
+    a = profiles.GPU("NVIDIA RTX A6000-Ada", 47.5, 8.9, "581.29", index=0, uuid="GPU-aaaa")
+    b = profiles.GPU("NVIDIA GeForce RTX 5090", 31.84, 12.0, "581.29", index=1, uuid="GPU-bbbb")
+    check("a hyphenated name fragment still resolves by name, not as a UUID",
+          profiles._gpu_from_visible([a, b], "A6000-Ada") is a)
+    check("an index that is not on the box resolves to nothing",
+          profiles._gpu_from_visible([a, b], "7") is None)
+    check("a UUID prefix resolves", profiles._gpu_from_visible([a, b], "GPU-bbb") is b)
+
+    # a profile built without a real card must not carry a pin
+    _, options = profiles.plan(16.0, False)
+    bare = profiles.env_updates(options[0], "(assumed 16 GB)", None)
+    check("a --vram fake does not pin CUDA to a card that is not there",
+          "CUDA_VISIBLE_DEVICES" not in bare, bare)
+
+    # switching cards invalidates a profile that was sized for the old one
+    real_list, real_env = profiles.list_gpus, setup_core.ENV_FILE
+    try:
+        profiles.list_gpus = lambda: [a, b]
+        setup_core.ENV_FILE = Path(tempfile.mkdtemp(prefix="gpu-pin-")) / ".env"
+        moved = setup_core.select_gpu(
+            {"CUDA_VISIBLE_DEVICES": "1", "PROFILE": "3.0bpw-33k", "GPU_MEM_GB": "29.8"}, 0)
+        check("moving to another card re-opens the menu instead of reusing its budget",
+              moved.get("PROFILE") == "ask", moved)
+        stay = setup_core.select_gpu(
+            {"CUDA_VISIBLE_DEVICES": "0", "PROFILE": "3.0bpw-33k"}, 0)
+        check("...but re-picking the card already in use leaves the profile alone",
+              stay.get("PROFILE") == "3.0bpw-33k", stay)
+    finally:
+        profiles.list_gpus, setup_core.ENV_FILE = real_list, real_env
+
+
 def test_vision_toggle_is_cheap_and_clearable():
     """The three images buttons must re-plan the menu and nothing else.
 
@@ -2198,7 +2257,7 @@ def test_vision_toggle_is_cheap_and_clearable():
     real_gpu, real_probe = profiles.detect_gpu, setup_core.probe
     probes = []
     try:
-        profiles.detect_gpu = lambda: profiles.GPU(name="Fake", total_gib=16.0, cc=8.9, driver="580")
+        profiles.detect_gpu = lambda cfg=None: profiles.GPU(name="Fake", total_gib=16.0, cc=8.9, driver="580")
         setup = setup_web.Setup({}, force=True)
         setup_core.probe = lambda cfg: probes.append(1) or {}
 
@@ -3763,7 +3822,7 @@ def test_web_setup_matches_the_console():
     real = profiles.detect_gpu
     try:
         for vram in (16.0, 24.0, 32.0):
-            profiles.detect_gpu = lambda v=vram: profiles.GPU(
+            profiles.detect_gpu = lambda cfg=None, v=vram: profiles.GPU(
                 name="Fake", total_gib=v, cc=8.9, driver="580")
             for want in (None, True, False):
                 web = setup_core.options_for({}, vram, want)
@@ -3789,7 +3848,7 @@ def test_web_setup_matches_the_console():
         # it rewrote the user's actual .env with this fake 16 GB card's profile
         # (PROFILE_GPU=Fake, GPU_MEM_GB=14.7) and capped their 32 GB card at 14.7.
         # A test may never write a file the product reads.
-        profiles.detect_gpu = lambda: profiles.GPU(name="Fake", total_gib=16.0, cc=8.9, driver="580")
+        profiles.detect_gpu = lambda cfg=None: profiles.GPU(name="Fake", total_gib=16.0, cc=8.9, driver="580")
         real_env = setup_core.ENV_FILE
         scratch = Path(tempfile.mkdtemp(prefix="envtest-")) / ".env"
         setup_core.ENV_FILE = scratch
@@ -4024,7 +4083,7 @@ def test_model_switch_uses_the_planner_rule():
     real = profiles.detect_gpu
     try:
         for vram in (16, 24, 32):
-            profiles.detect_gpu = lambda v=vram: profiles.GPU(
+            profiles.detect_gpu = lambda cfg=None, v=vram: profiles.GPU(
                 name="Fake", total_gib=v, cc=8.9, driver="580")
             _, options = profiles.plan(float(vram))
             for o in options:
@@ -4036,7 +4095,7 @@ def test_model_switch_uses_the_planner_rule():
                       (got["VISION"] != "off") == o["vision"], (got["VISION"], o["vision"]))
 
         # an answer of "no images" at setup time survives a model switch
-        profiles.detect_gpu = lambda: profiles.GPU(name="Fake", total_gib=32.0, cc=8.9, driver="580")
+        profiles.detect_gpu = lambda cfg=None: profiles.GPU(name="Fake", total_gib=32.0, cc=8.9, driver="580")
         off = webui_models.settings_for(Path("."), "models/Qwen3.8-27B-EXL3-4.0bpw",
                                         {"VISION": "off"})
         check("an explicit VISION=off is not overwritten by a model switch",
@@ -5121,6 +5180,7 @@ def main():
     test_no_invalid_escape_sequences()
     test_simulation_mode()
     test_multi_gpu_pin_matches_nvidia_smi()
+    test_gpu_pin_does_not_outlive_its_card()
     test_vision_toggle_is_cheap_and_clearable()
     test_rename_accepts_spaces()
     test_webui_restarts_itself()

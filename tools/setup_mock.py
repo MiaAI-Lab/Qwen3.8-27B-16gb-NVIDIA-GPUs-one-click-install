@@ -109,7 +109,7 @@ def patch(vram_gib: float = 16.0, name: str = "NVIDIA GeForce RTX 4060 Ti",
     import tempfile
     core.ENV_FILE = Path(env_file) if env_file else (
         Path(tempfile.mkdtemp(prefix="simplex-mock-")) / ".env")
-    profiles.detect_gpu = lambda: profiles.GPU(name, vram_gib, cc, driver)
+    profiles.detect_gpu = lambda cfg=None: profiles.GPU(name, vram_gib, cc, driver)
 
     def fake_install(cfg, log, steps, cancelled=None):
         if fail == "install":

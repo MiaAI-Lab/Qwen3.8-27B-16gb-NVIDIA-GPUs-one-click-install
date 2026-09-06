@@ -595,7 +595,7 @@ def main(argv=None):
     if args.dry_run:
         gpu = type("G", (), {"name": "Dry run", "total_gib": 32.0, "driver": "0"})()
     else:
-        gpu = profiles.detect_gpu()
+        gpu = profiles.detect_gpu(profiles.read_env(profiles.ENV_FILE))
     budget = args.budget or profiles.budget_gib(float(gpu.total_gib))
     data["gpu"] = {"name": gpu.name, "memory": float(gpu.total_gib),
                    "driver": getattr(gpu, "driver", "?"), "budget": budget,
