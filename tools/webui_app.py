@@ -28,6 +28,7 @@ import webui_models
 import webui_picker
 import webui_providers
 import webui_tools
+import webui_agent
 from webui_agent import ModelClient, run_turn, system_prompt
 
 UI_DIR = Path(__file__).resolve().parent / "webui"
@@ -42,6 +43,7 @@ class Response:
     status: int = 200
     content_type: str = "application/json"
     body: bytes = b""
+    headers: dict = field(default_factory=dict)
 
     @staticmethod
     def json(obj, status=200):
@@ -123,6 +125,25 @@ PWA_FILES = frozenset({
 })
 
 
+# A ceiling, not an allocation: generation stops at the end of the answer, so a
+# limit that is never reached costs nothing, and one that is reached costs the
+# whole tool call - the arguments are cut off mid-JSON and the call cannot be
+# run at all. 4096 could not write a page; 16384 could not write a long one.
+# The window is 200k+, so the ceiling is set where it stops being the thing
+# that decides how much work fits in one reply. Defined once - /ui/config once
+# advertised one number while the turn itself fell back to another, so any
+# caller that omitted the setting silently got the old limit.
+DEFAULT_MAX_TOKENS = 65536
+
+# ...except on a model whose whole window is smaller than that. Half the
+# context is a reasonable ceiling for an answer when nothing else is known: it
+# leaves room for the conversation that prompted it.
+def default_max_tokens(context_length=None):
+    if not context_length:
+        return DEFAULT_MAX_TOKENS
+    return max(2048, min(DEFAULT_MAX_TOKENS, int(context_length) // 2))
+
+
 class ChatUI:
     def __init__(self, root: Path, cfg: dict, model_base: str, model_id: str,
                  context_length=None, vision=False):
@@ -151,7 +172,13 @@ class ChatUI:
         self._lock = threading.Lock()
         self.default_workspace = str(
             Path(cfg.get("AGENT_WORKSPACE") or (self.root / "workspace")).expanduser())
-        self.max_steps = int(cfg.get("AGENT_MAX_STEPS") or 8)
+        # Eight was a sensible budget when a step meant "read a file,
+        # then answer". It is not one now: the agent is told to write a
+        # long file by opening it and appending the rest, and a page
+        # with its own CSS and script is a dozen appends on its own. A
+        # build that stops two thirds of the way through leaves a half
+        # written file behind, which is worse than being slow.
+        self.max_steps = int(cfg.get("AGENT_MAX_STEPS") or 24)
         # The server usually binds 0.0.0.0 so other devices can reach /v1. The
         # UI is a different matter: agent mode writes files and runs commands
         # on this machine, and there is no login. So it answers only the
@@ -169,6 +196,8 @@ class ChatUI:
         self.picker = (cfg.get("FOLDER_PICKER") or "native").strip().lower()
         # the dev server has no model behind it, so it answers /health itself
         self.fake_health = False
+        # effort levels this model's chat template accepts; see _config()
+        self.efforts: list[str] = []
         self._counters = {"prompt": 0, "completion": 0, "busy": False}
         # set by the launcher: only a supervised server can restart itself into
         # another model, because something has to start it again
@@ -228,7 +257,68 @@ class ChatUI:
         ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         if ctype.startswith("text/") or ctype in ("application/javascript",):
             ctype += "; charset=utf-8"
-        return Response(200, ctype, path.read_bytes())
+        # These files were served with no cache headers whatsoever, which means
+        # the browser is free to make its own guess - and it guesses "keep it".
+        # Editing app.js and reloading then showed the old UI, with no clue why:
+        # the file on disk was right, the page was not, and only a hard refresh
+        # or an incognito window would say so. "no-cache" is not "do not store";
+        # it stores it and revalidates every load, which for a few files over
+        # loopback costs nothing and can never be stale.
+        return Response(200, ctype, path.read_bytes(),
+                        {"Cache-Control": "no-cache, must-revalidate"})
+
+    # A page the agent just wrote, opened from the conversation that wrote it.
+    # Everything here exists because the file is not ours: a model wrote it,
+    # and it is about to run in a browser.
+    VIEWABLE = {
+        ".html": "text/html", ".htm": "text/html", ".svg": "image/svg+xml",
+        ".css": "text/css", ".js": "text/javascript", ".json": "application/json",
+        ".txt": "text/plain", ".md": "text/plain", ".csv": "text/plain",
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp", ".avif": "image/avif",
+        ".ico": "image/x-icon", ".pdf": "application/pdf",
+        ".mp4": "video/mp4", ".webm": "video/webm",
+        ".mp3": "audio/mpeg", ".wav": "audio/wav",
+    }
+    # Scripts may run - a page that cannot run its own JS is not a preview of
+    # anything - but the document gets an opaque origin, so it can neither read
+    # this UI's storage nor call /ui/* as the user. Without this, opening a
+    # model's HTML would hand it the same origin as the chat: it could delete
+    # conversations or read providers.json, keys and all, from a page the
+    # person only meant to look at.
+    SANDBOX = ("sandbox allow-scripts allow-popups allow-forms allow-modals; "
+               "base-uri 'none'; form-action 'none'")
+
+    def _workspace_file(self, query):
+        sid, rel = query.get("session"), query.get("path") or ""
+        session = self._load(sid) if sid else None
+        root = Path((session or {}).get("workspace") or self.default_workspace)
+        if not rel or any(part.startswith(".") for part in Path(rel).parts):
+            return Response(404, "text/plain", b"not found")
+        suffix = Path(rel).suffix.lower()
+        if suffix not in self.VIEWABLE:
+            # Not a refusal to be worked around: this route exists to look at
+            # what the agent made, and the workspace is a real folder with
+            # real secrets in it. Anything else is read through the agent.
+            return Response(403, "text/plain",
+                            f"{suffix or 'this kind of file'} is not viewable "
+                            f"here".encode())
+        try:
+            target = webui_tools.Workspace(root).resolve(rel)
+        except Exception:                               # noqa: BLE001
+            return Response(404, "text/plain", b"not found")
+        if not target.is_file():
+            return Response(404, "text/plain", b"not found")
+        ctype = self.VIEWABLE[suffix]
+        if ctype.startswith(("text/", "image/svg", "application/json")):
+            ctype += "; charset=utf-8"
+        headers = {
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+            "Content-Security-Policy": self.SANDBOX,
+        }
+        return Response(200, ctype, target.read_bytes(), headers)
 
     # ---------------------------------------------------------- sessions ----
 
@@ -242,9 +332,48 @@ class ChatUI:
         if not p or not p.is_file():
             return None
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
+            session = json.loads(p.read_text(encoding="utf-8"))
         except ValueError:
             return None
+        # A conversation saved before the truncation fix can hold a tool call
+        # whose arguments string was cut off mid-JSON. The model server parses
+        # that string again when it renders the chat template, so one such
+        # message makes every later request in the conversation fail with an
+        # HTTP 400 - for good, because the message is on disk.
+        #
+        # `healed` marks a session that has already been through this, so the
+        # common case costs one dict lookup instead of walking every message
+        # and re-parsing every arguments string on every single read.
+        if session.get("healed"):
+            return session
+        try:
+            healed = webui_agent.heal_messages(session.get("messages") or [])
+        except Exception:                            # noqa: BLE001
+            return session      # a shape we do not understand is not ours to fix
+        if healed is None:
+            session["healed"] = 1
+            return session
+        # Re-read under the same lock the writers use. This is a read-modify-
+        # write, and without the lock a turn finishing between the read above
+        # and the write below is silently reverted - the heal writes back its
+        # own pre-turn snapshot and the turn's messages are gone.
+        with self._save_locks.setdefault(sid, threading.Lock()):
+            try:
+                fresh = json.loads(p.read_text(encoding="utf-8"))
+            except ValueError:
+                fresh = session
+            again = webui_agent.heal_messages(fresh.get("messages") or [])
+            if again is not None:
+                fresh["messages"] = again
+            fresh["healed"] = 1
+            tmp = p.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp")
+            try:
+                tmp.write_text(json.dumps(fresh, indent=1), encoding="utf-8")
+                tmp.replace(p)
+            finally:
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+        return fresh
 
     def _save(self, session, touch=True):
         """Atomic, and serialised per session: a rename, a rewind and the end of
@@ -442,11 +571,14 @@ class ChatUI:
         return {
             "model": self.model_id,
             "context_length": self.context_length,
-            # This server can turn thinking off exactly (the chat template emits
-            # an empty <think></think>) but has no way to enforce a level once
-            # generation starts, so it advertises none. A provider's levels come
-            # from what its own /models said - see webui_providers.probe_efforts.
-            "efforts": [],
+            # What this model's own chat template will act on. Empty when the
+            # UI is running standalone (no tokenizer to ask) or when the
+            # template ignores reasoning_effort, because offering a choice that
+            # changes nothing is worse than offering none. Filled in by
+            # chatui.mount(), which runs in the server process. A provider's
+            # levels come from what its own /models said instead - see
+            # webui_providers.probe_efforts.
+            "efforts": list(self.efforts),
             "vision": self.vision,
             "title": self.cfg.get("UI_TITLE") or "Simplex",
             "default_workspace": self.default_workspace,
@@ -460,7 +592,8 @@ class ChatUI:
                 "temperature": float(self.cfg.get("TEMPERATURE") or 0.6),
                 "top_p": float(self.cfg.get("TOP_P") or 0.95),
                 "top_k": int(self.cfg.get("TOP_K") or 20),
-                "max_tokens": int(self.cfg.get("MAX_TOKENS") or 4096),
+                "max_tokens": int(self.cfg.get("MAX_TOKENS")
+                                  or default_max_tokens(self.context_length)),
             },
         }
 
@@ -538,8 +671,14 @@ class ChatUI:
         with self._lock:
             self._pending[key] = _Pending()
 
-    def _approver(self, sid, cancelled=None):
+    def _approver(self, sid, cancelled=None, auto=()):
+        """`auto` is the set of tool names the user's Permissions setting has
+        already answered for - see chat(). It is kept separate from the
+        session's "always allow" set so that turning the setting back down
+        takes effect immediately, rather than leaving behind permissions the
+        user granted by choosing a mode rather than by pressing a button."""
         allowed = self._always.setdefault(sid, set())
+        auto = set(auto)
 
         def approve(call_id, tool, args):
             pend = self._wait(call_id,
@@ -555,7 +694,7 @@ class ChatUI:
 
         # "always allow" is answered before the card is ever drawn (run_turn
         # asks this first), so an auto-approved call shows no prompt at all
-        return approve, allowed.__contains__
+        return approve, (lambda name: name in allowed or name in auto)
 
     def chat(self, body):
         sid = body.get("session_id") or uuid.uuid4().hex[:16]
@@ -621,7 +760,8 @@ class ChatUI:
             "temperature": float(settings.get("temperature", 0.6)),
             "top_p": float(settings.get("top_p", 0.95)),
             "top_k": int(settings.get("top_k", 20)),
-            "max_tokens": int(settings.get("max_tokens", 4096)),
+            "max_tokens": int(settings.get(
+                "max_tokens", default_max_tokens(self.context_length))),
         }
         # How hard the model should think. "off" is exact - the chat template
         # emits an empty <think></think> and there is nowhere to reason. The
@@ -632,9 +772,23 @@ class ChatUI:
         # model obliges or does not.
         thinking = str(settings.get("thinking", "")).strip().lower()
         if thinking == "off":
+            # Two routes to the same prompt, and both are needed. vLLM accepts
+            # reasoning_effort "none" at the top level and converts it; it
+            # rejects "none" inside chat_template_kwargs. This kit's own server
+            # reads chat_template_kwargs.enable_thinking. Sending both means
+            # either endpoint understands one of them, and they cannot conflict
+            # because they say the same thing.
             sampling["chat_template_kwargs"] = {"enable_thinking": False}
             sampling["reasoning_effort"] = "none"
-        elif thinking in ("low", "medium", "high"):
+        elif thinking and thinking != "default":
+            # Whatever level is set, not a hardcoded triple. ("low", "medium",
+            # "high") was wrong in both directions on a real endpoint: it
+            # dropped "xhigh" silently - the user picked Extra high and nothing
+            # was sent at all - while happily forwarding "high", which this
+            # model's template rejects outright with a 400. Which levels exist
+            # is the endpoint's business, and it is answered where that is
+            # known: the local server probes its template, a provider declares
+            # them or is probed. Nothing here should second-guess that list.
             sampling["reasoning_effort"] = thinking
         with self._lock:
             self._gc_turns()
@@ -645,7 +799,19 @@ class ChatUI:
                     "press Stop first", 409)
         cancel = self._cancel.setdefault(sid, threading.Event())
         cancel.clear()
-        approve, pre_approved = self._approver(sid, cancel.is_set)
+        # How much the user has agreed to in advance. "ask" is the default and
+        # the only one that shows a card for every write; the other two are a
+        # standing answer, so they are re-read from the request on every turn
+        # and never remembered on the server.
+        stance = str(settings.get("permissions", "ask")).strip().lower()
+        if stance == "all":
+            auto = {t.name for t in tool_list
+                    if t.risk in (webui_tools.WRITE, webui_tools.EXEC)}
+        elif stance == "writes":
+            auto = {t.name for t in tool_list if t.risk == webui_tools.WRITE}
+        else:
+            auto = set()
+        approve, pre_approved = self._approver(sid, cancel.is_set, auto)
         ask = self._asker(cancel.is_set)
 
         def events():
@@ -691,6 +857,7 @@ class ChatUI:
             self._append_turn(sid, fresh[sent:], plan,
                               {"provider": target["id"], "model": target["model"],
                                "mode": mode, "workspace": session.get("workspace"),
+                               "thinking": thinking or None,
                                "title": session["title"]})
             yield {"type": "done",
                    "usage": (final or {}).get("usage") or {},
@@ -792,6 +959,8 @@ class ChatUI:
                               "model": self.model_id,
                               "base_url": self.model_base},
                 })
+            if path == "/ui/file":
+                return self._workspace_file(query)
             if path == "/ui/browse":
                 return self._browse(query.get("path"))
             return Response(404, "text/plain", b"not found")
@@ -931,6 +1100,15 @@ class ChatUI:
                     return Response.error("no such session", 404)
                 if body.get("title"):
                     session["title"] = str(body["title"])[:MAX_TITLE]
+                if "thinking" in body:
+                    # The level belongs to the conversation, like its model and
+                    # its mode. Written on change rather than only with the next
+                    # turn, so setting it and switching away does not lose it.
+                    want = str(body.get("thinking") or "").strip().lower()
+                    if want and want != "default":
+                        session["thinking"] = want
+                    else:
+                        session.pop("thinking", None)
                 if "pinned" in body:
                     was_pinned = bool(session.get("pinned"))
                     session["pinned"] = bool(body["pinned"])

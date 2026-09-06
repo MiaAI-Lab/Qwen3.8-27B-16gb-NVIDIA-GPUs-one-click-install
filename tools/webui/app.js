@@ -28,6 +28,7 @@ const state = {
   provider: "local",     // which endpoint answers this chat
   model: "",
   settings: {},          // filled from the server's defaults, then localStorage
+  thinking: null,        // this conversation's level; null = use the default
 };
 
 const SUGGESTIONS = {
@@ -50,17 +51,84 @@ function escapeHtml(s) {
     { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+/* Placeholders.
+
+   Several rules below lift a finished fragment out of the text, run the
+   remaining rules, and put it back at the end. The token that marks the hole
+   has to be something the text itself cannot contain, or a message that types
+   the token literally gets somebody else's fragment pasted into it - and, in
+   the case of a generated tag, gets it pasted somewhere the escaping cannot
+   reach. U+E000..U+E002 are private-use code points with no meaning anywhere;
+   markdown() strips them from the source before anything else runs, so by the
+   time these are inserted the text is guaranteed not to hold one. */
+const HOLE_OPEN = "\uE000";
+const HOLE_CLOSE = "\uE001";
+const HOLE_RE = /\uE000(\d+)\uE001/g;
+
 function inline(s) {
-  return s
-    .replace(/`([^`]+)`/g, (_, c) => `<code>${c}</code>`)
+  /* Everything lifted out of this string, in the order it was lifted. Two
+     kinds go in here and both have to:
+
+     - code spans, because everything between backticks is literal: bold,
+       links and the <br> rule must not run inside them (`a**b**c` used to come
+       back with a <strong> in the middle of it);
+
+     - the anchors the link rule builds, because the autolink rule runs after
+       it over the same string. An anchor's href holds a URL, the autolink rule
+       matches URLs, and it does not know a tag when it sees one - so it
+       rewrote the URL sitting inside href="..." and injected raw quotes into
+       the middle of the attribute. Everything after those quotes was then
+       parsed as further attributes, and since "/" separates attribute names,
+       "http://e/onmouseover=..." became a working event handler. That was
+       arbitrary script in this page's origin, from model output, on hover. */
+  const holes = [];
+  const hole = (html) => `${HOLE_OPEN}${holes.push(html) - 1}${HOLE_CLOSE}`;
+
+  let text = String(s)
+    .replace(/`([^`]+)`/g, (_, c) => hole(`<code>${c}</code>`));
+
+  text = text
+    /* A model reaching for a line break mid-sentence writes <br>, which
+       escapeHtml has already turned into visible text by the time we get here.
+       Only the void, attribute-less spellings come back as real breaks: a <br>
+       has no attribute surface, so nothing can ride in on one. */
+    .replace(/&lt;br\s*\/?&gt;/gi, "<br>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (whole, label, href) =>
-      (/^(https?:|mailto:|[./#])/i.test(href.trim())
-        ? `<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`
-        : `${label} (${href})`))       /* javascript:, data:, file: stay inert */
-    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g,
-             '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (whole, label, href) => {
+      /* javascript:, data:, file: stay inert */
+      if (!/^(https?:|mailto:|[./#])/i.test(href.trim())) return `${label} (${href})`;
+      /* escapeHtml ran over the whole source before this, so a raw quote or
+         angle bracket cannot be here by any honest route. If one is, something
+         upstream changed and this is not a link any more. */
+      if (/["'<>]/.test(href)) return `${label} (${href})`;
+      /* The whole anchor goes in the hole, label included. Lifting only the
+         tags would leave the label exposed to the autolink rule below, which
+         would then open a second anchor inside this one - and browsers close
+         the outer one when they meet it, so the link came apart. The label has
+         already been through <br>, bold and em, and its code spans are holes
+         of their own; nested holes are resolved by the loop at the end. */
+      return hole(`<a href="${href}" target="_blank" rel="noopener noreferrer">`
+                  + `${label}</a>`);
+    })
+    /* Bare URLs. The character class has to exclude the hole sentinels or a
+       URL sitting next to one swallows it, and the index digits with it -
+       "https://a.example" followed by hole 1 became "https://a.example1". */
+    .replace(/(^|[\s(])(https?:\/\/[^\s<)\uE000\uE001]+)/g, (whole, before, url) =>
+      before + hole(`<a href="${url}" target="_blank" rel="noopener noreferrer">`
+                    + `${url}</a>`));
+
+  /* Holes can nest - an anchor's label may hold a code span - so this runs
+     until the text stops changing. Bounded, because a hole whose index does
+     not exist is left alone and would otherwise spin. */
+  let out = text;
+  for (let pass = 0; pass < 4; pass += 1) {
+    const next = out.replace(/\uE000(\d+)\uE001/g,
+                             (whole, n) => (holes[n] === undefined ? whole : holes[n]));
+    if (next === out) break;
+    out = next;
+  }
+  return out;
 }
 
 function codeBlock(lang, code) {
@@ -72,15 +140,19 @@ function codeBlock(lang, code) {
 
 function markdown(src) {
   const blocks = [];
-  let text = escapeHtml(src || "").replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+  // The sentinels below are inserted, never matched from the source: anything
+  // that looks like one in the incoming text is removed here, so a message can
+  // neither collide with a hole nor manufacture one.
+  const clean = String(src || "").replace(/[\uE000-\uE002]/g, "");
+  let text = escapeHtml(clean).replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
     blocks.push(codeBlock(lang, code.replace(/\n$/, "")));
-    return `@@CB${blocks.length - 1}@@`;
+    return `${HOLE_OPEN}${blocks.length - 1}${HOLE_CLOSE}`;
   });
 
   const open = text.match(/```(\w*)\n?([\s\S]*)$/);
   if (open) {
     blocks.push(codeBlock(open[1], open[2].replace(/\n$/, "")));
-    text = text.slice(0, open.index) + `@@CB${blocks.length - 1}@@`;
+    text = text.slice(0, open.index) + `${HOLE_OPEN}${blocks.length - 1}${HOLE_CLOSE}`;
   }
 
   const lines = text.split("\n");
@@ -100,7 +172,9 @@ function markdown(src) {
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (/^@@CB\d+@@$/.test(line.trim())) { flushAll(); out.push(line.trim()); continue; }
+    if (/^\uE000\d+\uE001$/.test(line.trim())) {
+      flushAll(); out.push(line.trim()); continue;
+    }
     if (!line.trim()) { flushAll(); continue; }
 
     const head = line.match(/^(#{1,6})\s+(.*)$/);
@@ -135,8 +209,7 @@ function markdown(src) {
     para.push(line.trim());
   }
   flushAll();
-  // a model writing about this file can emit the placeholder itself
-  return out.join("\n").replace(/@@CB(\d+)@@/g,
+  return out.join("\n").replace(HOLE_RE,
                                 (whole, n) => (blocks[n] === undefined ? whole : blocks[n]));
 }
 
@@ -236,6 +309,7 @@ function setEndpoint(provider, model, providerName) {
   // if the user told us what it is when adding the provider, use that instead of
   // giving up and showing a dash.
   refreshAttachButton();
+  refreshEffort();
   const total = activeContextLength();
   if (total) {
     $("#stat-context").textContent = `${Math.round(total / 1024)}k tokens`;
@@ -324,8 +398,17 @@ function followThink(pane) {
   pane.scrollTop = pane.scrollHeight;
 }
 
+/* A run of thinking, in the place it happened.
+
+   This used to find the first .think in the message and pour every later burst
+   back into it - and it prepended that block, so in an agent turn the model's
+   thinking for step six was appended to a window pinned above step one, still
+   growing while the work scrolled past underneath it. Thinking is part of the
+   sequence: each run gets its own block, below whatever it follows. */
 function thinkBlock(container, live) {
-  let node = container.querySelector(".think");
+  const all = container.querySelectorAll(".think");
+  let node = all[all.length - 1];
+  if (node && node.dataset.closed) node = null;
   if (!node) {
     node = el("details", "think");
     node.open = thinkOpenPref();
@@ -344,10 +427,21 @@ function thinkBlock(container, live) {
       setThinkOpenPref(node.open);
     });
     node.dataset.started = String(Date.now());
-    container.prepend(node);
+    container.append(node);
   }
   node.classList.toggle("live", !!live);
   return node.querySelector(".think-body");
+}
+
+/* A run of thinking is over when the model starts saying something or reaches
+   for a tool. Whatever it thinks after that is new thinking, and belongs in a
+   new block underneath - not back in the one above. */
+function closeThink(container) {
+  const all = container.querySelectorAll(".think");
+  const node = all[all.length - 1];
+  if (!node || node.dataset.closed) return;
+  node.dataset.closed = "1";
+  settleThinkBlock(node);
 }
 
 /* The block stops being live: name what it did and how long it took, so it
@@ -410,28 +504,414 @@ function contentBlock(container) {
   return node;
 }
 
-function toolCard(container, call) {
-  const card = el("details", "tool");
-  card.dataset.id = call.id;
+/* How each tool introduces itself.
+
+   A card used to be the tool's name over a JSON dump of its arguments and a
+   blob of its output. That is a database row, not a sentence: the person
+   reading it wants to know that a file was written and which one, and only
+   sometimes what went into it. So every tool says what it is doing in words,
+   names the one thing it is doing it to, and keeps the rest folded away.
+
+   `text` is the argument worth reading as text rather than as a value - a
+   file's contents, a command, a script. It is the one that streams. */
+const TOOL_VIEW = {
+  write_file:  { icon: "file", doing: "Writing", done: "Wrote",
+                 subject: (a) => a.path, text: "content",
+                 asks: "write a file", noun: "writing files" },
+  edit_file:   { icon: "pencil", doing: "Editing", done: "Edited",
+                 subject: (a) => a.path, text: "new_text",
+                 asks: "change a file", noun: "editing files" },
+  read_file:   { icon: "file", doing: "Reading", done: "Read",
+                 subject: (a) => a.path },
+  list_dir:    { icon: "folder", doing: "Listing", done: "Listed",
+                 subject: (a) => a.path || "the workspace" },
+  find_files:  { icon: "search", doing: "Looking for", done: "Looked for",
+                 subject: (a) => a.pattern },
+  search_text: { icon: "search", doing: "Searching for", done: "Searched for",
+                 subject: (a) => a.query },
+  run_command: { icon: "terminal", doing: "Running", done: "Ran",
+                 subject: (a) => a.description || a.command,
+                 text: "command", mono: true,
+                 asks: "run a command on this computer",
+                 noun: "running commands" },
+  run_python:  { icon: "terminal", doing: "Running", done: "Ran",
+                 subject: (a) => a.description || "a Python snippet",
+                 text: "code", lang: "python",
+                 asks: "run a Python script on this computer",
+                 noun: "running Python" },
+  job_output:  { icon: "terminal", doing: "Checking", done: "Checked",
+                 subject: (a) => `job ${a.job_id}` },
+  job_kill:    { icon: "stop", doing: "Stopping", done: "Stopped",
+                 subject: (a) => `job ${a.job_id}`,
+                 asks: "stop a running job", noun: "stopping jobs" },
+  web_search:  { icon: "globe", doing: "Searching the web for",
+                 done: "Searched the web for", subject: (a) => a.query },
+  web_fetch:   { icon: "globe", doing: "Fetching", done: "Fetched",
+                 subject: (a) => a.url },
+  update_plan: { icon: "list", doing: "Updating the plan",
+                 done: "Updated the plan", subject: () => "", plan: true,
+                 // the checklist above already is the result; printing
+                 // "[~] read the config" underneath it says it twice
+                 resultAs: (out) => (out.match(/\((\d+\/\d+) done\)/) || [])[1] },
+  ask_user:    { icon: "ask", doing: "Asking", done: "Asked",
+                 subject: (a) => a.question },
+};
+
+/* A page the agent just wrote is something you want to look at, now, not go
+   hunting for in a folder. Anything the browser can render as a page counts. */
+const OPENABLE = /\.(html?|svg|pdf)$/i;
+
+function wroteAPage(name, args) {
+  if (name !== "write_file" && name !== "edit_file") return "";
+  const path = (args || {}).path || "";
+  return OPENABLE.test(path) ? path : "";
+}
+
+/* It opens in its own tab, from a route that serves it with an opaque origin -
+   the model wrote this page, and it must not be able to act as this UI. */
+function pageUrl(path) {
+  return `/ui/file?session=${encodeURIComponent(state.sessionId || "")}`
+       + `&path=${encodeURIComponent(path)}`;
+}
+
+function openPageLink(path, cls) {
+  const a = el("a", cls || "act");
+  a.href = pageUrl(path);
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  a.append(icon("globe"), el("span", null, `Open ${path.split(/[\\/]/).pop()}`));
+  return a;
+}
+
+/* The moment the thing you asked for exists.
+
+   A row of small grey buttons is the wrong shape for it: Copy and Retry are
+   things you might do, and this is the answer. So it is its own card, the
+   width of the reply, and it shows the page rather than describing it - the
+   preview is the real file, rendered, which is also the fastest way to see
+   that it came out right. */
+function pageReadyCard(path, bytes) {
+  const name = path.split(/[\\/]/).pop();
+  const card = el("a", "page-ready");
+  card.href = pageUrl(path);
+  card.target = "_blank";
+  card.rel = "noopener noreferrer";
+  card.title = `Open ${name} in a new tab`;
+
+  const shot = el("span", "shot");
+  shot.dataset.src = pageUrl(path);
+  const meta = el("span", "meta");
+  meta.append(el("span", "eyebrow", "Ready"),
+              el("span", "name", name),
+              el("span", "sub", kindOf(name)));
+  const go = el("span", "go");
+  go.append(icon("send"));
+  card.append(el("span", "ring"), shot, meta, go);
+  mountPreview(shot);
+  if (bytes) sizeInto(meta.querySelector(".sub"), card.href, kindOf(name));
+  return card;
+}
+
+const KINDS = { html: "HTML page", htm: "HTML page", svg: "SVG drawing",
+                pdf: "PDF document" };
+
+function kindOf(name) {
+  return KINDS[(name.split(".").pop() || "").toLowerCase()] || "File";
+}
+
+/* The real page, rendered small. It is mounted only while the card is on
+   screen: a transcript with a dozen of these must not be a dozen pages all
+   running their own animation loops behind a scrollbar. */
+function mountPreview(shot) {
+  const calm = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const show = () => {
+    if (shot.firstChild) return;
+    const frame = el("iframe");
+    frame.src = shot.dataset.src;
+    frame.setAttribute("sandbox", "allow-scripts");   // belt and braces
+    frame.setAttribute("scrolling", "no");
+    frame.setAttribute("tabindex", "-1");
+    frame.setAttribute("aria-hidden", "true");
+    frame.loading = "lazy";
+    shot.append(frame);
+  };
+  if (calm || !("IntersectionObserver" in window)) { show(); return; }
+  const watch = new IntersectionObserver((rows) => {
+    rows.forEach((row) => {
+      if (row.isIntersecting) show();
+      else shot.replaceChildren();
+    });
+  }, { rootMargin: "200px" });
+  watch.observe(shot);
+}
+
+/* The size is the file's own, read from the response rather than guessed from
+   what the model happened to send: appends mean the last write is not the
+   file. The body is cancelled the moment the headers land. */
+async function sizeInto(node, url, kind) {
+  try {
+    const res = await fetch(url);
+    const len = Number(res.headers.get("content-length")) || 0;
+    res.body?.cancel();
+    if (len) node.textContent = `${kind}  ·  ${sizeOf(len)}`;
+  } catch (e) { /* the name and the kind are enough */ }
+}
+
+/* A tool nobody taught this UI about still has to read as a sentence. */
+function toolView(name) {
+  return TOOL_VIEW[name] || {
+    icon: "bolt", doing: "Running", done: "Ran",
+    subject: (a) => String(Object.values(a || {})[0] ?? "").slice(0, 160),
+  };
+}
+
+const BYTE_UNITS = ["bytes", "KB", "MB"];
+
+function sizeOf(chars) {
+  let n = chars, unit = 0;
+  while (n >= 1024 && unit < BYTE_UNITS.length - 1) { n /= 1024; unit += 1; }
+  return `${unit ? n.toFixed(1) : Math.round(n)} ${BYTE_UNITS[unit]}`;
+}
+
+/* The card's one line. Everything else about the call is behind the fold. */
+function toolSummary(view, subject, running) {
   const summary = el("summary");
-  summary.append(el("span", "name", call.name), el("span", "arg", call.label || ""),
-                 el("span", "state run", "running"));
+  summary.append(icon(view.icon, "tool-ico"),
+                 el("span", "verb", running ? view.doing : view.done));
+  const what = el("span", "subject", subject || "");
+  what.title = subject || "";
+  summary.append(what, el("span", "meta", ""), el("span", "state", ""),
+                 icon("down", "chev"));
+  return summary;
+}
+
+function setToolMeta(card, text) {
+  const meta = card.querySelector(".meta");
+  if (meta) meta.textContent = text || "";
+}
+
+function setToolSubject(card, subject) {
+  const what = card.querySelector(".subject");
+  if (!what || !subject || what.textContent === subject) return;
+  what.textContent = subject;
+  what.title = subject;
+}
+
+/* A call the model is still writing.
+
+   Tool arguments arrive as one JSON object built a token at a time and are
+   only parseable at the very last brace, so a write_file carrying a whole page
+   used to be minutes of a climbing character count and nothing else. The
+   server decodes the fragment as it goes now, so this shows the file being
+   written, live - open while it happens, and folded away once it lands. */
+function pendingToolCard(container, ev) {
+  const view = toolView(ev.name);
+  const card = el("details", "tool pending");
+  card.dataset.id = ev.id;
+  card.dataset.name = ev.name;
+  card.open = true;
+  const summary = toolSummary(view, "", true);
+  summary.querySelector(".state").className = "state run";
+  summary.querySelector(".state").textContent = "writing";
   const io = el("div", "io");
-  io.append(el("div", "lbl", "arguments"),
-            el("pre", null, JSON.stringify(call.args, null, 2)));
   card.append(summary, io);
   container.append(card);
   return card;
 }
 
+/* Each fragment says which argument it belongs to. The one worth watching gets
+   a live block; a short one - the path, a flag - is the card's subject line,
+   which is why it is worth decoding the arguments in order rather than waiting
+   for the end. */
+function updatePendingToolCard(card, ev) {
+  if (!card) return;
+  const view = toolView(ev.name);
+  const io = card.querySelector(".io");
+  (ev.parts || []).forEach(([field, add]) => {
+    if (!add) return;
+    if (field === view.text || (!view.text && add.length > 80)) {
+      let pre = io.querySelector(`.tool-live[data-field="${CSS.escape(field)}"]`);
+      if (!pre) {
+        pre = el("pre", "tool-live");
+        pre.dataset.field = field;
+        io.append(pre);
+      }
+      pre.append(document.createTextNode(add));
+      // follow the tail, but only while the person has not scrolled up in it
+      if (pre.scrollHeight - pre.scrollTop - pre.clientHeight < 60) {
+        pre.scrollTop = pre.scrollHeight;
+      }
+      return;
+    }
+    // a short scalar: the subject line, or a quiet chip beside it
+    const held = card.dataset[`arg_${field}`] || "";
+    card.dataset[`arg_${field}`] = held + add;
+    const args = {};
+    Object.keys(card.dataset).forEach((k) => {
+      if (k.startsWith("arg_")) args[k.slice(4)] = card.dataset[k];
+    });
+    const subject = view.subject(args);
+    if (subject) setToolSubject(card, subject);
+  });
+  if (ev.chars > 400) setToolMeta(card, sizeOf(ev.chars));
+}
+
+function toolCard(container, call) {
+  // Reuse the card that was showing this call being written, rather than
+  // dropping it and building a new one: the arguments are the same text, and
+  // replacing the element mid-stream makes the card blink and jump back to the
+  // top of a file the person was reading.
+  // Not only the one matching this id: a server that sends the call id in a
+  // later fragment than the name announces progress under a provisional id, so
+  // the placeholder can be filed under a different one. Calls are executed one
+  // at a time, so any placeholder still standing here belongs to this call.
+  const view = toolView(call.name);
+  const args = call.args || {};
+  const pending = container.querySelector(".tool.pending");
+  const card = pending || el("details", "tool");
+  card.dataset.id = call.id;
+  card.dataset.name = call.name;
+  // A call whose arguments could not be read arrives here with none - the
+  // server replaces an unparseable string with {} so it can never poison the
+  // conversation. But the person just watched ten thousand characters of it
+  // arrive, and this block is the only copy of them that exists. Throwing it
+  // away at the exact moment it turns out to matter is the wrong instinct.
+  const live = pending && pending.querySelector(".tool-live");
+  const lost = live && !(view.text && typeof args[view.text] === "string");
+  const subject = view.subject(args) || call.label
+    || (pending && pending.querySelector(".subject")?.textContent) || "";
+  const summary = toolSummary(view, subject, true);
+  summary.querySelector(".state").className = "state run";
+  summary.querySelector(".state").textContent = "running";
+  const page = wroteAPage(call.name, args);
+  if (page) {
+    // A file written and then appended to six times is one page, not seven.
+    // The link belongs on the last call that touched it - that is the version
+    // there is to look at.
+    // Across the whole thread, not just this message: a live turn puts every
+    // step in one body, but a reopened one gives each step its own, and seven
+    // identical links came back the moment the conversation was reopened.
+    const here = pageUrl(page);
+    ($("#thread") || container).querySelectorAll(".tool .open-page")
+      .forEach((old) => { if (old.getAttribute("href") === here) old.remove(); });
+    summary.insertBefore(openPageLink(page, "act open-page"),
+                         summary.querySelector(".state"));
+  }
+  const io = el("div", "io");
+  if (lost) {
+    live.className = "tool-text";
+    io.append(el("div", "lbl", "what arrived before it stopped"), live);
+  }
+  toolDetail(io, view, args);
+  card.classList.remove("pending");
+  card.replaceChildren(summary, io);
+  // The size the person watched climb should still be there at the end - but
+  // only where a size means something. "68 bytes" next to a shell command is
+  // a measurement of the wrong thing.
+  const body = view.text ? args[view.text] : null;
+  if (typeof body === "string" && body.length > 400) {
+    setToolMeta(card, sizeOf(body.length));
+  } else if (typeof body === "string") {
+    setToolMeta(card, "");
+  }
+  if (!pending) container.append(card);
+  return card;
+}
+
+/* What is behind the fold: the text the call is really about, then whatever
+   else it was given - as named values, not as a JSON object the reader has to
+   parse in their head. */
+function toolDetail(io, view, args) {
+  if (view.plan) { io.append(planList(args.todos || [])); return; }
+  const rest = { ...args };
+  if (view.text && typeof rest[view.text] === "string") {
+    const pre = el("pre", view.mono ? "tool-text mono" : "tool-text",
+                   rest[view.text]);
+    io.append(pre);
+    delete rest[view.text];
+  }
+  // edit_file is a before and after; showing only the after is half a story
+  if (typeof rest.old_text === "string") {
+    io.append(el("div", "lbl", "replacing"),
+              el("pre", "tool-text was", rest.old_text));
+    delete rest.old_text;
+  }
+  // Whatever the summary line already says is not worth repeating under it:
+  // a card that reads "Wrote arcanum-vault.html" does not need a row saying
+  // path: arcanum-vault.html.
+  const said = view.subject(args);
+  const keys = Object.keys(rest).filter((k) => rest[k] !== undefined
+                                            && rest[k] !== "" && k !== "description"
+                                            && String(rest[k]) !== said);
+  if (!keys.length) return;
+  const list = el("dl", "tool-args");
+  keys.forEach((k) => {
+    const value = rest[k];
+    list.append(el("dt", null, k.replace(/_/g, " ")),
+                el("dd", null, typeof value === "object"
+                  ? JSON.stringify(value) : String(value)));
+  });
+  io.append(list);
+}
+
+/* The plan, as a checklist. It is a list of things to do - the shape it has in
+   the plan bar at the top - and there is no reading of `{"status":"pending"}`
+   that beats a tick box. */
+function planList(items) {
+  const list = el("ul", "plan-list mini");
+  items.forEach((item) => {
+    const li = el("li", item.status === "completed" ? "done"
+      : item.status === "in_progress" ? "now" : "");
+    const mark = el("span", "mark");
+    if (item.status === "completed") mark.append(icon("check"));
+    if (item.status === "in_progress") mark.append(el("i"));
+    li.append(mark, el("span", null, item.content));
+    list.append(li);
+  });
+  return list;
+}
+
 function finishToolCard(card, ok, output, ms) {
   if (!card) return;
+  const view = toolView(card.dataset.name);
+  const verb = card.querySelector(".verb");
+  if (verb) verb.textContent = view.done;
   const badge = card.querySelector(".state");
-  badge.className = `state ${ok ? "ok" : "err"}`;
-  badge.textContent = ok ? (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : "done") : "failed";
+  // A green DONE on every row is noise: a call that worked is the ordinary
+  // case and says so by not saying anything. Only time worth knowing about,
+  // and failure, earn a mark.
+  badge.className = ok ? "state" : "state err";
+  badge.textContent = ok ? "" : "failed";
+  card.classList.toggle("failed", !ok);
+  const bits = [];
+  const meta = card.querySelector(".meta");
+  if (meta && meta.textContent) bits.push(meta.textContent);
+  // A call with no text argument of its own - a read, a listing - has nothing
+  // to measure until its result arrives. "Read a file" and "read 40KB of
+  // file" are different facts, and the second one is the useful one.
+  else if (String(output || "").length > 400) bits.push(sizeOf(output.length));
+  if (ms >= 1000) bits.push(`${(ms / 1000).toFixed(1)}s`);
   const io = card.querySelector(".io");
-  io.append(el("div", "lbl", "result"), el("pre", null, output));
-  if (!ok) card.open = true;
+  // the live block was the argument arriving; keep the text, drop the tailing
+  io.querySelectorAll(".tool-live").forEach((pre) => {
+    pre.className = "tool-text";
+  });
+  // Some results are better said in the summary line than printed as a block:
+  // a tool that has already drawn its own answer does not need it in prose
+  // underneath.
+  const short = ok && view.resultAs && view.resultAs(String(output || ""));
+  if (short) {
+    bits.unshift(short);
+  } else if (String(output || "").trim()) {
+    if (io.childNodes.length) io.append(el("div", "lbl", "result"));
+    io.append(el("pre", "tool-out", output));
+  }
+  setToolMeta(card, bits.join("  ·  "));
+  // Folded once it lands - the point of watching a file being written is over
+  // when it has been. A failure stays open, because that is the one you have
+  // to read.
+  card.open = !ok;
+  card.classList.remove("pending");
 }
 
 function renderPlan(items) {
@@ -502,7 +982,8 @@ function questionCard(container, ev) {
 }
 
 function markResolved(body, id, label) {
-  body.querySelectorAll(`[data-call="${id}"]`).forEach((card) => {
+  /* an id from the model reaches a selector here, same as the tool cards */
+  body.querySelectorAll(`[data-call="${CSS.escape(String(id))}"]`).forEach((card) => {
     if (card.classList.contains("done")) return;
     card.classList.add("done");
     const row = card.querySelector(".row") || card.querySelector(".free");
@@ -524,15 +1005,35 @@ function approvalCard(container, ev, cards) {
     card.open = true;
     container = card.querySelector(".io");
   }
+  const view = toolView(ev.name);
+  const args = ev.args || {};
   const box = el("div", "approval");
   box.dataset.call = ev.id;
+  // The approval sits inside the card for the very call it is about, and that
+  // card already shows the command, the script, the file. Repeating it here -
+  // as escaped JSON, no less - asked the person to read the same thing twice
+  // and to prefer the unreadable copy.
+  const shown = !!card;
+
+  // This is the one moment where the person has to decide something on the
+  // agent's behalf, so it has to be readable at a glance. It used to open with
+  // the function's name jammed against its description - "run_python Check raw
+  // bytes for mangled CSS names" - over the arguments as escaped JSON, so the
+  // script you were being asked to approve arrived full of \n and \" and was
+  // the hardest thing on screen to actually read.
   const head = el("h4");
-  head.append(icon("shield"),
-    el("span", null, ev.risk === "exec"
-      ? "The agent wants to run something on this machine"
-      : "The agent wants to change a file"));
-  box.append(head, el("div", "sub", `${ev.name}  ${ev.label || ""}`),
-             el("pre", null, JSON.stringify(ev.args, null, 2)));
+  head.append(icon("shield"), el("span", null,
+    `The agent wants to ${view.asks
+      || (ev.risk === "exec" ? "run something on this computer"
+                             : "change a file")}`));
+  box.append(head);
+  if (!shown) {
+    const subject = view.subject(args) || ev.label || "";
+    if (subject) box.append(el("div", "sub", subject));
+    const what = el("div", "io");
+    toolDetail(what, view, args);
+    box.append(what);
+  }
 
   const row = el("div", "row");
   const decide = async (decision, label, yes) => {
@@ -547,11 +1048,14 @@ function approvalCard(container, ev, cards) {
       });
     } catch (e) { toast("Could not send that decision", true); }
   };
+  // The button used to be labelled with the function's name, which is the one
+  // word in the sentence the person has no way to judge.
+  const noun = view.noun || "this";
   const allow = el("button", "btn primary", "Allow once");
   allow.onclick = () => decide("allow", "Allowed", true);
-  const always = el("button", "btn", `Always allow ${ev.name}`);
+  const always = el("button", "btn", `Always allow ${noun}`);
   always.onclick = () => decide("always",
-    `Allowed - ${ev.name} will not ask again this session`, true);
+    `Allowed - ${noun} will not ask again in this chat`, true);
   const deny = el("button", "btn danger", "Deny");
   deny.onclick = () => decide("deny", "Denied", false);
   row.append(allow, always, deny);
@@ -597,10 +1101,13 @@ async function consumeStream(res, body, cards, stats) {
 
 function finishTurn(body, stats) {
   setStreaming(false);
+  // A call announced while it was streaming but never completed - truncated at
+  // the output limit, stopped, or lost to a network error - leaves its
+  // placeholder behind, because only a finished tool_call removes one.
+  body.querySelectorAll(".tool.pending").forEach((card) => card.remove());
   $("#speed").classList.remove("live");
   body.querySelector(".typing")?.remove();
-  const think = body.querySelector(".think");
-  if (think) settleThinkBlock(think);
+  body.querySelectorAll(".think").forEach(settleThinkBlock);
   flushContent(body);
   announce("Reply finished");
   messageActions(body, stats);
@@ -773,6 +1280,11 @@ function messageActions(body, stats) {
   const raw = [...body.querySelectorAll(".stream-content")]
     .map(rawOf).join("\n\n").trim();
   if (!raw) return;
+  // Above the row, not in it: what the turn produced is the answer, and Copy
+  // and Retry are things you might do next.
+  if (body.dataset.page && !body.querySelector(".page-ready")) {
+    body.append(pageReadyCard(body.dataset.page, true));
+  }
   const row = el("div", "msg-actions");
   const copy = el("button", "act");
   copy.append(icon("copy"), el("span", null, "Copy"));
@@ -843,7 +1355,11 @@ function contentText(content) {
 function availableEfforts() {
   if (state.provider && state.provider !== "local") {
     const p = (state.config?.providers || []).find((x) => x.id === state.provider);
-    return p?.efforts || [];
+    // What you declared, else what Test found. Same order of authority as
+    // Images: an endpoint that says nothing is not an endpoint that says no,
+    // and vLLM says nothing about reasoning levels while accepting them.
+    if (p?.efforts?.length) return p.efforts;
+    return p?.efforts_detected || [];
   }
   return state.config?.efforts || [];
 }
@@ -932,6 +1448,7 @@ function activeVision() {
 async function reloadConfig() {
   state.config = await api("/ui/config");
   refreshAttachButton();
+  refreshEffort();
   showContext(state.lastPromptTokens);
   const total = activeContextLength();
   $("#stat-context").textContent = total
@@ -961,10 +1478,20 @@ const EFFORT_LABELS = {
 const COMMANDS = {
   effort: {
     help: "/effort [off|<level>|default] - how hard the model thinks",
+    args: () => {
+      const now = currentEffort();
+      const mark = (v) => (v === now ? "  (current)" : "");
+      return [
+        { value: "default", hint: `let the model decide${mark("default")}` },
+        { value: "off", hint: `no reasoning at all - exact${mark("off")}` },
+        ...availableEfforts().map((l) => ({
+          value: l, hint: `${EFFORT_LABELS[l] || l}${mark(l)}` })),
+      ];
+    },
     run: (arg) => {
       const levels = availableEfforts();
       const choices = ["off", ...levels, "default"];
-      const now = state.settings.thinking || "default";
+      const now = currentEffort();
       const shown = now === "default" ? "the model's default"
         : (now === "off" ? "off" : (EFFORT_LABELS[now] || now));
       if (!arg) {
@@ -976,14 +1503,13 @@ const COMMANDS = {
       }
       const want = arg.toLowerCase();
       if (want === "default" || want === "auto" || want === "reset") {
-        delete state.settings.thinking;
-        saveSettings();
-        return "Thinking left to the model to decide, as it was before.";
+        setEffort("default");
+        return "This chat leaves thinking to the model, as it was before.";
       }
       if (want === "off" || want === "none") {
-        state.settings.thinking = "off";
-        saveSettings();
-        return "Thinking off. The model answers straight away - this one is exact.";
+        setEffort("off");
+        return "Thinking off for this chat. The model answers straight away - "
+             + "this one is exact.";
       }
       if (!levels.includes(want)) {
         return levels.length
@@ -991,17 +1517,346 @@ const COMMANDS = {
           : `This endpoint did not say it takes "${arg}". Only off and default `
             + "are reliable here.";
       }
-      state.settings.thinking = want;
-      saveSettings();
-      return `Thinking set to ${EFFORT_LABELS[want] || want}. This is a request, `
+      setEffort(want);
+      return `This chat now asks for ${EFFORT_LABELS[want] || want}. It is a request, `
            + "not a limit: the model decides how much it actually needs.";
     },
   },
   help: {
     help: "/help - list these commands",
+    args: () => [],
     run: () => Object.values(COMMANDS).map((c) => c.help).join("\n"),
   },
 };
+
+/* ------------------------------------------------ thinking & permissions -- */
+
+/* What the model is being asked to do before it answers, and what the agent
+   may do without asking. Both used to live only inside Settings, several
+   clicks away - which for thinking meant nobody could tell whether a terse
+   answer was the setting or the model, and for permissions meant the one
+   state that can change files on your disk without a prompt was invisible. */
+
+const PERMISSIONS = [
+  { value: "ask", label: "Ask every time",
+    hint: "every write and every command stops for approval" },
+  { value: "writes", label: "Auto-accept file edits",
+    hint: "writes go through; commands still ask" },
+  { value: "all", label: "Accept everything",
+    hint: "no approvals at all, including running commands" },
+];
+
+/* The level this conversation is running at.
+
+   Two layers, the same shape as the model: Settings holds the default a NEW
+   chat starts on, and each conversation may depart from it. One number for the
+   whole browser was wrong for the way this gets used - a throwaway question
+   and a refactor want different amounts of thinking, and changing it for one
+   should not reach back into the other. */
+function currentEffort() {
+  return state.thinking || state.settings.thinking || "default";
+}
+
+/* What a turn is actually sent with: the saved settings, with this
+   conversation's level standing in for the default. */
+function turnSettings() {
+  const now = currentEffort();
+  const out = { ...state.settings };
+  if (now === "default") delete out.thinking; else out.thinking = now;
+  return out;
+}
+
+function effortLabel(value) {
+  if (value === "default") return "auto";
+  if (value === "off") return "off";
+  return EFFORT_LABELS[value] || value;
+}
+
+function refreshEffort() {
+  const chip = $("#stat-effort");
+  if (!chip) return;
+  const now = currentEffort();
+  $("#stat-effort-name").textContent = `Thinking: ${effortLabel(now)}`;
+  chip.title = now === "default"
+    ? "Thinking is left to the model - click to change"
+    : `Thinking is set to ${effortLabel(now)} - click to change`;
+}
+
+function refreshPermissions() {
+  const chip = $("#stat-perm");
+  if (!chip) return;
+  const now = state.settings.permissions || "ask";
+  // Silent when nothing has been given away; loud when it has.
+  chip.hidden = now === "ask";
+  chip.classList.toggle("hot", now === "all");
+  const spec = PERMISSIONS.find((p) => p.value === now);
+  $("#stat-perm-name").textContent =
+    now === "all" ? "Accepting everything" : "Auto-accepting edits";
+  chip.title = `${spec ? spec.hint : ""} - click to change`;
+}
+
+function setEffort(value) {
+  state.thinking = value === "default" ? null : value;
+  refreshEffort();
+  // Written now rather than only with the next turn: choosing a level and then
+  // switching chats without sending anything would otherwise lose it.
+  if (state.sessionId) {
+    api(`/ui/sessions/${state.sessionId}`, {
+      method: "POST", headers: UI_HEADERS,
+      body: JSON.stringify({ thinking: value === "default" ? "" : value }),
+    }).catch(() => { /* it still travels with the next turn */ });
+  }
+}
+
+/* The default a new conversation starts on - Settings' copy of this. */
+function setDefaultEffort(value) {
+  if (value === "default") delete state.settings.thinking;
+  else state.settings.thinking = value;
+  saveSettings();
+  refreshEffort();
+}
+
+function setPermissions(value) {
+  if (value === "ask") delete state.settings.permissions;
+  else state.settings.permissions = value;
+  saveSettings();
+  refreshPermissions();
+}
+
+/* Every level a chat template might take, in the order they are usually
+   meant. Which of them an endpoint actually accepts is the endpoint's
+   business - this is only the set to offer when declaring them. */
+const EFFORT_CANDIDATES = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/* Declare, from the menu, which levels this endpoint takes.
+
+   The probe cannot always find out - vLLM accepts reasoning_effort perfectly
+   well and its /models row says nothing about it - so this has to be
+   answerable by hand. It was only answerable in the provider form, four clicks
+   away from the chat you wanted to change; from here it is one. */
+function levelsEditor(anchor) {
+  const provider = (state.config?.providers || [])
+    .find((p) => p.id === state.provider);
+  if (!provider) {
+    toast("Levels are declared per provider - this chat is on the local model, "
+          + "which reports its own", true);
+    return;
+  }
+  const chosen = new Set(provider.efforts || []);
+  openMenu(anchor.left, anchor.top, [
+    { note: `Which levels does ${provider.name} take? Turn on only the ones it `
+          + "accepts - one it does not will fail the whole turn." },
+    ...EFFORT_CANDIDATES.map((level) => ({
+      icon: chosen.has(level) ? "check" : "bolt",
+      label: EFFORT_LABELS[level] || level,
+      checked: chosen.has(level),
+      keep: true,                        // the menu stays open while toggling
+      run: (button) => {
+        const on = !chosen.has(level);
+        if (on) chosen.add(level); else chosen.delete(level);
+        // The menu deliberately stays open, so nothing else is going to redraw
+        // this row: it has to show its own new state.
+        if (button) {
+          button.replaceChild(icon(on ? "check" : "bolt"), button.firstChild);
+          button.dataset.on = on ? "1" : "";
+        }
+        saveLevels(provider, [...chosen]);
+      },
+    })),
+  ]);
+}
+
+async function saveLevels(provider, levels) {
+  try {
+    // upsert is POST /ui/providers with the id in the body. The api_key is
+    // deliberately absent - public() never sends it out, and an empty key on
+    // the way in means "keep the stored one", which is the same contract the
+    // provider form relies on.
+    await api("/ui/providers", {
+      method: "POST", headers: UI_HEADERS,
+      body: JSON.stringify({ ...provider, efforts: levels }),
+    });
+    await reloadConfig();
+    toast(levels.length
+      ? `${provider.name} takes: ${levels.join(", ")}`
+      : `${provider.name} declares no levels`);
+  } catch (e) { toast(e.message, true); }
+}
+
+function effortMenu(event) {
+  /* Without this the click that opens the menu carries on up to the document
+     listener that closes any open menu - so it opened and shut in the same
+     tick and the chip looked dead. The row menus in the sidebar have always
+     stopped propagation for exactly this reason. */
+  event.stopPropagation();
+  const now = currentEffort();
+  const levels = availableEfforts();
+  const items = [["default", "Model default"], ["off", "Off"],
+                 ...levels.map((l) => [l, EFFORT_LABELS[l] || l])];
+  const rows = items.map(([value, label]) => ({
+    icon: value === now ? "check" : "bolt",
+    label: value === now ? `${label}  (current)` : label,
+    run: () => setEffort(value),
+  }));
+  // Two entries and no explanation reads as "there is nothing here". Say which
+  // it is: an endpoint that genuinely has no levels, or one that has not been
+  // asked yet because the server predates the question.
+  if (levels.length) {
+    // Measured on a real endpoint: the levels are named modes, not rungs. On
+    // one model's template "medium" adds no steering instruction at all, and
+    // on a short question it produced MORE reasoning than the level above it.
+    // Presenting them as a ladder would be claiming an ordering the numbers
+    // do not support.
+    rows.push("-");
+    rows.push({ note: "Named modes, not a ladder - a level is a request the "
+                    + "model can decline, and more is not guaranteed to think "
+                    + "longer than less." });
+  }
+  if (!levels.length) {
+    rows.push("-");
+    rows.push({ note: state.provider === "local"
+      ? "This server reported no effort levels. If you have just updated the "
+        + "kit, restart it - the levels are read from the model's own chat "
+        + "template when the server starts."
+      : "This provider did not say which levels it takes. Press Test on it in "
+        + "Settings \u203a Models \u203a Providers to ask again." });
+  }
+  // Declaring the levels is one row away, whether or not any are known yet.
+  if (state.provider && state.provider !== "local") {
+    rows.push("-");
+    rows.push({
+      icon: "gear",
+      label: levels.length ? "Edit levels\u2026" : "Add levels\u2026",
+      run: () => {
+        const at = $("#stat-effort").getBoundingClientRect();
+        levelsEditor({ left: at.left, top: at.top - 8 - 7 * 34 });
+      },
+    });
+  }
+  const box = event.currentTarget.getBoundingClientRect();
+  openMenu(box.left, box.top - 8 - rows.length * 34, rows);
+}
+
+function permissionsMenu(event) {
+  event.stopPropagation();
+  const now = state.settings.permissions || "ask";
+  const box = event.currentTarget.getBoundingClientRect();
+  openMenu(box.left, box.top - 8 - PERMISSIONS.length * 34,
+    PERMISSIONS.map((p) => ({
+      icon: p.value === now ? "check" : "shield",
+      danger: p.value === "all",
+      label: p.value === now ? `${p.label}  (current)` : p.label,
+      run: () => setPermissions(p.value),
+    })));
+}
+
+/* ------------------------------------------------------- slash commands -- */
+
+/* Typing a command should not be a memory test.
+
+   /effort took a level the endpoint may or may not accept, and the only way to
+   find out was to type it wrong and read the toast. The composer now offers
+   what is actually available as you type: the commands themselves after "/",
+   and that command's own arguments after the space - so the levels this
+   endpoint reports are a list you pick from rather than something you guess.
+
+   Arrow keys move, Enter or Tab takes the highlighted one, Escape dismisses.
+   Enter only sends the message when the menu is closed, so the key that
+   accepts a suggestion is never the key that fires a half-typed command. */
+
+/* Each command may describe its own arguments: (arg) -> [{value, hint}]. */
+function commandArgs(name) {
+  const spec = COMMANDS[name];
+  return spec && spec.args ? spec.args() : [];
+}
+
+function slashSuggestions(text) {
+  const m = /^\/([a-z]*)(\s+)?(.*)$/i.exec(text);
+  if (!m) return null;
+  const [, word, space, rest] = m;
+  if (!space) {
+    // still typing the command itself: taking one of these opens its arguments
+    const q = (word || "").toLowerCase();
+    return {
+      terminal: false,
+      replace: (v) => `/${v} `,
+      items: Object.keys(COMMANDS)
+        .filter((n) => n.startsWith(q))
+        .map((n) => ({ value: n, label: `/${n}`, hint: COMMANDS[n].help.split(" - ")[1] || "" })),
+    };
+  }
+  const q = (rest || "").toLowerCase();
+  return {
+    terminal: true,               // an argument completes the command
+    replace: (v) => `/${word.toLowerCase()} ${v}`,
+    items: commandArgs(word.toLowerCase())
+      .filter((a) => a.value.toLowerCase().startsWith(q))
+      .map((a) => ({ value: a.value, label: a.value, hint: a.hint || "" })),
+  };
+}
+
+let slashState = null;
+/* The exact text a suggestion was just accepted into. The menu stays shut for
+   it, so the Enter that completes "/effort off" is not also swallowed by a
+   menu that immediately re-opened on the word it had just inserted - the
+   second Enter has to send. Any further typing changes the text and the menu
+   is free again. */
+let slashDone = null;
+
+function closeSlash() {
+  slashState = null;
+  const pop = $("#slash-pop");
+  if (pop) pop.hidden = true;
+}
+
+function renderSlash() {
+  const pop = $("#slash-pop");
+  if (!pop) return;
+  const text = $("#input").value;
+  const found = (state.streaming || text === slashDone)
+    ? null : slashSuggestions(text);
+  if (!found || !found.items.length) { closeSlash(); return; }
+  const at = slashState && slashState.text === text
+    ? Math.min(slashState.at, found.items.length - 1) : 0;
+  slashState = { ...found, at, text };
+  pop.replaceChildren();
+  found.items.forEach((item, i) => {
+    const row = el("button", `slash-item${i === at ? " on" : ""}`);
+    row.type = "button";
+    row.append(el("b", null, item.label));
+    if (item.hint) row.append(el("span", null, item.hint));
+    // mousedown, not click: the textarea must not lose focus first
+    row.onmousedown = (e) => { e.preventDefault(); takeSlash(i); };
+    pop.append(row);
+  });
+  pop.hidden = false;
+}
+
+function moveSlash(step) {
+  if (!slashState) return;
+  const n = slashState.items.length;
+  slashState.at = (slashState.at + step + n) % n;
+  const rows = $("#slash-pop").querySelectorAll(".slash-item");
+  rows.forEach((r, i) => r.classList.toggle("on", i === slashState.at));
+  rows[slashState.at]?.scrollIntoView({ block: "nearest" });
+}
+
+function takeSlash(index) {
+  if (!slashState) return;
+  const item = slashState.items[index === undefined ? slashState.at : index];
+  if (!item) return;
+  const input = $("#input");
+  const terminal = slashState.terminal;
+  input.value = slashState.replace(item.value);
+  closeSlash();
+  slashDone = terminal ? input.value : null;
+  input.focus();
+  input.style.height = "auto";
+  input.style.height = `${Math.min(input.scrollHeight, 230)}px`;
+  // taking a command name should offer its arguments straight away; taking an
+  // argument is the end of it
+  if (!terminal) renderSlash();
+}
 
 /* True if the text was a command and has been dealt with. */
 function runCommand(text) {
@@ -1014,6 +1869,7 @@ function runCommand(text) {
   }
   const said = cmd.run(m[2].trim());
   if (said) toast(said);
+  closeSlash();
   return true;
 }
 
@@ -1056,7 +1912,7 @@ async function send(preset) {
       signal: state.controller.signal,
       body: JSON.stringify({
         session_id: state.sessionId, mode: state.mode, content,
-        workspace: state.workspace, settings: state.settings,
+        workspace: state.workspace, settings: turnSettings(),
         provider: state.provider, model: state.model,
       }),
     });
@@ -1101,16 +1957,28 @@ function handleEvent(ev, body, cards, stats) {
     }
     case "content": {
       body.querySelector(".typing")?.remove();
-      body.querySelector(".think")?.classList.remove("live");
+      closeThink(body);
       appendDelta(contentBlock(body), ev.delta);
+      break;
+    }
+    case "tool_progress": {
+      body.querySelector(".typing")?.remove();
+      closeThink(body);
+      const open = body.querySelector(".stream-content:last-of-type");
+      if (open) { open.dataset.closed = "1"; open.classList.remove("live"); }
+      let card = body.querySelector(
+        `.tool.pending[data-id="${CSS.escape(String(ev.id))}"]`);
+      if (!card) { card = pendingToolCard(body, ev); scrollDown(); }
+      updatePendingToolCard(card, ev);
       break;
     }
     case "tool_call": {
       body.querySelector(".typing")?.remove();
       const open = body.querySelector(".stream-content:last-of-type");
       if (open) { open.dataset.closed = "1"; open.classList.remove("live"); }
-      body.querySelector(".think")?.classList.remove("live");
+      closeThink(body);
       cards.set(ev.id, toolCard(body, ev));
+      body.dataset.page = wroteAPage(ev.name, ev.args) || body.dataset.page || "";
       scrollDown();
       break;
     }
@@ -1156,8 +2024,23 @@ function handleEvent(ev, body, cards, stats) {
   }
 }
 
+/* The sidebar list is refreshed when a turn ends, never while one runs - there
+   is no poll - so the row for the chat you are actually watching never showed
+   that it was working. Everything was in place except saying so: the class
+   goes on when the turn starts, and the refresh at the end confirms it. */
+function markRunningRow(on) {
+  const id = state.sessionId;
+  const row = id && $(`#sessions .session[data-id="${CSS.escape(id)}"]`);
+  if (!row) return;
+  row.classList.toggle("live", on);
+  const edge = row.querySelector(".edge");
+  if (on && !edge) row.append(el("i", "edge"));
+  if (!on && edge) edge.remove();
+}
+
 function setStreaming(on) {
   state.streaming = on;
+  markRunningRow(on);
   /* A turn just started: start sampling now rather than waiting out the idle
      interval, or the whole answer can finish before the first busy poll. */
   if (on) { sample = null; scheduleSpeedSample(120); }
@@ -1268,10 +2151,29 @@ function openMenu(x, y, items) {
   menu.replaceChildren();
   items.forEach((item) => {
     if (item === "-") { menu.append(el("hr")); return; }
+    if (item.note) {
+      // not a choice: an explanation of why there are so few of them
+      menu.append(el("div", "menu-note", item.note));
+      return;
+    }
     const button = el("button", item.danger ? "danger" : "");
     button.setAttribute("role", "menuitem");
+    if (item.checked !== undefined) button.dataset.on = item.checked ? "1" : "";
     button.append(icon(item.icon), el("span", null, item.label));
-    button.onclick = () => { closeMenu(); item.run(); };
+    button.onclick = (e) => {
+      // The document listener below closes a menu on any click outside it. It
+      // decides "outside" from the target's ancestors, and a row that opens a
+      // second menu detaches this button on the way - by the time the click
+      // reaches document it has no ancestors at all, so the listener read it
+      // as an outside click and shut the menu that had just opened. A click on
+      // a row is never an outside click: it is handled here, in full.
+      e.stopPropagation();
+      // `keep` is for a row you toggle rather than choose - the level editor
+      // would otherwise shut after every single tap.
+      if (item.keep) { item.run(button); return; }
+      closeMenu();
+      item.run(button);
+    };
     menu.append(button);
   });
   menu.hidden = false;
@@ -1374,23 +2276,38 @@ function markActiveSession(id) {
    replay its entry animation is the whole of the flicker. */
 let sessionsSig = "";
 
+/* Every conversation this page load has drawn a row for, ever. */
+let shownSessions = new Set();
+
+let sessionsSeq = 0;
+
 async function loadSessions() {
   let sessions = [];
   const query = ($("#session-filter").value || "").trim().toLowerCase();
+  const seq = ++sessionsSeq;
   try {
     // the server searches message text too, and caches the index by mtime
     const got = await api(`/ui/sessions${query ? `?q=${encodeURIComponent(query)}` : ""}`);
     sessions = got.sessions || [];
     state.live = got.live || {};
   } catch (e) { return; }
+  // A turn finishing fires this too, and the unfiltered list is slower than
+  // the filtered one: without this an in-flight full list lands after your
+  // search results and wipes them, leaving the query still in the box.
+  if (seq !== sessionsSeq) return;
   const nav = $("#sessions");
   const sig = JSON.stringify([query, state.sessionId, sessions.map(
     (s) => [s.id, s.title, s.snippet, s.mode, s.pinned, s.running, s.updated])]);
   if (sig === sessionsSig && nav.firstChild) return;
   sessionsSig = sig;
-  // rows already on screen are not re-animated: only ones that were not there
-  // a moment ago get the entry fade
-  const had = new Set([...nav.querySelectorAll(".session")].map((r) => r.dataset.id));
+  // Only a row that has never been drawn in this page load gets the entry
+  // fade. Tracked as an ever-growing set rather than "what is in the DOM right
+  // now", because the DOM is a poor record of it: a search that matched
+  // nothing leaves no rows at all, and reading that back said "none of these
+  // were here" - so clearing the search re-animated the whole list, which is
+  // the flicker the set exists to prevent.
+  const had = new Set(shownSessions);
+  sessions.forEach((x) => shownSessions.add(x.id));
   nav.replaceChildren();
   if (!sessions.length) {
     nav.append(el("div", "empty", query
@@ -1420,6 +2337,7 @@ async function loadSessions() {
     head.onclick = () => {
       const nowClosed = !section.classList.contains("closed");
       section.classList.toggle("closed", nowClosed);
+      inner.inert = nowClosed;
       head.setAttribute("aria-expanded", String(!nowClosed));
       head.title = `${group.label} - click to ${nowClosed ? "expand" : "collapse"}`;
       if (!query) setGroupClosed(group.key, nowClosed);
@@ -1429,6 +2347,11 @@ async function loadSessions() {
     // the inner wrapper is what the 1fr -> 0fr collapse animation clips
     const pane = el("div", "group-rows");
     const inner = el("div", "group-inner");
+    // A collapsed section is clipped to zero height, but its rows keep their
+    // box and their tabindex: tabbing out of the search box used to walk
+    // through a dozen invisible chats and their menu buttons, with no focus
+    // ring to show where you were. `inert` takes the whole subtree out.
+    inner.inert = closed.has(group.key);
     pane.append(inner);
     section.append(pane);
 
@@ -1448,6 +2371,9 @@ async function loadSessions() {
       const dot = el("span", "dot");
       if (s.running) dot.title = "Still working - open it to watch";
       row.append(dot);
+      // the running edge belongs to rows that are still working, and to no
+      // others - it is drawn only where it means something
+      if (s.running) row.append(el("i", "edge"));
 
       const title = el("span", "t");
       title.append(el("span", null, s.title));
@@ -1495,6 +2421,12 @@ async function loadSessions() {
 
     nav.append(section);
   });
+  // A conversation that started a moment ago is drawn for the first time here,
+  // after its turn was already running - and the redraw at the END of a turn
+  // races the server, which can still be reporting it as running for another
+  // moment and would leave the light going after the answer had landed. For
+  // the chat this window is looking at, this window is the authority.
+  markRunningRow(state.streaming);
 }
 
 /* Drag-and-drop only reorders pinned chats - the rest of the list sorts
@@ -1511,6 +2443,11 @@ async function loadSessions() {
   nav.addEventListener("dragstart", (e) => {
     const row = e.target.closest(".session.pinned[draggable]");
     if (!row) { e.preventDefault(); return; }
+    // From here the DOM is moved by hand. The render cache is keyed on server
+    // data alone, so it cannot see that and would skip the redraw that puts a
+    // failed reorder back - leaving the sidebar showing an order that was
+    // never saved, for good.
+    sessionsSig = "";
     dragging = row;
     e.dataTransfer.effectAllowed = "move";
     e.dataTransfer.setData("text/plain", row.dataset.id);
@@ -1572,43 +2509,62 @@ function renderStoredMessages(messages) {
   const thread = $("#thread");
   thread.replaceChildren();
   const cards = new Map();
+  // A reopened conversation should still offer the page it produced. The
+  // write is several messages above the answer, so the link is worked out
+  // once and hung on the last message that has actions to hang it from.
+  let made = "";
+  messages.forEach((m) => (m.tool_calls || []).forEach((c) => {
+    let args = {};
+    try { args = JSON.parse(c.function.arguments || "{}"); } catch (e) { args = {}; }
+    made = wroteAPage(c.function.name, args) || made;
+  }));
+  const lastSaid = messages.reduce(
+    (at, m, i) => (m.role === "assistant" && m.content ? i : at), -1);
   restoring = true;
-  messages.forEach((m) => {
-    if (m.role === "user") {
-      renderUserBody(newMessage("user"), m.content);
-    } else if (m.role === "assistant") {
-      const body = newMessage("assistant");
-      if (m.reasoning_content) {
-        thinkBlock(body).textContent = m.reasoning_content;
-        // a reloaded conversation follows the same preference as a live one
-        const node = body.querySelector(".think");
-        node.querySelector(".label").textContent = "Thinking";
-        node.dataset.settling = "1";
-        node.open = thinkOpenPref();
-        delete node.dataset.settling;
+  try {
+    messages.forEach((m, i) => {
+      if (m.role === "user") {
+        renderUserBody(newMessage("user"), m.content);
+      } else if (m.role === "assistant") {
+        const body = newMessage("assistant");
+        if (m.reasoning_content) {
+          thinkBlock(body).textContent = m.reasoning_content;
+          // a reloaded conversation follows the same preference as a live one
+          const node = body.querySelector(".think");
+          node.querySelector(".label").textContent = "Thinking";
+          node.dataset.settling = "1";
+          node.open = thinkOpenPref();
+          delete node.dataset.settling;
+        }
+        if (m.content) {
+          const node = contentBlock(body);
+          node.dataset.raw = m.content;
+          node.innerHTML = markdown(m.content);
+          node.classList.remove("live");
+          node.dataset.closed = "1";
+          if (i === lastSaid && made) body.dataset.page = made;
+          messageActions(body);
+        }
+        (m.tool_calls || []).forEach((c) => {
+          let args = {};
+          try { args = JSON.parse(c.function.arguments || "{}"); } catch (e) { args = {}; }
+          cards.set(c.id, toolCard(body, {
+            id: c.id, name: c.function.name, args,
+            label: Object.values(args)[0] ? String(Object.values(args)[0]).slice(0, 120) : "",
+          }));
+        });
+      } else if (m.role === "tool") {
+        const ok = !String(m.content || "").startsWith("error:");
+        finishToolCard(cards.get(m.tool_call_id), ok, m.content || "", 0);
       }
-      if (m.content) {
-        const node = contentBlock(body);
-        node.dataset.raw = m.content;
-        node.innerHTML = markdown(m.content);
-        node.classList.remove("live");
-        node.dataset.closed = "1";
-        messageActions(body);
-      }
-      (m.tool_calls || []).forEach((c) => {
-        let args = {};
-        try { args = JSON.parse(c.function.arguments || "{}"); } catch (e) { args = {}; }
-        cards.set(c.id, toolCard(body, {
-          id: c.id, name: c.function.name, args,
-          label: Object.values(args)[0] ? String(Object.values(args)[0]).slice(0, 120) : "",
-        }));
-      });
-    } else if (m.role === "tool") {
-      const ok = !String(m.content || "").startsWith("error:");
-      finishToolCard(cards.get(m.tool_call_id), ok, m.content || "", 0);
-    }
-  });
-  restoring = false;
+    });
+  } finally {
+    // Never leave this set. A single stored message that throws - a provider
+    // that saved `content` as an array of parts, a tool_call with no function
+    // - used to strand it at true, and from then on every message in the tab
+    // was marked .still and rendered with no animation at all.
+    restoring = false;
+  }
   refreshEditAction();
   scrollDown(true, true);          // put it at the bottom, do not travel there
 }
@@ -1625,11 +2581,22 @@ async function openSession(id) {
   state.sessionId = id;
   state.warnedContext = false;
   showContext(null);               // the meter belongs to the conversation
+  showSpeed(null);                 // ...and so does the rate
   setEndpoint(session.provider || "local", session.model || "");
+  state.thinking = session.thinking || null;
+  refreshEffort();
   setMode(session.mode === "agent" ? "agent" : "chat");
   if (session.workspace) setWorkspace(session.workspace);
   renderPlan(session.plan);
-  renderStoredMessages(session.messages || []);
+  try {
+    renderStoredMessages(session.messages || []);
+  } catch (e) {
+    // Half a transcript is worth more than none, and the work below - marking
+    // the row, closing the drawer, reattaching a turn that is still running -
+    // must happen whatever the messages did.
+    $("#thread").append(el("div", "err-box",
+      `Part of this conversation could not be displayed: ${e.message}`));
+  }
   // Opening a chat does not rename, reorder or re-time anything: the only
   // change to the list is which row is selected. Reloading it re-fetched,
   // re-created and re-animated every row, which is the flicker you saw on
@@ -1658,7 +2625,9 @@ function newChat() {
   if (state.streaming) detach();   // the turn carries on in its own conversation
   state.sessionId = null;
   state.warnedContext = false;
+  state.thinking = null;          // a new chat starts on the default
   showContext(null);
+  showSpeed(null);
   renderPlan([]);
   // start where the user said new chats should start; without a default set,
   // this keeps whichever endpoint was last chosen
@@ -1679,6 +2648,7 @@ function newChat() {
   // in more words. One statement of a thing is enough.
   thread.append(welcome);
   renderChips();
+  refreshEffort();
   loadSessions();
   $("#to-bottom").hidden = true;
 }
@@ -1796,59 +2766,112 @@ function browseModal() {
 
 /* Switching model means loading different weights into the same VRAM, so the
    server restarts into them. The UI waits for it to come back. */
+/* A section of the model picker that folds away.
+
+   The picker is two lists and one of them is nearly always the wrong one: a
+   chat answered by a provider has no use for seven local quants, and a chat on
+   local weights has no use for the provider list. So the section holding what
+   this chat actually uses opens and the other is folded - decided from what is
+   in force right now rather than from a remembered preference, because the
+   right answer changes with the chat you are in. */
+function pickerSection(box, title, count, open) {
+  const wrap = el("div", `pick-group${open ? "" : " closed"}`);
+  const head = el("button", "pick-head");
+  head.type = "button";
+  head.setAttribute("aria-expanded", open ? "true" : "false");
+  head.append(icon("down", "chev"), el("span", "t", title));
+  if (count) head.append(el("span", "count", String(count)));
+  const inner = el("div", "pick-inner");
+  head.onclick = () => {
+    const closed = wrap.classList.toggle("closed");
+    head.setAttribute("aria-expanded", closed ? "false" : "true");
+    fold(inner, closed);
+  };
+  const rows = el("div", "pick-rows");
+  rows.append(inner);
+  wrap.append(head, rows);
+  fold(inner, !open);
+  box.append(wrap);
+  return inner;                     // everything the section owns goes in here
+}
+
+/* A folded section is clipped, not removed - the rows inside it still have
+   their own boxes, so they stay in the tab order and a keyboard could reach a
+   button nobody can see. Clipping is a visual answer to a question that is
+   also about focus. */
+function fold(inner, closed) {
+  inner.inert = closed;
+  if (closed) inner.setAttribute("inert", ""); else inner.removeAttribute("inert");
+  inner.setAttribute("aria-hidden", closed ? "true" : "false");
+}
+
 async function modelModal() {
   let data;
   try {
     data = await api("/ui/models");
   } catch (e) { toast(e.message, true); return; }
 
+  // Which list is the one you came to look at. Anything but "local" is a
+  // provider, including a chat opened before any of this existed.
+  const onLocal = !state.provider || state.provider === "local";
+
   openModal("Model", (box) => {
     if (data.note) box.append(el("div", "muted-note", data.note));
-    if (!data.models.length) {
-      box.append(el("div", "muted-note",
-        "No models found under models/. Run start.bat and pick a profile to "
-        + "download one."));
-      return;
-    }
-    if (data.remote?.length) {
-      box.append(el("div", "group-label", "This computer"));
-    }
-    data.models.forEach((model) => {
-      const row = el("button", `model-row${model.current ? " current" : ""}`);
-      const who = el("div", "who");
-      who.append(el("div", "name", model.name));
-      const bits = [];
-      if (model.bpw) bits.push(`${model.bpw} bpw`);
-      if (model.quality) bits.push(model.quality);
-      if (model.size_gb) bits.push(`${model.size_gb} GB`);
-      if (model.context) bits.push(`${Math.round(model.context / 1024)}k context`);
-      who.append(el("div", "meta", model.fits === false
-        ? model.why : bits.join("  ·  ")));
-      row.append(who);
-      if (model.current) row.append(el("span", "badge", "loaded"));
-      else if (model.fits === false) {
-        row.append(el("span", "badge no",
-                      model.complete === false ? "incomplete" : "too big"));
+    // No local weights is not "no models": this chip is the only model control
+    // in the main UI now, and returning early here made every configured
+    // provider - and the button to add one - invisible from it.
+    if (data.remote?.length || data.models.length) {
+      // With nothing on the other side there is nothing to fold away to, so a
+      // lone section stays open whichever it is.
+      const only = !data.remote?.length;
+      const here = pickerSection(box, "This computer", data.models.length,
+                                 onLocal || only);
+      if (!data.models.length) {
+        here.append(el("div", "muted-note",
+          "No models found under models/. Run start.bat and pick a profile to "
+          + "download one."));
       }
-      row.disabled = model.current || !data.can_switch || model.fits === false;
-      row.onclick = () => switchModel(model);
-      box.append(row);
-    });
-    if (data.can_switch) {
-      box.append(el("div", "muted-note",
-        "Switching restarts the server and reloads the weights - about a "
-        + "minute. Open conversations are kept."));
+      data.models.forEach((model) => {
+        const row = el("button", `model-row${model.current ? " current" : ""}`);
+        const who = el("div", "who");
+        who.append(el("div", "name", model.name));
+        const bits = [];
+        if (model.bpw) bits.push(`${model.bpw} bpw`);
+        if (model.quality) bits.push(model.quality);
+        if (model.size_gb) bits.push(`${model.size_gb} GB`);
+        if (model.context) bits.push(`${Math.round(model.context / 1024)}k context`);
+        who.append(el("div", "meta", model.fits === false
+          ? model.why : bits.join("  \u00b7  ")));
+        row.append(who);
+        if (model.current) row.append(el("span", "badge", "loaded"));
+        else if (model.fits === false) {
+          row.append(el("span", "badge no",
+                        model.complete === false ? "incomplete" : "too big"));
+        }
+        row.disabled = model.current || !data.can_switch || model.fits === false;
+        row.onclick = () => switchModel(model);
+        here.append(row);
+      });
+      // Inside the section, not after it: an explanation of rows you have
+      // folded away is just a loose sentence under a heading.
+      if (data.can_switch) {
+        here.append(el("div", "muted-note",
+          "Switching restarts the server and reloads the weights - about a "
+          + "minute. Open conversations are kept."));
+      }
     }
 
     if (data.remote?.length) {
-      box.append(el("div", "group-label", "Providers"));
+      const away = pickerSection(box, "Providers", data.remote.length,
+                                 !onLocal || !data.models.length);
       data.remote.forEach((entry) => {
         const row = el("button", `model-row${
           state.provider === entry.provider && state.model === entry.model
             ? " current" : ""}`);
         const who = el("div", "who");
         who.append(el("div", "name", entry.model),
-                   el("div", "meta", `${entry.provider_name}  ·  ${entry.base_url}`));
+                   el("div", "meta",
+                      `${entry.provider_name}  \u00b7  ${entry.base_url}`));
         row.append(who);
         if (state.provider === entry.provider && state.model === entry.model) {
           row.append(el("span", "badge", "in use"));
@@ -1859,9 +2882,9 @@ async function modelModal() {
           closeModal();
           toast(`This chat now uses ${entry.model}`);
         };
-        box.append(row);
+        away.append(row);
       });
-      box.append(el("div", "muted-note",
+      away.append(el("div", "muted-note",
         "A provider answers instantly - nothing is loaded into VRAM. Tools "
         + "still run on this computer, and approvals still apply."));
     }
@@ -2000,6 +3023,36 @@ function providerForm(provider) {
     });
     visField.append(visHead, visRow);
     box.append(visField);
+
+    // Reasoning levels. Same shape as Images above and for the same reason:
+    // an endpoint can accept a level perfectly well and never advertise it.
+    const effField = el("label", "field");
+    const effHead = el("div", "head");
+    const seen = provider?.efforts_detected || [];
+    effHead.append(el("b", null, "Reasoning levels"),
+                   el("small", null, seen.length
+                     ? `the endpoint reports: ${seen.join(", ")}`
+                     : "the endpoint did not say - press Test, or set them here"));
+    const effRow = el("div", "textsize-row");
+    values.efforts = [...(provider?.efforts || [])];
+    ["minimal", "low", "medium", "high", "xhigh", "max"].forEach((level) => {
+      const btn = el("button",
+        `btn small${values.efforts.includes(level) ? " primary" : ""}`,
+        EFFORT_LABELS[level] || level);
+      btn.type = "button";
+      btn.onclick = () => {
+        const at = values.efforts.indexOf(level);
+        if (at >= 0) values.efforts.splice(at, 1); else values.efforts.push(level);
+        btn.classList.toggle("primary", values.efforts.includes(level));
+      };
+      effRow.append(btn);
+    });
+    effField.append(effHead, effRow);
+    effField.append(el("small", "field-note",
+      "Whichever you turn on here are offered in the Thinking menu for this "
+      + "provider, and sent as reasoning_effort. Leave them all off to use "
+      + "whatever Test discovered."));
+    box.append(effField);
 
     const modelWrap = el("label", "field");
     const modelHead = el("div", "head");
@@ -2200,10 +3253,12 @@ function paneAppearance(pane) {
     "How the app looks on this device. Kept in this browser and never sent to "
     + "the model.");
 
-  pane.append(fieldChoices("Theme", "the topbar button flips light and dark",
-    [["", "System"], ["light", "Light"], ["dark", "Dark"]], currentTheme(),
-    (v) => setTheme(v),
-    "System follows whatever this computer is set to, and changes with it."));
+  pane.append(fieldChoices("Theme", "the topbar button cycles the three",
+    [["", "System"], ["light", "Light"], ["dark", "Dark"], ["oled", "OLED"]],
+    currentTheme(), (v) => setTheme(v),
+    "System follows whatever this computer is set to, and changes with it. "
+    + "OLED is black rather than dark grey: on an OLED screen those pixels "
+    + "are switched off rather than lit dark."));
 
   pane.append(fieldChoices("Font size", null,
     [["0.9", "Small"], ["1", "Default"], ["1.15", "Large"], ["1.3", "Extra large"]],
@@ -2274,20 +3329,20 @@ function paneModels(pane) {
   // says so rather than implying a hard budget. Built from what this endpoint
   // actually accepts, not from a fixed menu.
   const levels = availableEfforts();
-  pane.append(fieldChoices("Thinking",
-    "or type /effort in the chat",
+  pane.append(fieldChoices("Default thinking for new chats",
+    "each conversation can differ - use the chip by the message box",
     [["default", "Model default"], ["off", "Off"],
      ...levels.map((l) => [l, EFFORT_LABELS[l] || l])],
     state.settings.thinking || "default",
     (v) => {
-      if (v === "default") delete state.settings.thinking;
-      else state.settings.thinking = v;
-      saveSettings();
+      setDefaultEffort(v);
     },
     levels.length
       ? "Off is exact - the chat template leaves the model nowhere to reason. "
         + "Anything else is guidance, not a budget: a level is a request the "
-        + "model can decline, and thinking cannot be cut short once it starts."
+        + "model can decline, thinking cannot be cut short once it starts, and "
+        + "the levels do not reliably order - on some templates the middle one "
+        + "steers nothing at all."
       : "This endpoint did not report which effort levels it takes, so only "
         + "Off and Model default are offered. Press Test on the provider to "
         + "ask again."));
@@ -2304,8 +3359,18 @@ function paneGeneration(pane) {
     "Considers only the likeliest words that add up to this much probability."));
   pane.append(fieldSlider("top_k", "Top-k", 0, 100, 1,
     "A hard cap on how many candidates are in play. 0 turns it off."));
-  pane.append(fieldSlider("max_tokens", "Max new tokens", 256, 16384, 256,
-    "The ceiling for one reply. It stops there whether or not it was finished."));
+  // The slider should not offer a ceiling the endpoint cannot reach: half the
+  // window leaves room for the conversation that prompted the answer, which is
+  // the same rule the server picks its default by.
+  const room = activeContextLength();
+  const ceiling = Math.max(8192, Math.min(131072,
+    room ? Math.floor(room / 2) : 65536));
+  pane.append(fieldSlider("max_tokens", "Max new tokens", 256, ceiling, 256,
+    "The ceiling for one reply. It stops there whether or not it was finished - "
+    + "and a tool call cut off mid-argument cannot be run at all, so keep this "
+    + "high if you ask the agent to write whole files."
+    + (room ? ` This endpoint's window is ${Math.round(room / 1024)}k tokens.`
+            : "")));
 
   pane.append(el("hr", "set-sep"));
 
@@ -2376,6 +3441,64 @@ function paneAgent(pane) {
       `A single agent turn takes at most ${state.config.max_steps} steps before `
       + "it hands back to you."));
   }
+}
+
+function panePermissions(pane) {
+  paneHead(pane, "Permissions",
+    "What the agent may do without stopping to ask. Reading is always allowed; "
+    + "this is about writing files and running commands.");
+
+  const now = state.settings.permissions || "ask";
+  pane.append(fieldChoices("Approvals", "applies to Agent mode",
+    PERMISSIONS.map((p) => [p.value, p.label]), now,
+    (v) => {
+      setPermissions(v);
+      // the consequences below change with the choice
+      const at = pane.querySelector(".perm-note");
+      if (at) at.textContent = PERMISSIONS.find((p) => p.value === v).hint;
+      pane.querySelector(".perm-warn").hidden = v !== "all";
+    }));
+  pane.append(el("small", "field-note perm-note",
+                 PERMISSIONS.find((p) => p.value === now).hint));
+
+  const warn = el("div", "err-box perm-warn");
+  warn.hidden = now !== "all";
+  warn.textContent = "With this on, the agent runs commands on this computer "
+    + "with no prompt. It is still confined to the workspace folder, but "
+    + "anything it can do there, it will do without telling you first.";
+  warn.style.margin = "14px 0 0";
+  pane.append(warn);
+
+  pane.append(el("hr", "set-sep"));
+
+  // what is actually being handed over
+  const tools = (state.config?.tools?.agent || []);
+  const risky = tools.filter((t) => t.risk === "write" || t.risk === "exec");
+  if (risky.length) {
+    const list = el("div", "field");
+    const head = el("div", "head");
+    head.append(el("b", null, "Tools this covers"),
+                el("small", null, `${risky.length} of ${tools.length}`));
+    list.append(head);
+    const ul = el("ul", "set-info");
+    risky.forEach((t) => {
+      const li = el("li");
+      li.append(el("span", null, t.name),
+                el("b", `risk-${t.risk}`, t.risk));
+      ul.append(li);
+    });
+    list.append(ul);
+    list.append(el("small", "field-note",
+      "Auto-accept file edits covers the write tools only. Accept everything "
+      + "covers both, exec included."));
+    pane.append(list);
+  }
+
+  pane.append(el("small", "field-note",
+    "Approving a single call with \u201cAlways allow\u201d is separate and lasts "
+    + "only for that conversation; this setting is remembered in this browser "
+    + "and read fresh on every turn, so turning it back down takes effect at "
+    + "once."));
 }
 
 function paneNotifications(pane) {
@@ -2467,6 +3590,7 @@ const SETTINGS_PANES = [
   { id: "models", label: "Models", icon: "cpu", build: paneModels },
   { id: "generation", label: "Generation", icon: "sliders", build: paneGeneration },
   { id: "agent", label: "Agent", icon: "bolt", build: paneAgent },
+  { id: "permissions", label: "Permissions", icon: "shield", build: panePermissions },
   { id: "notifications", label: "Notifications", icon: "bell", build: paneNotifications },
   { id: "advanced", label: "Advanced", icon: "terminal", build: paneAdvanced },
 ];
@@ -2536,6 +3660,45 @@ function settingsModal(startAt) {
   }, { wide: true });
 }
 
+/* 4096 was the server's old ceiling for one reply, and it is too low for a
+   tool call that carries a file: the arguments are cut off mid-JSON and the
+   call cannot be run at all. Anyone still sitting on exactly that number
+   inherited it rather than chose it, so take the new default once - and record
+   that we did, so a deliberate 4096 is never overwritten twice. */
+/* Ceilings people never chose.
+
+   Max new tokens is a ceiling on one reply, and every time the shipped ceiling
+   has turned out to be too low, the people carrying the old one were the ones
+   who never touched the setting: it was saved once from a default and then
+   quietly decided how much work could fit in a reply - long enough to write
+   half a file and lose the whole tool call. The old migration ran once, under
+   a flag, and recognised one specific number, so a browser that had already
+   seen it could never be lifted again.
+
+   A saved value that is exactly one of the defaults this kit has shipped was
+   inherited rather than chosen, so it moves when the default moves. Anything
+   else is the person's own number and is left alone. The key carries the
+   default it last applied, so a later change can lift it again. */
+const INHERITED_MAX_TOKENS = [4096, 16384];
+
+function migrateSettings() {
+  const fresh = Number(state.config?.defaults?.max_tokens) || 0;
+  const mine = Number(state.settings.max_tokens) || 0;
+  if (!fresh || !mine || mine >= fresh) return;
+  if (!INHERITED_MAX_TOKENS.includes(mine)) return;   // chosen: leave it alone
+  try {
+    if (Number(localStorage.getItem("chatui.maxTokensDefault")) === fresh) return;
+    localStorage.setItem("chatui.maxTokensDefault", String(fresh));
+  } catch (e) { return; }        // no storage: nothing was saved to migrate
+  state.settings.max_tokens = fresh;
+  saveSettings();
+  // Changing someone's saved setting silently is worse than the setting.
+  toast(`Max new tokens raised from ${mine.toLocaleString()} to `
+        + `${fresh.toLocaleString()} - the old ceiling could cut a file off `
+        + "mid-write. Settings \u203a Generation");
+}
+
+
 function saveSettings() {
   try { localStorage.setItem("chatui.settings", JSON.stringify(state.settings)); }
   catch (e) { /* private mode: settings just do not persist */ }
@@ -2578,12 +3741,18 @@ function currentTheme() {
   catch (e) { return ""; }
 }
 
+/* The button cycles the three explicit themes rather than flipping two, so
+   OLED is reachable without opening Settings. Following the system is still a
+   real choice, but it is one you make once - it stays in Settings. */
+const THEME_CYCLE = ["light", "dark", "oled"];
+
 function toggleTheme() {
   const root = document.documentElement;
-  const dark = root.dataset.theme
-    ? root.dataset.theme === "dark"
-    : matchMedia("(prefers-color-scheme: dark)").matches;
-  setTheme(dark ? "light" : "dark");
+  const now = root.dataset.theme
+    || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  const at = THEME_CYCLE.indexOf(now);
+  setTheme(THEME_CYCLE[(at + 1) % THEME_CYCLE.length]);
+  toast(`${{ light: "Light", dark: "Dark", oled: "OLED" }[currentTheme()]} theme`);
 }
 
 /* A display preference, not a generation parameter - kept out of
@@ -2867,11 +4036,14 @@ async function boot() {
     ? `${Math.round(state.config.context_length / 1024)}k tokens` : "-";
   // server defaults first, then anything this browser has chosen before
   state.settings = { system: "", ...state.config.defaults, ...savedSettings() };
+  migrateSettings();
   setWorkspace(state.config.default_workspace);
   if (compact()) $("#input").placeholder = "Ask anything";
   newChat();
   setMode("chat");
   refreshAttachButton();
+  refreshEffort();
+  refreshPermissions();
   // a turn that was running when the window closed is still running now
   try {
     const { live } = await api("/ui/sessions");
@@ -2903,6 +4075,8 @@ $("#ws-change").onclick = pickWorkspace;
 // wrapped: the click event must not land in settingsModal's startAt argument
 $("#settings-btn").onclick = () => settingsModal();
 $("#stat-model").onclick = modelModal;
+$("#stat-effort").onclick = effortMenu;
+$("#stat-perm").onclick = permissionsMenu;
 let filterTimer = null;
 $("#session-filter").addEventListener("input", () => {
   clearTimeout(filterTimer);
@@ -2922,12 +4096,23 @@ $("#thread").addEventListener("scroll", () => {
 });
 
 $("#input").addEventListener("keydown", (e) => {
+  if (slashState) {
+    if (e.key === "ArrowDown") { e.preventDefault(); moveSlash(1); return; }
+    if (e.key === "ArrowUp") { e.preventDefault(); moveSlash(-1); return; }
+    if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+      e.preventDefault(); takeSlash(); return;
+    }
+    if (e.key === "Escape") { e.preventDefault(); closeSlash(); return; }
+  }
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
 $("#input").addEventListener("input", (e) => {
   e.target.style.height = "auto";
   e.target.style.height = `${Math.min(e.target.scrollHeight, 230)}px`;
+  renderSlash();
 });
+$("#input").addEventListener("blur", () => setTimeout(closeSlash, 120));
+$("#input").addEventListener("focus", renderSlash);
 document.addEventListener("click", (e) => {
   if (!e.target.closest("#menu-pop")) closeMenu();
 });

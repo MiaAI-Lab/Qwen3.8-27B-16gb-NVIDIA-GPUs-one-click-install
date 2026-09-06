@@ -18,6 +18,18 @@
      with one number. 1 is the app's own (already slightly reduced) default. */
   --text-scale: 1;
 
+  /* A wide, shallow ramp across a dark screen is where 8-bit colour
+     runs out of steps, and the eye reads the steps as stripes. This is
+     the fix every film grade uses: a fine grey noise tile, blended
+     with overlay so it dithers the ramp without lifting anything -
+     overlay leaves pure black at pure black, which the OLED theme
+     depends on. */
+  --bg-noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' opacity='0.26'/%3E%3C/svg%3E");
+  /* One entry per background layer, and the list has to be exactly as long:
+     a short list repeats, which quietly put `overlay` on the base colour -
+     and on a theme with a third gradient, on the gradient too. */
+  --bg-blend: overlay, normal, normal, normal;
+
   /* shape and motion -------------------------------------------------- */
   --r-sm: 8px;
   --r-md: 12px;
@@ -31,8 +43,19 @@
   /* dark palette (default) -------------------------------------------- */
   color-scheme: dark;
   --bg: #0b0d12;
-  --bg-grad: radial-gradient(1200px 620px at 78% -12%, #1b2340 0%, transparent 62%),
-             radial-gradient(900px 520px at 8% 4%, #16203a 0%, transparent 55%);
+  /* Fading to `transparent` fades to transparent BLACK, so the ramp loses
+     saturation on the way out and leaves a dirty edge where it lands. Every
+     stop below ends on the same colour at zero alpha, and the middle stops
+     ease the falloff instead of letting one linear ramp cross 600px - which
+     on an 8-bit screen is what the banding was. */
+  --bg-grad: radial-gradient(1250px 660px at 78% -12%,
+               rgba(31, 40, 74, 1) 0%, rgba(27, 35, 64, .72) 26%,
+               rgba(22, 29, 53, .38) 48%, rgba(18, 23, 42, .14) 68%,
+               rgba(15, 19, 34, 0) 84%),
+             radial-gradient(980px 560px at 8% 4%,
+               rgba(22, 32, 58, 1) 0%, rgba(20, 28, 52, .66) 28%,
+               rgba(17, 23, 43, .3) 52%, rgba(14, 18, 33, .1) 72%,
+               rgba(12, 15, 27, 0) 88%);
   --panel: #10131b;
   --panel-2: #151926;
   --raise: #1a1f2e;
@@ -56,23 +79,41 @@
      of --panel-2. A section heading, a row under the pointer and the row you
      have open all have to be told apart at a glance, and mixing 6% of the
      accent into the panel is not a glance - it is a squint. */
+  /* The window chrome - sidebar and topbar. Derived from --panel until now,
+     which in the light theme made both of them white: the sidebar became the
+     largest white slab on screen while the conversation it framed was white
+     too, and nothing had a shape. It is its own step on the ladder now. */
+  --chrome: #10131b;
   --band: #1c2334;      /* section heading: neutral, so it cannot be mistaken
                            for a selected row */
   --row-hover: #1f2739;
   --row-on: #2a3360;    /* the conversation on screen: unmistakably the accent */
 }
 
+/* Only when nothing has been chosen. This used to say :not([data-theme="dark"]),
+   which was the same thing while there were two themes and stopped being it the
+   moment there was a third: on a light-OS machine the light palette matched the
+   OLED theme too, and the two fought over every token. */
 @media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) {
+  :root:not([data-theme]) {
     color-scheme: light;
-    --bg: #f4f6fb;
-    --bg-grad: radial-gradient(1100px 560px at 82% -14%, #e3e9ff 0%, transparent 60%),
-               radial-gradient(800px 460px at 4% 2%, #eaf0ff 0%, transparent 52%);
+    --bg: #e8ebf3;
+    /* Same reason as the dark theme: fading to `transparent` fades to
+       transparent black, which on a pale ground dirties the ramp rather
+       than letting it end. */
+    --bg-grad: radial-gradient(1150px 600px at 82% -14%,
+                 rgba(238, 241, 251, 1) 0%, rgba(238, 241, 251, .7) 28%,
+                 rgba(238, 241, 251, .34) 52%, rgba(238, 241, 251, .1) 72%,
+                 rgba(238, 241, 251, 0) 88%),
+               radial-gradient(860px 500px at 4% 2%,
+                 rgba(240, 243, 252, 1) 0%, rgba(240, 243, 252, .64) 30%,
+                 rgba(240, 243, 252, .28) 54%, rgba(240, 243, 252, 0) 80%);
     --panel: #ffffff;
-    --panel-2: #f7f8fc;
+    --panel-2: #eef1f7;
+    --chrome: #dbe0ec;   /* sidebar and topbar: recessed, not white */
     --raise: #ffffff;
-    --line: #a3adc9;
-    --line-soft: #edf0f7;
+    --line: #c2cadb;
+    --line-soft: #d8dfeb;
     --text: #12151d;
     --text-2: #414a5e;
     --muted: #5d6577;   /* AA on the light surfaces */
@@ -85,22 +126,28 @@
     --shadow-1: 0 1px 2px rgba(16, 24, 40, .06);
     --shadow-2: 0 12px 28px -14px rgba(16, 24, 40, .22);
     --shadow-3: 0 26px 60px -24px rgba(16, 24, 40, .3);
-    --band: #e4e8f0;
-    --row-hover: #eceff6;
-    --row-on: #d7deff;
+    --band: #ccd3e2;
+    --row-hover: #e9edf6;
+    --row-on: #d3dcff;
   }
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #f4f6fb;
-  --bg-grad: radial-gradient(1100px 560px at 82% -14%, #e3e9ff 0%, transparent 60%),
-             radial-gradient(800px 460px at 4% 2%, #eaf0ff 0%, transparent 52%);
+  --bg: #e8ebf3;
+  --bg-grad: radial-gradient(1150px 600px at 82% -14%,
+               rgba(238, 241, 251, 1) 0%, rgba(238, 241, 251, .7) 28%,
+               rgba(238, 241, 251, .34) 52%, rgba(238, 241, 251, .1) 72%,
+               rgba(238, 241, 251, 0) 88%),
+             radial-gradient(860px 500px at 4% 2%,
+               rgba(240, 243, 252, 1) 0%, rgba(240, 243, 252, .64) 30%,
+               rgba(240, 243, 252, .28) 54%, rgba(240, 243, 252, 0) 80%);
   --panel: #ffffff;
-  --panel-2: #f7f8fc;
+  --panel-2: #eef1f7;
+  --chrome: #dbe0ec;   /* sidebar and topbar: recessed, not white */
   --raise: #ffffff;
-  --line: #a3adc9;
-  --line-soft: #edf0f7;
+  --line: #c2cadb;
+  --line-soft: #d8dfeb;
   --text: #12151d;
   --text-2: #414a5e;
   --muted: #5d6577;   /* AA on the light surfaces */
@@ -113,9 +160,55 @@
   --shadow-1: 0 1px 2px rgba(16, 24, 40, .06);
   --shadow-2: 0 12px 28px -14px rgba(16, 24, 40, .22);
   --shadow-3: 0 26px 60px -24px rgba(16, 24, 40, .3);
-  --band: #e4e8f0;
-  --row-hover: #eceff6;
-  --row-on: #d7deff;
+  --band: #ccd3e2;
+  --row-hover: #e9edf6;
+  --row-on: #d3dcff;
+}
+
+/* OLED: black that is actually black.
+
+   On an OLED panel a #0b0d12 background is 2.5 million lit pixels; #000 is
+   2.5 million pixels switched off, which is why the theme exists. So the
+   surfaces are near-black rather than dark grey, and the gradient is a
+   suggestion of colour rather than a wash - it has to arrive from black and
+   return to black without ever lifting the corners of the screen off it.
+   Borders carry the structure the fills used to. */
+:root[data-theme="oled"] {
+  color-scheme: dark;
+  --bg: #000000;
+  --bg-grad: radial-gradient(1250px 700px at 78% -14%,
+               rgba(26, 33, 62, .58) 0%, rgba(20, 26, 50, .34) 24%,
+               rgba(14, 18, 35, .16) 46%, rgba(8, 10, 20, .05) 68%,
+               rgba(0, 0, 0, 0) 86%),
+             radial-gradient(900px 540px at 6% 2%,
+               rgba(19, 28, 52, .5) 0%, rgba(14, 21, 40, .28) 26%,
+               rgba(9, 13, 26, .11) 50%, rgba(0, 0, 0, 0) 78%),
+             radial-gradient(1100px 620px at 50% 118%,
+               rgba(12, 22, 40, .34) 0%, rgba(0, 0, 0, 0) 72%);
+  --bg-blend: overlay, normal, normal, normal, normal;   /* one more gradient */
+  --panel: #060609;
+  --panel-2: #0b0c12;
+  --chrome: #030305;
+  --raise: #111320;
+  --line: #1e2130;
+  --line-soft: #14161f;
+  --text: #edf0f7;
+  --text-2: #b0b8ca;
+  --muted: #79819a;
+  --accent: #8b98ff;
+  --accent-2: #b39cff;
+  --accent-ink: #05050a;
+  --accent-soft: #141a3a;
+  --ok: #3fd6a8;
+  --warn: #f0b429;
+  --danger: #ff6b7d;
+  /* Shadows do nothing against black; the depth has to come from the edges. */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, .9);
+  --shadow-2: 0 10px 30px -12px rgba(0, 0, 0, 1);
+  --shadow-3: 0 24px 60px -20px rgba(0, 0, 0, 1);
+  --band: #0f1220;
+  --row-hover: #14172a;
+  --row-on: #232c58;
 }
 
 /* ------------------------------------------------------------- basics -- */
@@ -126,7 +219,8 @@
 html, body { height: 100%; }
 body {
   margin: 0;
-  background: var(--bg-grad), var(--bg);
+  background: var(--bg-noise), var(--bg-grad), var(--bg);
+  background-blend-mode: var(--bg-blend);
   background-attachment: fixed;
   color: var(--text);
   font: calc(14px * var(--text-scale))/1.6 var(--sans);
@@ -219,13 +313,15 @@ textarea:focus, input:focus, textarea:focus-visible, input:focus-visible {
    half once the pin marker and the menu button have taken their share - is the
    default and what double-clicking the handle goes back to. The clamp is not
    decoration: below ~200px the rows stop being readable, and past ~520px the
-   thread is the thing being squeezed. */
-:root { --side-w: 292px; --side-w-min: 200px; --side-w-max: 520px; }
+   thread is the thing being squeezed. The clamp itself is SIDE_W in app.js -
+   the drag handler needs it in pixels - so it is deliberately not duplicated
+   here as custom properties nothing would read. */
+:root { --side-w: 292px; }
 
 #sidebar {
   position: relative;
   width: var(--side-w); flex: 0 0 var(--side-w); display: flex; flex-direction: column;
-  background: color-mix(in srgb, var(--panel) 82%, transparent);
+  background: color-mix(in srgb, var(--chrome) 82%, transparent);
   backdrop-filter: blur(14px);
   border-right: 1px solid var(--line-soft);
   z-index: 6;
@@ -423,6 +519,28 @@ body.resizing * { cursor: col-resize !important; }
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 .session.live .t { color: var(--text); }
+/* A chat still working, seen from the sidebar: two lights chase round its
+   edge. A pulsing dot says "something", an edge in motion says "this one, and
+   it has not finished". It is one rotating conic gradient, masked down to the
+   border - so it costs a transform per frame and nothing else, and it is the
+   row's own outline rather than a box drawn near it. */
+.session .edge {
+  position: absolute; inset: 0; z-index: 2; padding: 1px;
+  border-radius: inherit; overflow: hidden; pointer-events: none;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor; mask-composite: exclude;
+}
+.session .edge::before {
+  content: ""; position: absolute; left: 50%; top: 50%;
+  width: 260%; aspect-ratio: 1; transform: translate(-50%, -50%);
+  background: conic-gradient(from 0deg,
+    transparent 0 46%,
+    color-mix(in srgb, #fff 82%, var(--accent)) 52%, transparent 58%,
+    transparent 90%,
+    color-mix(in srgb, #fff 55%, var(--accent)) 96%, transparent 100%);
+  animation: edge-run 2.6s linear infinite;
+}
 .session .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
               font-size: calc(12.5px * var(--text-scale));
               /* the body's 1.6 is set for paragraphs; a single-line row only
@@ -483,6 +601,12 @@ body.resizing * { cursor: col-resize !important; }
 .menu .ico { width: 15px; height: 15px; color: var(--muted); }
 .menu button:hover .ico { color: inherit; }
 .menu hr { border: none; border-top: 1px solid var(--line-soft); margin: 4px 2px; }
+/* A line in a menu that is not a choice - it explains why the choices above
+   are so few. */
+.menu-note {
+  padding: 6px 11px 8px; max-width: 260px; color: var(--muted);
+  font-size: calc(11px * var(--text-scale)); line-height: 1.5;
+}
 
 .side-foot { border-top: 1px solid var(--line-soft); padding: 10px 14px 12px;
              display: flex; flex-direction: column; gap: 5px; }
@@ -505,6 +629,49 @@ body.resizing * { cursor: col-resize !important; }
   color: var(--muted); margin: 16px 0 8px;
 }
 .group-label:first-child { margin-top: 0; }
+
+/* A foldable section of the model picker. The sidebar's .group-head is a
+   sticky full-bleed band cancelling that list's padding; this one lives in a
+   modal that scrolls as one piece, so it is the same idea at modal scale -
+   a real heading you can press, not small grey caps floating on the rows. */
+.pick-group + .pick-group { margin-top: 14px; }
+.pick-head {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  padding: 9px 12px; margin-bottom: 10px;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--panel-2); color: var(--text);
+  font-size: calc(11px * var(--text-scale)); font-weight: 700;
+  letter-spacing: .09em; text-transform: uppercase;
+  transition: color var(--fast), background var(--fast),
+              border-color var(--fast);
+}
+.pick-head:hover { background: color-mix(in srgb, var(--accent) 10%, var(--panel-2));
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+.pick-head:focus-visible { outline: none; box-shadow: var(--ring); }
+.pick-head .chev { width: 14px; height: 14px; color: var(--text-2);
+  transition: transform var(--med), color var(--fast); }
+.pick-head:hover .chev { color: var(--accent); }
+.pick-group.closed .pick-head { margin-bottom: 0; }
+.pick-group.closed .pick-head .chev { transform: rotate(-90deg); }
+.pick-head .t { flex: 1 1 auto; min-width: 0; }
+.pick-head .count {
+  flex: none; font-weight: 600; letter-spacing: 0;
+  font-size: calc(10px * var(--text-scale)); color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--panel);
+}
+.pick-head:hover .count { color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+/* 1fr -> 0fr is the only way to animate to a height nobody has measured */
+.pick-rows { display: grid; grid-template-rows: 1fr;
+  transition: grid-template-rows var(--med); }
+.pick-inner { overflow: hidden; min-height: 0; }
+.pick-group.closed .pick-rows { grid-template-rows: 0fr; }
+/* belt and braces for a browser without inert: clipped is not clickable */
+.pick-group.closed .pick-inner { pointer-events: none; }
+/* the last row's own margin is the gap to whatever follows the section */
+.pick-inner > :last-child { margin-bottom: 0; }
 .model-row .act { flex: none; }
 .model-row .badge { white-space: nowrap; }
 
@@ -549,7 +716,7 @@ body.resizing * { cursor: col-resize !important; }
 #topbar {
   display: flex; align-items: center; gap: 10px; padding: 11px 18px;
   border-bottom: 1px solid var(--line-soft);
-  background: color-mix(in srgb, var(--panel) 68%, transparent);
+  background: color-mix(in srgb, var(--chrome) 68%, transparent);
   backdrop-filter: blur(14px); z-index: 3;
 }
 .spacer { flex: 1; }
@@ -611,15 +778,22 @@ body.resizing * { cursor: col-resize !important; }
   color: var(--muted); font-size: calc(10.5px * var(--text-scale)); font-variant-numeric: tabular-nums; }
 
 #theme-btn .theme-moon { display: none; }
-:root[data-theme="dark"] #theme-btn .theme-sun,
-:root:not([data-theme="light"]) #theme-btn .theme-sun { display: none; }
-:root[data-theme="dark"] #theme-btn .theme-moon,
-:root:not([data-theme="light"]) #theme-btn .theme-moon { display: block; }
+/* An explicit choice wins, whatever the OS is set to. */
 :root[data-theme="light"] #theme-btn .theme-sun { display: block; }
 :root[data-theme="light"] #theme-btn .theme-moon { display: none; }
+:root[data-theme="dark"] #theme-btn .theme-sun,
+:root[data-theme="oled"] #theme-btn .theme-sun { display: none; }
+:root[data-theme="dark"] #theme-btn .theme-moon,
+:root[data-theme="oled"] #theme-btn .theme-moon { display: block; }
+/* OLED is a dark theme, so it wears the moon - dimmed, because the point of it
+   is that the screen is off where it can be. */
+:root[data-theme="oled"] #theme-btn .theme-moon { opacity: .72; }
+/* ...and with nothing chosen, follow the OS. */
+:root:not([data-theme]) #theme-btn .theme-sun { display: none; }
+:root:not([data-theme]) #theme-btn .theme-moon { display: block; }
 @media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) #theme-btn .theme-sun { display: block; }
-  :root:not([data-theme="dark"]) #theme-btn .theme-moon { display: none; }
+  :root:not([data-theme]) #theme-btn .theme-sun { display: block; }
+  :root:not([data-theme]) #theme-btn .theme-moon { display: none; }
 }
 
 /* --------------------------------------------------------------- plan --- */
@@ -804,10 +978,32 @@ body.resizing * { cursor: col-resize !important; }
 .think > summary .chev { transition: transform var(--med); }
 .think[open] > summary .chev { transform: rotate(180deg); }
 .think.live > summary { color: var(--accent); }
+/* Thinking, while it is happening: a light runs down the rail the block hangs
+   from, and a brighter, tighter sweep crosses the words - a flat 90deg wipe of
+   one accent read as a loading bar, which is the wrong idea. The rail is the
+   part that carries it: it is the full height of the block, so the movement is
+   visible even with the block folded shut. */
+.think { position: relative; }
+.think.live { border-left-color: transparent; }
+.think.live::before {
+  content: ""; position: absolute; left: -2px; top: 0; bottom: 0; width: 2px;
+  border-radius: 2px; pointer-events: none;
+  background: linear-gradient(180deg,
+    var(--line) 0%, var(--line) 34%,
+    color-mix(in srgb, var(--accent) 70%, var(--line)) 43%,
+    var(--accent) 48%, color-mix(in srgb, #fff 65%, var(--accent)) 50%,
+    var(--accent) 52%, color-mix(in srgb, var(--accent) 70%, var(--line)) 57%,
+    var(--line) 66%, var(--line) 100%);
+  background-size: 100% 260%;
+  animation: rail-run 2.4s var(--ease) infinite;
+}
 .think.live > summary .label {
-  background: linear-gradient(90deg, var(--muted) 20%, var(--accent) 50%, var(--muted) 80%);
-  background-size: 220% 100%; -webkit-background-clip: text; background-clip: text;
-  color: transparent; animation: shimmer 1.9s linear infinite;
+  background: linear-gradient(100deg,
+    var(--muted) 0%, var(--muted) 36%,
+    var(--accent) 45%, color-mix(in srgb, #fff 70%, var(--accent)) 50%,
+    var(--accent) 55%, var(--muted) 64%, var(--muted) 100%);
+  background-size: 260% 100%; -webkit-background-clip: text; background-clip: text;
+  color: transparent; animation: shimmer 2.4s var(--ease) infinite;
 }
 .think .think-body {
   padding: 6px 12px 4px; color: var(--muted);
@@ -839,46 +1035,236 @@ body.resizing * { cursor: col-resize !important; }
 .think[open] .think-body { animation: reveal var(--med) both; }
 
 /* tool cards -------------------------------------------------------- */
+/* A tool call reads as a sentence - what it did, and to what. The name of the
+   function and a JSON dump of its arguments is a database row; this is the
+   line a person can skim, with everything else folded behind it. */
 .tool {
   margin: 12px 0; border: 1px solid var(--line); border-radius: var(--r-md);
   background: var(--panel); overflow: hidden; box-shadow: var(--shadow-1);
   animation: rise var(--med) both;
 }
 .tool > summary {
-  display: flex; align-items: center; gap: 10px; padding: 10px 13px; list-style: none;
-  font-size: calc(12.5px * var(--text-scale)); transition: background var(--fast);
+  display: flex; align-items: center; gap: 9px; padding: 10px 13px;
+  list-style: none; cursor: pointer;
+  font-size: calc(12.5px * var(--text-scale));
+  transition: background var(--fast);
 }
 .tool > summary:hover { background: var(--panel-2); }
 .tool > summary::-webkit-details-marker { display: none; }
-.tool .name { font-family: var(--mono); font-size: calc(11.5px * var(--text-scale)); color: var(--accent);
-  font-weight: 600; }
-.tool .arg { flex: 1; min-width: 0; color: var(--muted); font-size: calc(11.5px * var(--text-scale));
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool .tool-ico { width: 15px; height: 15px; flex: none; color: var(--text-2); }
+.tool .verb { flex: none; color: var(--text); font-weight: 600; }
+.tool .subject {
+  flex: 1 1 auto; min-width: 0; color: var(--text-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* a path, a command, a URL: things you read left to right, character by
+   character, and would rather not see kerned like prose */
+.tool[data-name="write_file"] .subject,
+.tool[data-name="edit_file"] .subject,
+.tool[data-name="read_file"] .subject,
+.tool[data-name="list_dir"] .subject,
+.tool[data-name="find_files"] .subject,
+.tool[data-name="web_fetch"] .subject { font-family: var(--mono);
+  font-size: calc(11.5px * var(--text-scale)); }
+.tool .meta {
+  flex: none; color: var(--muted); white-space: nowrap;
+  font-size: calc(11px * var(--text-scale)); font-variant-numeric: tabular-nums;
+}
+.tool .chev { width: 14px; height: 14px; flex: none; color: var(--muted);
+  transition: transform var(--med); }
+.tool[open] > summary .chev { transform: rotate(180deg); }
+/* A badge on every row is noise: a call that worked is the ordinary case and
+   says so by saying nothing. Only failure and work in progress get a mark. */
+.tool .state:empty { display: none; }
 .tool .state {
-  font-size: calc(10px * var(--text-scale)); font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+  flex: none;
+  font-size: calc(10px * var(--text-scale)); font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase;
   padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line);
   color: var(--muted); white-space: nowrap;
 }
-.tool .state.run { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+.tool .state.run { color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
   background: color-mix(in srgb, var(--warn) 12%, transparent); }
 .tool .state.run::before {
   content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
   background: currentColor; margin-right: 6px; vertical-align: 1px;
   animation: breathe 1.1s var(--ease) infinite;
 }
-.tool .state.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 38%, transparent);
-  background: color-mix(in srgb, var(--ok) 11%, transparent); }
-.tool .state.err { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+.tool .state.err { color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
   background: color-mix(in srgb, var(--danger) 11%, transparent); }
+.tool.pending { border-style: dashed;
+  border-color: color-mix(in srgb, var(--warn) 32%, var(--line)); }
+.tool.failed { border-color: color-mix(in srgb, var(--danger) 38%, var(--line)); }
 .tool .io { padding: 0 13px 13px; }
 .tool[open] .io { animation: reveal var(--med) both; }
-.tool .lbl { font-size: calc(10px * var(--text-scale)); text-transform: uppercase; letter-spacing: .07em;
-  color: var(--muted); font-weight: 600; margin: 10px 0 5px; }
+/* A caption, not a heading. RESULT in small caps over every block was the
+   card shouting section names at a person who only wanted to know what
+   happened. */
+.tool .lbl { font-size: calc(11px * var(--text-scale)); color: var(--muted);
+  font-weight: 500; margin: 11px 0 5px; }
 .tool pre {
   margin: 0; padding: 11px 13px; max-height: 320px; overflow: auto;
   white-space: pre-wrap; word-break: break-word; background: var(--panel-2);
-  border: 1px solid var(--line-soft); border-radius: var(--r-sm); font-size: calc(11.5px * var(--text-scale));
-  line-height: 1.55;
+  border: 1px solid var(--line-soft); border-radius: var(--r-sm);
+  font-size: calc(11.5px * var(--text-scale)); line-height: 1.55;
+}
+.tool pre + .lbl { margin-top: 12px; }
+/* The file as it is being written. Taller than a finished block, because
+   watching it is the whole point, and pinned to the tail. */
+.tool .tool-live { max-height: 44vh; scroll-behavior: auto;
+  border-color: color-mix(in srgb, var(--warn) 26%, var(--line-soft)); }
+.tool .tool-text.was { background: color-mix(in srgb, var(--danger) 7%, var(--panel-2));
+  border-color: color-mix(in srgb, var(--danger) 22%, var(--line-soft)); }
+.tool .tool-out { color: var(--text-2); }
+.tool.failed .tool-out { background: color-mix(in srgb, var(--danger) 8%, var(--panel-2));
+  border-color: color-mix(in srgb, var(--danger) 26%, var(--line-soft)); }
+/* the leftovers: named values, one per line, not a JSON object to decode */
+.tool-args { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px;
+  margin: 11px 0 0; font-size: calc(11.5px * var(--text-scale)); }
+.tool-args dt { color: var(--muted); white-space: nowrap; }
+.tool-args dd { margin: 0; color: var(--text-2); font-family: var(--mono);
+  overflow-wrap: anywhere; }
+.tool .plan-list.mini { padding: 4px 0 0; max-height: none; }
+/* the page the call just wrote, one click from the line that says it wrote it */
+.tool .open-page {
+  flex: none; display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 9px; border-radius: 999px; text-decoration: none;
+  border: .5px solid color-mix(in srgb, var(--accent) 45%, var(--line));
+  color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, transparent);
+  font-size: calc(10.5px * var(--text-scale)); letter-spacing: .04em;
+  transition: background var(--fast), border-color var(--fast);
+}
+.tool .open-page:hover { background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border-color: var(--accent); }
+.tool .open-page .ico { width: 12px; height: 12px; }
+
+
+/* the file is ready ------------------------------------------------- */
+/* The moment the thing you asked for exists. It gets the width of the reply
+   and a picture of itself, because a row of grey buttons is the wrong shape
+   for an answer - and the preview is the real page, so it is also the fastest
+   way to see that it came out right. */
+.page-ready {
+  position: relative; display: flex; align-items: center; gap: 15px;
+  margin: 14px 0 4px; padding: 13px 15px; border-radius: var(--r-lg);
+  text-decoration: none; color: inherit; overflow: hidden; isolation: isolate;
+  background:
+    linear-gradient(120deg,
+      color-mix(in srgb, var(--accent) 13%, var(--panel)) 0%,
+      var(--panel) 46%,
+      color-mix(in srgb, var(--accent-2) 10%, var(--panel)) 100%);
+  box-shadow: var(--shadow-2), 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
+  animation: ready-in .62s var(--ease) both, ready-sweep 1.5s var(--ease) .2s 1;
+  transition: transform var(--med), box-shadow var(--med);
+}
+.page-ready:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-3),
+              0 0 0 1px color-mix(in srgb, var(--accent) 52%, transparent),
+              0 14px 40px -18px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+.page-ready:active { transform: translateY(0); }
+.page-ready:focus-visible { outline: none;
+  box-shadow: var(--shadow-2), var(--ring); }
+
+/* A ring that turns: the same conic-masked-to-the-border trick the running
+   chat row uses, so "this is live" reads the same way everywhere. */
+.page-ready .ring {
+  position: absolute; inset: 0; z-index: 0; padding: 1px;
+  border-radius: inherit; overflow: hidden; pointer-events: none;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor; mask-composite: exclude;
+  opacity: .55; transition: opacity var(--med);
+}
+.page-ready:hover .ring { opacity: 1; }
+.page-ready .ring::before {
+  content: ""; position: absolute; left: 50%; top: 50%;
+  width: 180%; aspect-ratio: 1; transform: translate(-50%, -50%);
+  background: conic-gradient(from 0deg,
+    transparent 0 40%,
+    color-mix(in srgb, #fff 70%, var(--accent)) 50%, transparent 60%,
+    transparent 88%,
+    color-mix(in srgb, var(--accent-2) 80%, #fff) 96%, transparent 100%);
+  animation: edge-run 5.5s linear infinite;
+}
+
+/* the page itself, rendered small and inert */
+.page-ready .shot {
+  position: relative; z-index: 1; flex: none;
+  width: 132px; height: 86px; border-radius: var(--r-sm); overflow: hidden;
+  background: var(--panel-2);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .04);
+  transition: transform var(--med), border-color var(--med);
+}
+.page-ready:hover .shot { transform: scale(1.03);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+.page-ready .shot iframe {
+  width: 1200px; height: 782px; border: 0; pointer-events: none;
+  transform: scale(.11); transform-origin: 0 0;
+  animation: fade-in var(--slow) both;
+}
+
+.page-ready .meta { position: relative; z-index: 1;
+  display: grid; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.page-ready .eyebrow {
+  font-size: calc(10px * var(--text-scale)); font-weight: 700;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--accent);
+  display: flex; align-items: center; gap: 6px;
+}
+/* a dot that keeps its own time, so the card is never quite still */
+.page-ready .eyebrow::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 60%, transparent);
+  animation: ready-pulse 2.4s var(--ease) infinite;
+}
+.page-ready .name {
+  font-family: var(--mono); font-size: calc(14px * var(--text-scale));
+  font-weight: 600; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.page-ready .sub {
+  font-size: calc(11.5px * var(--text-scale)); color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.page-ready .go {
+  position: relative; z-index: 1; flex: none;
+  width: 38px; height: 38px; border-radius: 50%; display: grid;
+  place-items: center; color: var(--accent-ink);
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  box-shadow: 0 6px 18px -8px color-mix(in srgb, var(--accent) 80%, transparent);
+  transition: transform var(--med), box-shadow var(--med);
+}
+.page-ready .go .ico { width: 16px; height: 16px; }
+.page-ready:hover .go { transform: translateX(3px) scale(1.06);
+  box-shadow: 0 10px 26px -8px color-mix(in srgb, var(--accent) 90%, transparent); }
+
+/* the one-off light that crosses it as it arrives */
+.page-ready::after {
+  content: ""; position: absolute; inset: 0; z-index: 2; pointer-events: none;
+  background: linear-gradient(104deg, transparent 34%,
+    color-mix(in srgb, #fff 40%, transparent) 50%, transparent 66%);
+  transform: translateX(-130%);
+  animation: ready-shine 1.5s var(--ease) .2s 1;
+}
+@keyframes ready-in {
+  from { opacity: 0; transform: translateY(10px) scale(.985); }
+}
+@keyframes ready-sweep { from { filter: brightness(1.18); } }
+@keyframes ready-shine { to { transform: translateX(130%); } }
+@keyframes ready-pulse {
+  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+  70%  { box-shadow: 0 0 0 7px color-mix(in srgb, var(--accent) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .page-ready, .page-ready::after, .page-ready .ring::before,
+  .page-ready .eyebrow::before { animation: none; }
+  .page-ready::after { display: none; }
 }
 
 /* approvals --------------------------------------------------------- */
@@ -1096,6 +1482,35 @@ body.resizing * { cursor: col-resize !important; }
 .model-chip:focus-visible { outline: none; box-shadow: var(--ring); }
 .model-chip[disabled] { pointer-events: none; opacity: .55; }
 .model-chip .tag.remote { margin-left: 1px; }
+/* The two state chips beside the model. Quieter than it - they say what the
+   settings are, and only the model is something you change per question. */
+.model-chip.quiet { border-color: var(--line-soft); background: transparent;
+  color: var(--muted); padding-left: 8px; padding-right: 8px; }
+.model-chip.quiet:hover { background: var(--panel-2); color: var(--text-2); }
+.model-chip.quiet .ico { width: 13px; height: 13px; }
+.model-chip.quiet .chev { width: 12px; height: 12px; opacity: .8; }
+/* Standing permission is not a quiet setting: if the agent can write or run
+   without asking, that has to be visible from the composer, every turn. */
+.model-chip.warn {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  color: var(--warn); font-weight: 600;
+}
+.model-chip.warn .ico { color: var(--warn); width: 13px; height: 13px; }
+.model-chip.warn:hover {
+  background: color-mix(in srgb, var(--warn) 20%, transparent);
+  border-color: var(--warn); color: var(--warn);
+}
+.model-chip.warn.hot {
+  border-color: color-mix(in srgb, var(--danger) 50%, var(--line));
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+.model-chip.warn.hot .ico { color: var(--danger); }
+.model-chip.warn.hot:hover {
+  background: color-mix(in srgb, var(--danger) 20%, transparent);
+  border-color: var(--danger); color: var(--danger);
+}
 
 .hint {
   flex: 1; min-width: 120px; justify-content: flex-end; text-align: right;
@@ -1106,6 +1521,34 @@ body.resizing * { cursor: col-resize !important; }
   font-family: var(--mono); font-size: calc(10px * var(--text-scale)); padding: 1px 6px; border-radius: 5px;
   border: 1px solid var(--line); background: var(--panel-2); color: var(--text-2);
 }
+
+/* Command suggestions. Sits above the input rather than below it: the
+   composer is already at the bottom of the window, and a menu that opened
+   downwards would be off-screen. */
+.slash {
+  max-width: 800px; margin: 0 auto 8px; padding: 5px;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--panel); box-shadow: var(--shadow-3);
+  max-height: 260px; overflow-y: auto;
+  animation: pop 120ms var(--ease) both;
+}
+.slash[hidden] { display: none; }
+.slash-item {
+  display: flex; align-items: baseline; gap: 10px; width: 100%; text-align: left;
+  padding: 7px 10px; border: none; background: none; border-radius: var(--r-sm);
+  color: var(--text-2); transition: background var(--fast), color var(--fast);
+}
+.slash-item b {
+  font-family: var(--mono); font-size: calc(12px * var(--text-scale));
+  color: var(--accent); font-weight: 600; flex: none;
+}
+.slash-item span {
+  font-size: calc(11.5px * var(--text-scale)); color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.slash-item.on { background: var(--row-on); color: var(--text); }
+.slash-item.on span { color: var(--text-2); }
+.slash-item:hover { background: var(--row-hover); }
 
 .to-bottom {
   position: absolute; left: 50%; bottom: 118px; transform: translateX(-50%);
@@ -1193,14 +1636,23 @@ body.resizing * { cursor: col-resize !important; }
    the pointer every time you change section */
 .modal-box.wide { width: min(880px, 100%); height: min(620px, 86vh);
                   max-height: 86vh; }
-.modal-box.wide #modal-body { padding: 0; overflow: hidden; display: flex; }
+.modal-box.wide #modal-body {
+  padding: 0; overflow: hidden; display: flex;
+  /* The box has a fixed height; without this the body only grows to fit its
+     content and the rest of the box is left bare. The rail's own background
+     then stopped two thirds of the way down, which read as the rail ending
+     rather than as the body not filling its container. */
+  flex: 1 1 auto; min-height: 0;
+}
 
 .settings { display: flex; width: 100%; min-height: 0; }
 
 .set-nav {
   flex: 0 0 194px; display: flex; flex-direction: column; gap: 2px;
   padding: 12px 10px; border-right: 1px solid var(--line-soft);
-  background: color-mix(in srgb, var(--panel-2) 55%, transparent);
+  /* solid, not 55% of it: over a white dialog the tint disappeared and the
+     rail read as part of the pane rather than as the index to it */
+  background: var(--panel-2);
   overflow-y: auto;
 }
 .set-tab {
@@ -1330,6 +1782,9 @@ input[type=range]::-moz-range-thumb {
 @keyframes bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .55; }
                     30% { transform: translateY(-5px); opacity: 1; } }
 @keyframes shimmer { from { background-position: 120% 0; } to { background-position: -120% 0; } }
+@keyframes rail-run { from { background-position: 0 -130%; }
+                      to   { background-position: 0 230%; } }
+@keyframes edge-run { to { transform: translate(-50%, -50%) rotate(1turn); } }
 @keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-7px); } }
 @keyframes glow {
   0%, 100% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 9%, transparent); }
@@ -1358,11 +1813,27 @@ input[type=range]::-moz-range-thumb {
   #scrim.on { opacity: 1; pointer-events: auto; }
   .ws-chip { max-width: 30vw; }
   .speed { display: none; }
+  /* Below ~500px the row - menu, mode switch, workspace chip, install, theme,
+     settings - is wider than the window, and because body has overflow:hidden
+     there is no scroll to reach what falls off the end: Settings and the theme
+     toggle were simply gone in Agent mode. The mode switch keeps its icons and
+     drops its labels, and the chip yields first. */
+  .modes { flex: 0 1 auto; min-width: 0; }
+  .ws-chip { flex: 0 1 auto; min-width: 0; }
+  #topbar { gap: 4px; padding-left: 6px; padding-right: 6px; }
   .cards { grid-template-columns: 1fr; }
   #thread { padding: 20px 14px 6px; }
   #composer { padding: 10px 14px 14px; }
   .msg.user .body { max-width: 92%; }
   #welcome { margin-top: 3vh; }
+}
+@media (max-width: 520px) {
+  .mode span { display: none; }          /* the icons carry it from here */
+  .mode { padding-left: 12px; padding-right: 12px; }
+  .ws-chip { max-width: 22vw; }
+  #install-btn span { display: none; }
+}
+@media (max-width: 900px) {
   #welcome h1 { font-size: calc(22.5px * var(--text-scale)); }
   #welcome .sub { font-size: calc(13px * var(--text-scale)); margin-bottom: 22px; }
   .hero-mark { width: 48px; height: 48px; border-radius: 16px; margin-bottom: 16px; }

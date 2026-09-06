@@ -72,6 +72,7 @@ def public(provider: dict) -> dict:
         "default_model": provider.get("default_model", ""),
         "context_length": provider.get("context_length"),
         "efforts": list(provider.get("efforts") or []),
+        "efforts_detected": list(provider.get("efforts_detected") or []),
         "vision": provider.get("vision"),
         "vision_detected": provider.get("vision_detected"),
         "has_key": bool(provider.get("api_key")),
@@ -138,10 +139,20 @@ def _clean(row: dict, existing: dict | None = None) -> dict:
         if context_length > 100_000_000:
             raise ProviderError("that context looks like a typo")
 
+    # Two answers, kept apart for the same reason vision keeps two: what the
+    # endpoint said, and what the user says. A single field meant a probe that
+    # found nothing wiped a setting the user had entered by hand - and plenty
+    # of endpoints will never say. vLLM is the case in point: it accepts
+    # reasoning_effort through chat_template_kwargs perfectly well, and its
+    # /models row mentions none of it.
     efforts = row.get("efforts")
     if efforts is None:
         efforts = (existing or {}).get("efforts")
     efforts = [e for e in EFFORT_ORDER if e in {str(x).lower() for x in (efforts or [])}]
+    found = row.get("efforts_detected")
+    if found is None:
+        found = (existing or {}).get("efforts_detected")
+    found = [e for e in EFFORT_ORDER if e in {str(x).lower() for x in (found or [])}]
 
     # Images. Two values, because they answer different questions: what the
     # endpoint said when probed, and what the user told us. Plenty of
@@ -162,6 +173,7 @@ def _clean(row: dict, existing: dict | None = None) -> dict:
     return {"id": pid, "name": name, "base_url": base, "api_key": key,
             "models": models, "default_model": default_model,
             "context_length": context_length, "efforts": efforts,
+            "efforts_detected": found,
             "vision": vision, "vision_detected": detected,
             "checked": (existing or {}).get("checked"), "note": note}
 
@@ -369,7 +381,9 @@ def test(root: Path, row: dict) -> dict:
         stored = find(root, pid)
         if stored:
             stored["models"] = models
-            stored["efforts"] = caps["efforts"]
+            # what the probe found goes in its own field: overwriting "efforts"
+            # threw away whatever the user had declared by hand
+            stored["efforts_detected"] = caps["efforts"]
             stored["vision_detected"] = caps["vision"]
             stored["checked"] = time.time()
             save(root, [stored if p["id"] == pid else p for p in load(root)])
