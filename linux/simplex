@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# One command for the whole kit:  ./simplex start | stop | status | doctor ...
+# Everything it does lives in tools/cli.py, so Windows and Linux behave alike.
+set -euo pipefail
+# This script lives in linux/; the kit is its parent.
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SELF_DIR/.."
+PY="$(command -v python3 || command -v python || true)"
+if [ -x .venv/bin/python ]; then PY=.venv/bin/python; fi
+if [ -z "$PY" ]; then
+    echo "Python 3.11+ is needed and was not found on PATH." >&2
+    echo "Install it from your package manager, then run this again." >&2
+    exit 1
+fi
+exec "$PY" tools/cli.py "$@"

@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mia's One-click Install</title>
+<link rel="stylesheet" href="/ui/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='42' fill='%23d97757'/><circle cx='50' cy='50' r='16' fill='%23fff'/></svg>">
+<style>
+/* Setup is a single centred column: it is read top to bottom once, so it
+   borrows the chat UI's tokens but none of its three-pane layout. */
+/* style.css locks the chat app to the viewport - html,body { height: 100% } and
+   body { overflow: hidden } - because that layout scrolls inside its own panes.
+   This page is one long column that scrolls with the window, so it has to undo
+   both. Without this the page is clipped at the fold: on a card with several
+   quants the menu, the Continue button and everything below them are simply
+   unreachable, with no scrollbar to say so. */
+html, body { height: auto; overflow: visible; }
+body { min-height: 100vh; background: var(--bg); background-image: var(--bg-grad);
+  /* fixed, or the gradient restarts partway down a tall page and draws a seam */
+  background-attachment: fixed; background-repeat: no-repeat; }
+#setup { max-width: 880px; margin: 0 auto; padding: 28px 20px 72px; }
+
+.setup-head { display: flex; align-items: center; gap: 12px; margin-bottom: 26px; }
+.setup-head .brand { display: flex; align-items: center; gap: 10px; font-family: var(--display);
+  font-size: 17px; font-weight: 650; letter-spacing: .2px; }
+.setup-head .spacer { flex: 1; }
+
+h1 { font-family: var(--display); font-size: 27px; line-height: 1.2; margin: 0 0 8px;
+  letter-spacing: -.4px; }
+.lede { color: var(--text-2); font-size: 15px; line-height: 1.55; margin: 0 0 22px; max-width: 62ch; }
+
+.s-card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-lg);
+  box-shadow: var(--shadow-1); padding: 18px 20px; margin: 0 0 16px; }
+.s-card h2 { font-family: var(--display); font-size: 15px; margin: 0 0 12px; font-weight: 620; }
+
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px 18px; }
+.fact { min-width: 0; }
+.fact span { display: block; font-size: 11.5px; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--muted); margin-bottom: 3px; }
+.fact b { font-size: 14.5px; font-weight: 600; overflow-wrap: anywhere; }
+.fact.bad b { color: var(--danger); }
+.fact.warn b { color: var(--warn); }
+
+.opts { display: grid; gap: 10px; }
+.s-opt { display: grid; grid-template-columns: 22px 1fr auto; gap: 14px; align-items: center;
+  width: 100%; text-align: left; padding: 14px 16px; border-radius: var(--r-md);
+  border: 1px solid var(--line); background: var(--panel-2); color: inherit;
+  cursor: pointer; transition: border-color var(--fast), background var(--fast), transform var(--fast); }
+.s-opt:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.s-opt:active { transform: translateY(1px); }
+.s-opt[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft);
+  box-shadow: 0 0 0 1px var(--accent) inset; }
+.s-opt .dot { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--line);
+  position: relative; }
+.s-opt[aria-pressed="true"] .dot { border-color: var(--accent); }
+.s-opt[aria-pressed="true"] .dot::after { content: ""; position: absolute; inset: 3px;
+  border-radius: 50%; background: var(--accent); }
+.s-opt .who { min-width: 0; }
+.s-opt .who b { display: block; font-size: 14.5px; font-weight: 620; }
+.s-opt .who small { display: block; color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+.s-opt .num { text-align: right; font-size: 12.5px; color: var(--text-2); white-space: nowrap; }
+.s-opt .num b { display: block; font-size: 14px; }
+.s-badge { display: inline-block; font-size: 10.5px; font-weight: 700; letter-spacing: .05em;
+  text-transform: uppercase; padding: 2px 7px; border-radius: 999px; margin-left: 7px;
+  background: var(--accent-soft); color: var(--accent); vertical-align: 2px; }
+.s-badge.have { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+.s-badge.part { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+
+/* the images question, above the quant menu */
+#vision-choice { margin: 4px 0 14px; padding: 12px 14px; border: 1px solid var(--line-soft);
+  border-radius: 10px; background: var(--panel-2, transparent); }
+.s-seg { display: inline-flex; gap: 6px; margin-left: 8px; vertical-align: 1px; }
+.s-seg .btn { padding: 4px 12px; font-size: 12.5px; }
+.s-caveat { display: block; margin-top: 6px; color: var(--muted); font-size: 12px;
+  font-style: italic; }
+
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 18px; }
+.row .grow { flex: 1; }
+.note { color: var(--muted); font-size: 13px; line-height: 1.5; }
+
+/* --- install ---------------------------------------------------------- */
+.bar { height: 10px; border-radius: 999px; background: var(--line-soft); overflow: hidden;
+  margin: 12px 0 8px; }
+.bar i { display: block; height: 100%; width: 0; border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 420ms var(--ease); }
+.bar.indet i { width: 34%; animation: slide 1.4s var(--ease) infinite; }
+@keyframes slide { 0% { margin-left: -34%; } 100% { margin-left: 100%; } }
+.dlnums { display: flex; justify-content: space-between; gap: 12px; font-size: 13px;
+  color: var(--text-2); font-variant-numeric: tabular-nums; }
+.dlnums .file { color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; max-width: 46%; }
+
+ol.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+ol.steps li { display: grid; grid-template-columns: 24px 1fr auto; gap: 10px; align-items: baseline;
+  padding: 8px 4px; border-radius: var(--r-sm); }
+ol.steps li .mark { font-size: 14px; line-height: 1.4; text-align: center; color: var(--muted); }
+ol.steps li b { font-weight: 580; font-size: 14px; }
+ol.steps li small { display: block; color: var(--muted); font-size: 12.5px; margin-top: 1px; }
+ol.steps li .secs { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+ol.steps li[data-state="running"] { background: var(--panel-2); }
+ol.steps li[data-state="running"] .mark { color: var(--accent); }
+ol.steps li[data-state="running"] b { color: var(--text); }
+ol.steps li[data-state="ok"] .mark, ol.steps li[data-state="skipped"] .mark { color: var(--ok); }
+ol.steps li[data-state="failed"] .mark { color: var(--danger); }
+ol.steps li[data-state="pending"] b { color: var(--muted); font-weight: 500; }
+
+.spin { display: inline-block; width: 13px; height: 13px; border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-top-color: var(--accent); animation: spin .7s linear infinite; vertical-align: -2px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+details.log { margin-top: 4px; }
+details.log > summary { cursor: pointer; font-size: 13px; color: var(--text-2); padding: 6px 2px;
+  list-style: none; display: flex; align-items: center; gap: 7px; }
+details.log > summary::-webkit-details-marker { display: none; }
+details.log > summary::before { content: "›"; transition: transform var(--fast); font-size: 15px; }
+details.log[open] > summary::before { transform: rotate(90deg); }
+pre.out { margin: 6px 0 0; max-height: 300px; overflow: auto; background: var(--bg);
+  border: 1px solid var(--line-soft); border-radius: var(--r-sm); padding: 10px 12px;
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.55; color: var(--text-2);
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+pre.out .cmd { color: var(--accent); }
+pre.out .error { color: var(--danger); }
+pre.out .hint { color: var(--warn); }
+
+.alert { border-radius: var(--r-md); padding: 14px 16px; border: 1px solid; margin: 0 0 16px; }
+.alert b { display: block; font-size: 14.5px; margin-bottom: 5px; }
+.alert p { margin: 0; font-size: 13.5px; line-height: 1.55; }
+.alert.bad { border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.alert.warn { border-color: color-mix(in srgb, var(--warn) 42%, transparent);
+  background: color-mix(in srgb, var(--warn) 11%, transparent); }
+.alert.ok { border-color: color-mix(in srgb, var(--ok) 38%, transparent);
+  background: color-mix(in srgb, var(--ok) 10%, transparent); }
+
+input.text { width: 100%; padding: 9px 12px; border-radius: var(--r-sm); font: inherit;
+  font-size: 13.5px; background: var(--panel-2); border: 1px solid var(--line); color: var(--text); }
+input.text:focus { outline: none; border-color: var(--accent); box-shadow: var(--ring); }
+
+.btn.ghost { background: transparent; box-shadow: none; color: var(--text-2); }
+.btn.ghost:hover { background: var(--panel-2); color: var(--text); }
+
+.hidden { display: none !important; }
+@media (max-width: 620px) {
+  #setup { padding: 18px 14px 56px; }
+  h1 { font-size: 22px; }
+  .s-opt { grid-template-columns: 20px 1fr; }
+  .s-opt .num { grid-column: 2; text-align: left; }
+}
+</style>
+</head>
+<body>
+
+<svg class="sprite" aria-hidden="true" style="position:absolute;width:0;height:0">
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.2A8.2 8.2 0 0 1 9.8 4 8.2 8.2 0 1 0 20 14.2"/></symbol>
+</svg>
+
+<div id="setup">
+  <div class="setup-head">
+    <div class="brand">
+      <span class="brand-mark"><i class="busy"></i></span>
+      <span id="brand-name">Mia's One-click Install</span>
+    </div>
+    <div class="spacer"></div>
+    <button id="theme-btn" class="icon" title="Theme" aria-label="Theme">
+      <svg class="ico theme-sun"><use href="#i-sun"/></svg>
+      <svg class="ico theme-moon"><use href="#i-moon"/></svg>
+    </button>
+  </div>
+
+  <!-- ------------------------------------------------------ choose ---- -->
+  <section id="screen-choose" class="hidden">
+    <h1>Let's get Qwen3.8-27B running</h1>
+    <p class="lede">This happens once. The installer checks the graphics card, installs
+      what it needs into its own folder, and downloads the model you pick. Nothing is
+      installed system-wide and nothing leaves this PC.</p>
+
+    <div id="blockers"></div>
+
+    <div class="s-card">
+      <h2>What's on this PC</h2>
+      <div class="facts" id="facts"></div>
+    </div>
+
+    <div class="s-card">
+      <h2>Pick a model size</h2>
+      <p class="note" id="menu-note" style="margin:-4px 0 14px"></p>
+      <div class="opts" id="opts"></div>
+      <details class="log" style="margin-top:14px">
+        <summary>Advanced</summary>
+        <div style="padding:10px 2px 2px">
+          <p class="note" style="margin:0 0 8px">A Hugging Face access token, only needed
+            if a model you choose is gated. It is stored in this folder's <code>.env</code>
+            and never sent anywhere except huggingface.co.</p>
+          <input class="text" id="hf-token" type="password" placeholder="hf_..." autocomplete="off" spellcheck="false">
+        </div>
+      </details>
+      <div class="row">
+        <button class="btn primary" id="go">Install and download</button>
+        <span class="note" id="go-note"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ----------------------------------------------------- install ---- -->
+  <section id="screen-install" class="hidden">
+    <h1 id="install-title">Setting everything up</h1>
+    <p class="lede" id="install-lede">The download and the install run at the same time.
+      You can close this page - it keeps going, and the address stays the same.</p>
+
+    <div class="s-card">
+      <h2>Downloading <span id="dl-model" class="note"></span></h2>
+      <div class="bar" id="dl-bar"><i></i></div>
+      <div class="dlnums">
+        <span id="dl-left">Starting</span>
+        <span class="file" id="dl-file"></span>
+        <span id="dl-right"></span>
+      </div>
+    </div>
+
+    <div class="s-card">
+      <h2>Installing</h2>
+      <ol class="steps" id="steps"></ol>
+      <details class="log" id="log-wrap">
+        <summary>Show the detailed log</summary>
+        <pre class="out" id="out"></pre>
+      </details>
+    </div>
+
+    <div class="row">
+      <button class="btn ghost" id="cancel">Stop</button>
+      <span class="note">Stopping is safe. The download resumes where it left off.</span>
+    </div>
+  </section>
+
+  <!-- -------------------------------------------------------- done ---- -->
+  <section id="screen-done" class="hidden">
+    <h1>Setup finished</h1>
+    <p class="lede" id="done-lede">The model is loading into the graphics card. That takes a few
+      minutes the first time, because the GPU kernels are compiled and cached. This page
+      turns into the chat window on its own.</p>
+    <div class="s-card" id="done-card">
+      <div class="row" style="margin:0">
+        <span class="spin"></span>
+        <b id="done-state">Starting the model server</b>
+      </div>
+      <div class="bar indet" style="margin-top:14px"><i></i></div>
+      <p class="note" id="done-note" style="margin-top:12px"></p>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------- error ---- -->
+  <section id="screen-error" class="hidden">
+    <h1>Setup could not finish</h1>
+    <div class="alert bad">
+      <b id="err-msg"></b>
+      <p id="err-hint"></p>
+    </div>
+    <div class="s-card">
+      <h2>What happened</h2>
+      <ol class="steps" id="err-steps"></ol>
+      <details class="log" open>
+        <summary>Log</summary>
+        <pre class="out" id="err-out"></pre>
+      </details>
+    </div>
+    <div class="row">
+      <button class="btn primary" id="retry">Try again</button>
+      <button class="btn ghost" id="back">Choose a different model</button>
+    </div>
+  </section>
+</div>
+
+<div id="toasts" aria-live="polite"></div>
+<script src="/ui/static/setup.js"></script>
+</body>
+</html>

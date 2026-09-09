@@ -1,0 +1,20 @@
+# ---------------------------------------------------------------------------
+# Line endings. This kit is launched from cmd.exe on Windows and from bash on
+# Linux, and the same clone has to work on both. Git decides the endings here
+# rather than leaving them to each machine's core.autocrlf.
+# ---------------------------------------------------------------------------
+
+# Default: let git detect text and store it with LF in the repo.
+* text=auto
+
+# Scripts cmd.exe runs. A .bat with LF endings can break `goto` and label
+# parsing, so these are checked out with CRLF everywhere.
+*.bat text eol=crlf
+
+# Scripts a shell runs. A .sh with CRLF endings fails with a "\r: command not
+# found" that reads like a bug in the script.
+*.sh    text eol=lf
+simplex text eol=lf
+
+# Binaries.
+*.ico binary
