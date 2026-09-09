@@ -58,6 +58,13 @@ from pathlib import Path
 # preview and moving fast - and the wrong one when a run has to reproduce.
 DEFAULT_VERSION = "0.1.3-alpha.2"
 DEFAULT_PORT = 3080
+
+
+def port_from_cfg(cfg: dict, default: int = DEFAULT_PORT) -> int:
+    """Harness bind port. Prefer SIMPLEX_HARNESS_PORT; DSH_PORT in a .env
+    file is fatal to current dsh-app-boot, so new kits do not ship it."""
+    raw = cfg.get("SIMPLEX_HARNESS_PORT") or cfg.get("DSH_PORT") or default
+    return int(raw)
 PACKAGE = "@deepseek-ai/dsh"
 
 # The provider route dsh serves this kit's model on. The id is permanent as far
@@ -501,8 +508,14 @@ def start(root: Path, port: int = DEFAULT_PORT, version: str = DEFAULT_VERSION,
     if extra_env:
         env.update(extra_env)
     home(root).mkdir(parents=True, exist_ok=True)
+    # Current dsh (dsh-app-boot) walks parent dirs for a .env and *refuses*
+    # reserved keys such as DSH_PORT in that file ("export it instead").
+    # Our kit .env used to ship DSH_PORT=3080, which killed the harness after
+    # /v1 was already up. cwd is .dsh (DSH_HOME) so that walk does not see
+    # the kit .env; the port is already on the CLI as `dsh web --port`.
+    env.setdefault("DSH_PORT", str(port))
     return subprocess.Popen(
-        command(version, port), cwd=str(root), env=env,
+        command(version, port), cwd=str(home(root)), env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
         shell=False)
 
@@ -605,7 +618,8 @@ def main() -> int:
                 k, _, v = line.partition("=")
                 cfg[k.strip()] = v.split("#")[0].strip().strip('"').strip("'")
 
-    port = args.port or int(cfg.get("DSH_PORT") or DEFAULT_PORT)
+    port = args.port or int(
+        cfg.get("SIMPLEX_HARNESS_PORT") or cfg.get("DSH_PORT") or DEFAULT_PORT)
     version = args.version or cfg.get("DSH_VERSION") or DEFAULT_VERSION
     base = args.base or f"http://127.0.0.1:{cfg.get('PORT', '8888')}/v1"
 

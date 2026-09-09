@@ -24,7 +24,7 @@ at setup, and you can change it any time.
 | GPU | NVIDIA, 12 GB VRAM or more, compute capability 7.5+ (Turing and newer). 16 GB is the size this kit was built around. |
 | Driver | 570 or newer (the default PyTorch build is cu128). |
 | Python | **3.11 or newer, 64-bit.** The only thing you install by hand. |
-| Node | LTS from [nodejs.org](https://nodejs.org/) — needed for the chat UI. Without it `/v1` still serves; the launcher says what is missing. |
+| Node | **22.19+** from [nodejs.org](https://nodejs.org/) (current dsh). Older LTS (20) warns `EBADENGINE` and the chat UI may fail. Without Node, `/v1` still serves; the launcher says what is missing. |
 | Disk | 9.7–22.9 GB per quant (see the table below), plus several GB for the Python environment and PyTorch. |
 
 **Not needed:** CUDA Toolkit, Visual Studio Build Tools, Git. The engine arrives as a
@@ -402,10 +402,10 @@ token is a session on an agent that runs commands here.
 
 | | |
 | --- | --- |
-| Harness | `http://127.0.0.1:3080/` (`DSH_PORT` in `.env`) |
+| Harness | `http://127.0.0.1:3080/` (`SIMPLEX_HARNESS_PORT` in `.env`; do not use `DSH_PORT` there) |
 | Version | `DSH_VERSION` in `.env`, pinned; `latest` follows the newest |
 | Its home | `.dsh/` in the kit folder — settings, credentials, profiles, plugins |
-| Run it alone | `tools/dsh.py --open`, with the kit's venv Python and the server already up |
+| Run it alone | From the **kit root** (not `C:\Windows\System32`): `python tools/dsh.py --open`. PowerShell: `Set-Location -LiteralPath <kit>`; cmd: `cd /d <kit>`. `cd /d` is not valid in PowerShell. |
 | Just the settings | `tools/dsh.py --settings-only` |
 
 The harness binds loopback only and **refuses to bind `0.0.0.0` at all**: its agent
@@ -609,7 +609,7 @@ fine. The ones you are most likely to touch:
 | `PORT` | `8888` | the OpenAI API port |
 | `HOST` | `0.0.0.0` | set to `127.0.0.1` to keep `/v1` off your network |
 | `UI` | `browser` | `browser`, `server`, or `no` |
-| `DSH_PORT` | `3080` | the chat UI's port |
+| `SIMPLEX_HARNESS_PORT` | `3080` | the chat UI's port. Do **not** set `DSH_PORT` in `.env` — current dsh treats that key in a file as fatal and the harness never binds |
 | `DRAFT` | `mtp` | `none` turns off speculative decoding |
 | `SETUP` | `browser` | `console` for terminal questions on Windows |
 | `TRAY` | `auto` | Windows notification-area icon; `no` to skip |

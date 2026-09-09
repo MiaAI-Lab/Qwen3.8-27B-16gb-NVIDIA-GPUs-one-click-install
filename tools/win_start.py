@@ -1069,7 +1069,7 @@ def harness_after_ready(proc: subprocess.Popen, host: str, port: str,
         info(f"The API is serving at {cyan(base)} in the meantime.")
         return
 
-    hport = int(cfg.get("DSH_PORT") or dsh.DEFAULT_PORT)
+    hport = dsh.port_from_cfg(cfg)
     version = (cfg.get("DSH_VERSION") or dsh.DEFAULT_VERSION).strip()
 
     # A harness from a run that did not shut down cleanly still holds the port.
@@ -1093,7 +1093,7 @@ def harness_after_ready(proc: subprocess.Popen, host: str, port: str,
         warn(f"port {hport} is held by something this kit cannot get into - "
              f"a harness left over from a run that did not shut down, or "
              f"another program")
-        info("windows\\stop.bat clears a leftover harness; DSH_PORT in .env moves this "
+        info("windows\\stop.bat clears a leftover harness; SIMPLEX_HARNESS_PORT in .env moves this "
              "one out of the way.")
         info(f"The API is serving at {cyan(base)} in the meantime.")
         return
@@ -1344,7 +1344,7 @@ def server_command(cfg: dict[str, str]):
     cmd.extend(["--vision", vision_mode, "--image_max_pixels", image_max_pixels])
     ui = ui_mode(cfg)
     cmd.extend(["--ui", "off" if ui == "no" else "on"])
-    cmd.extend(["--harness_port", str(cfg.get("DSH_PORT") or "3080")])
+    cmd.extend(["--harness_port", str(cfg.get("SIMPLEX_HARNESS_PORT") or cfg.get("DSH_PORT") or "3080")])
     return cmd, host, port, gpu_mem, ui, context
 
 
@@ -1467,7 +1467,7 @@ def main() -> int:
     info("The Ready box appears after load finishes  - do not connect yet.")
     if ui != "no":
         info(f"The harness starts after that, at "
-             f"http://127.0.0.1:{cfg.get('DSH_PORT') or '3080'}/.")
+             f"http://127.0.0.1:{cfg.get('SIMPLEX_HARNESS_PORT') or cfg.get('DSH_PORT') or '3080'}/.")
     if prep is not None:
         info("After Ready you will be asked whether to open Cherry Studio.")
     print()
