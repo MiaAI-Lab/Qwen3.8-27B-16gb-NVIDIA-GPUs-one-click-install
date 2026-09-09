@@ -110,3 +110,10 @@ build/
 *.safetensors
 *.gguf
 *.part
+
+# Promo renders and their music. Made here, kept here - 85 MB of video and
+# audio that nobody cloning the kit needs, and that every future clone would
+# have to carry. The .png is the same story at a smaller size.
+/*.mp4
+/*.mp3
+/*.png
