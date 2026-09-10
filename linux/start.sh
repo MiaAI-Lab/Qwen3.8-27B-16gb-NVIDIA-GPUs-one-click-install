@@ -497,7 +497,7 @@ fi
 UI="${UI:-browser}"
 # --harness / --no-harness, and `simplex start --no-harness`, which sets this.
 UI="${SIMPLEX_UI:-$UI}"
-DSH_PORT="${DSH_PORT:-3080}"
+DSH_PORT="${SIMPLEX_HARNESS_PORT:-${DSH_PORT:-3080}}"
 case "$UI" in
     1|yes|true|on|browser) UI=browser ;;
     0|no|none|off|false)   UI=no ;;

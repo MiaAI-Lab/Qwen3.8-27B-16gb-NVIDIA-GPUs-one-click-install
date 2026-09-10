@@ -53,6 +53,8 @@ WINDOWS = os.name == "nt"
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
+import dsh
+
 
 # --------------------------------------------------------------- colour ----
 def _colour_ok() -> bool:
@@ -317,7 +319,7 @@ def snapshot() -> dict:
     """Everything `status` reports, in one dict - also what --json prints."""
     cfg = read_env()
     port = env_int(cfg, "PORT", 8888)
-    dsh_port = env_int(cfg, "DSH_PORT", 3080)
+    dsh_port = dsh.port_from_cfg(cfg)
     state = {
         "root": str(ROOT),
         "server": {"port": port, "running": False, "pid": 0, "model": None,
@@ -475,7 +477,7 @@ def cmd_start(a) -> int:
 def cmd_stop(a) -> int:
     cfg = read_env()
     port = a.port or env_int(cfg, "PORT", 8888)
-    dsh_port = env_int(cfg, "DSH_PORT", 3080)
+    dsh_port = dsh.port_from_cfg(cfg)
     rc = 0
 
     if not a.server_only:
@@ -611,7 +613,7 @@ def cmd_logs(a) -> int:
 def cmd_harness(a) -> int:
     import dsh                                              # noqa: WPS433
     cfg = read_env()
-    port = env_int(cfg, "DSH_PORT", dsh.DEFAULT_PORT)
+    port = a.port or dsh.port_from_cfg(cfg)
     base = f"http://127.0.0.1:{env_int(cfg, 'PORT', 8888)}/v1"
 
     if a.action == "status":
@@ -816,7 +818,7 @@ def cmd_doctor(a) -> int:
         warn("node", "not installed - the harness cannot run (UI=no skips it)")
 
     port = env_int(cfg, "PORT", 8888)
-    dsh_port = env_int(cfg, "DSH_PORT", 3080)
+    dsh_port = dsh.port_from_cfg(cfg)
     for label, p in (("model port", port), ("harness port", dsh_port)):
         if port_listening(p):
             pid, cmdl = port_owner(p)
