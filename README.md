@@ -1,4 +1,4 @@
-<h1 align="center">Qwen3.8-27B on 16-24 GB Nvidia GPUs one-click install for Windows / Linux</h1>
+<h1 align="center">Qwen3.8-27B on 16-32 GB Nvidia GPUs one-click install for Windows / Linux</h1>
 
 <p align="center">
   <img src="assets/intro.png" alt="Qwen3.8-27B one-click install" width="900" />
