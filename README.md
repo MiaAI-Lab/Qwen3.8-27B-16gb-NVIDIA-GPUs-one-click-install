@@ -1,4 +1,4 @@
-# Simplex — Qwen3.8-27B on your own NVIDIA GPU
+# Qwen3.8-27B on 16 GB VRAM NVIDIA GPU
 
 A serving kit for [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) in
 **[turboderp](https://huggingface.co/turboderp)**'s EXL3 quants, on one consumer
