@@ -1,4 +1,4 @@
-<h1 align="center">Qwen3.8-27B on 16 GB VRAM NVIDIA GPU</h1>
+<h1 align="center">Qwen3.8-27B on 16-24 GB Nvidia GPUs one-click install for Windows / Linux</h1>
 
 <p align="center">
   <sub>by <a href="https://x.com/MiaAI_lab">Mia'a AI Lab</a></sub>
