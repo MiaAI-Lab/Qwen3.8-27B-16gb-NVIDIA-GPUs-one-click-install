@@ -1,6 +1,10 @@
 <h1 align="center">Qwen3.8-27B on 16-24 GB Nvidia GPUs one-click install for Windows / Linux</h1>
 
 <p align="center">
+  <img src="assets/intro.png" alt="Qwen3.8-27B one-click install" width="900" />
+</p>
+
+<p align="center">
   <sub>by <a href="https://x.com/MiaAI_lab">Mia'a AI Lab</a></sub>
   <br><br>
   <a href="https://github.com/sponsors/MiaAI-Lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Sponsor%20me%20on%20GitHub-181717?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor me on GitHub" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
