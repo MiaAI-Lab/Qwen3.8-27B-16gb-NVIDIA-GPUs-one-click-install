@@ -114,7 +114,9 @@ loads.
   **Quit Simplex**.
   (`TRAY=no` in `.env` turns it off.)
 * Every launch writes a full transcript to `logs\`, so a crash that scrolls past is
-  still readable afterwards.
+  still readable afterwards. It also carries one
+  [per-request stats](#per-request-stats) line per reply — prefill/decode tok/s and
+  friends.
 * The first successful launch adds Start-menu and desktop shortcuts
   (`SHORTCUTS=no` in `.env` to skip that).
 
@@ -180,6 +182,8 @@ http://127.0.0.1:3080/       the chat UI
 `-b` is the honest equivalent of the Windows tray: it detaches, writes to
 `logs/simplex-*.log`, and tells you where that log is and how to stop it. First-run
 setup and the model menu still happen — written to the log instead of the screen.
+The log also carries one [per-request stats](#per-request-stats) line per reply —
+prefill/decode tok/s and friends.
 
 **On a box with no desktop session** `webbrowser` has nothing to open, so the chat
 address is printed for you to copy. Take the whole thing, **token and all** — see
@@ -493,6 +497,47 @@ says images are on. Video is not supported.
 Defaults: temperature 0.6, top-p 0.95, top-k 20, thinking on. One request at a time;
 extras queue.
 
+### Per-request stats
+
+The server logs its requests to the console and to `logs/` (Windows: the
+launcher window and **View the log**; Linux: the console, or
+`logs/simplex-*.log` with `-b` — `simplex logs -f` follows it live). While a
+request **runs**, transient ` .. ` progress lines show where it is; when it
+**finishes**, one ` == stats` line is the record. A request with a long prompt
+followed by a streamed reply looks like this in the log:
+
+```
+ .. chatcmpl-1a7babbd9ca6: prefill 2048/9652 tok (1303.7 tok/s)
+ .. chatcmpl-1a7babbd9ca6: prefill 4096/9652 tok (1283.6 tok/s)
+ .. chatcmpl-1a7babbd9ca6: prefill 8192/9652 tok (1217.1 tok/s)
+ .. chatcmpl-1a7babbd9ca6: prefill done, 9651 tok in 8.4 s
+ .. chatcmpl-8948a77c3bfb stream: decoding, 61 tok (58.3 tok/s)
+ .. chatcmpl-8948a77c3bfb stream: decoding, 106 tok (50.7 tok/s)
+ == stats chatcmpl-8948a77c3bfb stream: prompt 59 tok, completion 395 tok, prefill 403.3 tok/s, decode 44.1 tok/s, wall 9.11 s (queue 0.00), draft accepted 208/748 (28%)
+```
+
+**While it runs** (` .. ` lines): prefill ingress with a running tok/s, a
+closing `prefill done` when the first token arrives, then decode tokens so far
+with the running tok/s — and a `queued N s` line first if the request waited
+behind another one. At most one line per second per phase
+(`PROGRESS_EVERY` in `.env`; `0` turns the live lines off). Phases shorter
+than the interval print nothing, so short chats stay quiet, and a cancelled
+request just stops — no noise, no cleanup line.
+
+**When it finishes** (` == stats` line):
+
+| field | what it is |
+| --- | --- |
+| `prefill tok/s` | how fast the prompt was ingested. Counts only tokens the engine actually computed — prompt-cache hits are free and shown as `(N cached)` instead. |
+| `decode tok/s` | generation speed, first token to last. |
+| `wall` | the whole request, queue wait included. Requests are serialized, so under concurrency only `wall` grows — the two rates above stay honest per-stage numbers. |
+| `queue` | time the request spent waiting behind another one, in seconds. |
+| `draft accepted` | speculative-drafting hit rate (`DRAFT=none` omits this). |
+
+A `-` where a rate is undefined: a cancelled request, a prompt served whole
+out of the cache, or a zero-token completion. The same numbers are also the
+`last_request` object on `GET /health`, for scripts and dashboards.
+
 ### Cherry Studio (optional, off by default)
 
 The kit used to ship [Cherry Studio](https://github.com/CherryHQ/cherry-studio) as
@@ -621,6 +666,7 @@ fine. The ones you are most likely to touch:
 | `HOST` | `0.0.0.0` | set to `127.0.0.1` to keep `/v1` off your network |
 | `UI` | `browser` | `browser`, `server`, or `no` |
 | `SIMPLEX_HARNESS_PORT` | `3080` | the chat UI's port. Do **not** set `DSH_PORT` in `.env` — current dsh treats that key in a file as fatal and the harness never binds |
+| `PROGRESS_EVERY` | `1.0` | seconds between the live ` .. ` progress lines per phase; `0` = live lines off (the per-request ` == stats` line always prints) |
 | `DRAFT` | `mtp` | `none` turns off speculative decoding |
 | `SETUP` | `browser` | `console` for terminal questions on Windows |
 | `TRAY` | `auto` | Windows notification-area icon; `no` to skip |
