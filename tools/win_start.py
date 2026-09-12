@@ -1341,6 +1341,10 @@ def server_command(cfg: dict[str, str]):
         cmd.extend(["--cache_quant", cache_quant])
     if cpu_cache not in ("0", "0.0", ""):
         cmd.extend(["--cpu_cache_size", cpu_cache])
+    # Live " .. " progress lines while a request runs (0 = off; the
+    # end-of-request " == stats" line always prints). Passed raw like the
+    # other numeric knobs: a bad value dies loudly in the server's argparse.
+    cmd.extend(["--progress_every", str(cfg.get("PROGRESS_EVERY") or "1.0")])
     cmd.extend(["--vision", vision_mode, "--image_max_pixels", image_max_pixels])
     ui = ui_mode(cfg)
     cmd.extend(["--ui", "off" if ui == "no" else "on"])
