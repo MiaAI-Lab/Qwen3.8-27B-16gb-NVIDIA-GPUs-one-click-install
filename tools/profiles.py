@@ -554,21 +554,30 @@ def read_env(path: Path) -> dict[str, str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        out[k.strip()] = v.split("#", 1)[0].strip().strip('"').strip("'")
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        elif " #" in v:
+            v = v.split(" #", 1)[0].rstrip()
+        out[k.strip()] = v
     return out
 
 
 def _env_value(value: str) -> str:
     """One .env line's worth of value.
 
-    .env is parsed line by line, so a newline inside a value silently becomes a
-    second setting - and the values written here are not all ours: PROFILE_GPU
-    comes from nvidia-smi, HF_TOKEN from a text box. Anything that could start a
-    new line, or comment out the rest of this one, is dropped."""
+    A newline inside a value would become a second setting, so those are
+    flattened. A hash is kept. When a space and then # would be read as a
+    trailing comment, the value is quoted so the readers keep the rest."""
     text = str(value if value is not None else "")
     text = text.replace("\r", " ").replace("\n", " ").replace("\0", "")
     text = "".join(ch for ch in text if ch >= " " or ch == "\t")
-    return text.split("#", 1)[0].strip()
+    text = text.strip()
+    if "#" in text and '"' not in text:
+        return f'"{text}"'
+    if "#" in text and "'" not in text:
+        return f"'{text}'"
+    return text
 
 
 def write_env(path: Path, updates: dict[str, str]) -> None:
