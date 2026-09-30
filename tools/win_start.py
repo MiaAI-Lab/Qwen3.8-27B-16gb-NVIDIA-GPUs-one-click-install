@@ -173,7 +173,13 @@ def load_dotenv(path: Path) -> dict[str, str]:
             continue
         key, val = line.split("=", 1)
         key = key.strip()
-        val = val.split("#", 1)[0].strip().strip('"').strip("'")
+        val = val.strip()
+        # Same rule as linux/start.sh and tools/cli.py. A quoted value keeps
+        # its hash. A trailing comment is a space, then #.
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        elif " #" in val:
+            val = val.split(" #", 1)[0].rstrip()
         if key:
             out[key] = val
     return out
