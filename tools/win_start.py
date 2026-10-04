@@ -540,7 +540,8 @@ def vram_preflight(gpu_mem_gb: str, margin_gib: float = 0.3) -> None:
     On Windows a short budget does not fail loudly: the driver can spill CUDA
     memory to system RAM and the model then runs many times slower."""
     try:
-        need_mib = int(float(gpu_mem_gb) * 1024)
+        # "14.9,7.2" (two GPUs): nvidia_mem_mib() reads GPU 0, so check its share
+        need_mib = int(float(str(gpu_mem_gb).split(",")[0]) * 1024)
     except ValueError:
         return
     used, free, total = nvidia_mem_mib()
@@ -993,7 +994,8 @@ def start_tray(rt: Runtime, log_path: Path | None):
 def ui_mode(cfg: dict[str, str]) -> str:
     """UI=browser (default) starts the DeepSeek Harness once the server is
     Ready and opens it; UI=server starts it but opens nothing; UI=no does not
-    start it at all, leaving a plain OpenAI endpoint on /v1."""
+    start it at all, leaving the server as plain endpoints: OpenAI on /v1,
+    Anthropic on /v1/messages."""
     # SIMPLEX_UI is the per-run override (`simplex start --no-harness`, or
     # windows\start.bat --no-harness). It beats .env; UI in the environment does not,
     # because .env is this file's answer for everything else too.
@@ -1042,7 +1044,8 @@ def harness_after_ready(proc: subprocess.Popen, host: str, port: str,
         row = dsh.describe_model(base)
     except Exception as e:  # noqa: BLE001
         warn(f"could not ask the server what it is ({e})")
-        info(f"The API is serving at {cyan(base)} - point any OpenAI client at it.")
+        info(f"The API is serving at {cyan(base)} - point any OpenAI or "
+             f"Anthropic client at it.")
         return
 
     try:
@@ -1341,6 +1344,12 @@ def server_command(cfg: dict[str, str]):
         cmd.extend(["--cache_quant", cache_quant])
     if cpu_cache not in ("0", "0.0", ""):
         cmd.extend(["--cpu_cache_size", cpu_cache])
+    # Two GPUs (GPU_MEM_GB=14.9,7.2) and MTP draft length - see .env.example.
+    for key, flag in (("GPU_OFFLOAD_LAYERS", "--offload_layers"),
+                      ("DRAFT_TOKENS", "--num_draft_tokens"),
+                      ("DRAFT_CONFIDENCE", "--dynamic_draft")):
+        if (cfg.get(key) or "").strip():
+            cmd.extend([flag, cfg[key].strip()])
     cmd.extend(["--vision", vision_mode, "--image_max_pixels", image_max_pixels])
     ui = ui_mode(cfg)
     cmd.extend(["--ui", "off" if ui == "no" else "on"])

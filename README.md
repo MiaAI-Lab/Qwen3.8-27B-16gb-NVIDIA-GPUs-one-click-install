@@ -14,8 +14,8 @@
 A serving kit for [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) in
 **[turboderp](https://huggingface.co/turboderp)**'s EXL3 quants, on one consumer
 NVIDIA card. It picks a quant that fits the card it finds, installs its own Python
-environment, downloads the weights, serves an **OpenAI-compatible** endpoint, and
-opens a chat UI. Windows and Linux, same behaviour.
+environment, downloads the weights, serves **OpenAI- and Anthropic-compatible**
+endpoints, and opens a chat UI. Windows and Linux, same behaviour.
 
 It started as a 16 GB recipe — the 2.0 bpw quant is still that floor, and still the
 one thing here that is not turboderp's own upload ([Mia-AiLab/Qwen3.8-27B-EXL3-2.0bpw](https://huggingface.co/Mia-AiLab/Qwen3.8-27B-EXL3-2.0bpw),
@@ -174,6 +174,7 @@ used last; it auto-picks after 45 seconds), then serves:
 
 ```
 http://localhost:8888/v1     the OpenAI-compatible API
+http://127.0.0.1:8888        the same server, Anthropic Messages API
 http://127.0.0.1:3080/       the chat UI
 ```
 
@@ -361,6 +362,92 @@ CUDA workspace.
 By hand, a 24 GB card takes `CONTEXT_SIZE=262144` and `GPU_MEM_GB=22`. Do not do
 that on 16 GB.
 
+### Two GPUs
+
+Give `GPU_MEM_GB` one budget per card, fastest first, and the model is spread over
+both:
+
+```
+GPU_MEM_GB=14.9,7.2       # RTX 5080 16 GB + RTX 3050 8 GB
+CONTEXT_SIZE=262144
+CACHE_QUANT=4
+DRAFT_TOKENS=4
+DRAFT_CONFIDENCE=0.4
+```
+
+The profile planner does not write this yet (it reads GPU 0 only), so set it by
+hand. Leave `PROFILE` set: the start-time picker then keeps `.env` as it is instead
+of re-planning for one card.
+
+**What goes where.** exllamav3's own layer split fills GPU 0 in order and puts the
+rest — the last layers, their KV cache and the 248k-vocab output head — on GPU 1.
+On an unequal pair that is backwards: decode reads every weight once per forward,
+and at long context every KV page too, dequantized to fp16, so a KV byte costs
+several times its size in traffic. The server therefore moves only linear-attention
+(GDN) blocks to the second card — 48 of the 64 layers are GDN and hold no KV —
+taken as whole runs of three, just enough to fit GPU 0's budget. The attention
+layers, all of the KV cache, `lm_head` and the MTP head stay on the fast card; the
+vision tower goes to the slow one (it only runs while a picture is encoded). The
+load log prints the plan and a layer map:
+
+```
+ == split plan: weights 9.45 GiB + KV 4.50 GiB, GPU 0 room 11.60 GiB -> 18 GDN blocks (2.43 GiB) to GPU 1
+ == layer map (c=cpu): c000000000000000000000000000000000000000011101110111011101110111000
+ == cuda:0 allocated 12.49 GiB, reserved 13.21 GiB (cap 14.9 GB)
+ == cuda:1 allocated 3.61 GiB, reserved 3.70 GiB (cap 7.2 GB)
+```
+
+`GPU_OFFLOAD_LAYERS` overrides the count (`auto`, a number, or `stock` for
+exllamav3's own split).
+
+**Measured** on RTX 5080 (Gen5 x16) + RTX 3050 8 GB (x4 slot, no peer-to-peer),
+3.0 bpw, `CONTEXT_SIZE=262144` with images, 2026-09-26. Decode is the mean of three
+768-token answers at the server's default sampling, via `tools/bench.py`; prefill
+is the cold first run. Every run is in `bench/two-gpu-2026-09-26.jsonl`.
+
+| prompt tokens | decode tok/s | prefill tok/s |
+| --- | --- | --- |
+| 86 | 57.9 | — |
+| 29k | 52.7 | 721 |
+| 59k | 47.5 | 670 |
+| 115k | 41.9 | 584 |
+| 173k | 37.8 | 512 |
+| 222k | 36.1 | 465 |
+| 250k (window ~95 % full) | 35.7 | 443 |
+
+For scale, the old single-card recipe (2.0 bpw @ 229k on the 5080 alone) decodes at
+72.8 tok/s short, 49.2 at 115k and 35.6 at 190k — long-context decode is bounded by
+reading the KV cache on the fast card, split or not.
+
+What the tuning bought, 3.0 bpw @ 262k, same ~2.5 GiB moved off GPU 0 in every
+row. Decode tok/s, greedy (`bench.py --temperature 0`), mean of two runs; run-to-run
+noise is still ±5 %:
+
+| | short | 115k |
+| --- | --- | --- |
+| stock-style tail split (last 10 modules on GPU 1), draft 4 + confidence 0.4 | 56.0 | 36.0 |
+| GDN-only split, MTP draft 4 (the default) | 62.0 | 38.7 |
+| GDN-only split, draft 3 | 53.4 | 41.3 |
+| **GDN-only split, draft 4 + confidence 0.4** | **60.8** | **40.5** |
+
+With default sampling, three runs each, the draft settings compare the same way:
+draft 4 gives 52.8 / 37.0 and draft 4 + confidence 0.4 gives 54.5 / 43.7. Draft
+lengths 2, 5 and 6 were slower at 115k (39.7, 34.8, 38.1). Draft 7 with confidence
+0.4 was the fastest on short prompts (59.4) but did not survive a 115k prefill on
+this budget.
+
+Every block moved costs speed: GeForce cards have no peer-to-peer path, so each
+hand-over between cards goes through system RAM, and the small card runs its layers
+at a fraction of the big one's compute (prefill roughly halves). On 2.0 bpw, moving
+3 blocks cost 5 % of short-context decode; 12 blocks cost 30 %. That is why the plan
+moves only as much as GPU 0's budget needs.
+
+Past the native 262144 the model needs YaRN, and on this pair more context means
+more layers on the slow card: 384k (39 layers moved) decoded 36.8 tok/s on a
+*short* prompt, and the measured costs — about 0.47 ms per moved layer plus 0.047
+ms per 1k tokens in context, per token — put the ceiling for 30 tok/s at a full
+window near 290k. Not worth YaRN's cost to short-text quality, so the kit stays native.
+
 ---
 
 ## Chat with the model
@@ -493,6 +580,80 @@ says images are on. Video is not supported.
 Defaults: temperature 0.6, top-p 0.95, top-k 20, thinking on. One request at a time;
 extras queue.
 
+### Any other Anthropic client
+
+The same server, on the same port, also speaks the **Anthropic Messages API**. That
+is the format Claude Code, Cline, Continue, Zed and OpenCode talk, and it is not a
+second engine: `POST /v1/messages` is translated onto the request the OpenAI path
+already uses, generation runs once, and the reply is translated back into Anthropic
+content blocks. Nothing needs enabling.
+
+| | |
+| --- | --- |
+| Base URL | `http://127.0.0.1:8888` — **without** `/v1`. The SDKs append `/v1/messages` themselves. |
+| API key | `local` (ignored). `x-api-key` and `Authorization: Bearer` are both accepted. |
+| Model id | the same `MODEL_ID` as above — `GET /v1/models` answers in the Anthropic shape when the request carries `anthropic-version` (every Anthropic client sends it), and in the OpenAI shape otherwise. |
+| Version header | not required. `anthropic-version` is accepted and only used to pick that shape. |
+| `anthropic-beta` | ignored entirely — Claude Code sends beta values that appear in no public list, and rejecting them would break the client. |
+
+Supported: streaming and non-streaming; `system` as a string or as blocks; tools and
+`tool_choice` of `auto`, `any`, `tool`, `none` (plus `disable_parallel_tool_use`,
+which is enforced by keeping only the first call); `tool_result` blocks, including
+images inside them; `thinking` of `enabled`, `adaptive` or `disabled`, with
+`display: "omitted"` honoured; images as base64 or URL sources; `stop_sequences`;
+`temperature`/`top_p`/`top_k`; `output_config.effort`; `POST /v1/messages/count_tokens`
+(counted with the same template generation uses, so it is the real number, not an
+estimate); mid-conversation `role: "system"` messages, which Claude Code sends — their
+text is folded into the one system message the chat template accepts.
+
+Not supported, and refused with a `400` that names the block rather than dropping it
+silently: `document` (PDF) blocks, the Files API (`image` with a `file` source), and
+server-side tools such as `web_search`. Prompt caching is not implemented — the
+`cache_*` usage fields are simply not reported, and `cache_control` markers are
+ignored. `context_management` edits are ignored too, so a session that relies on them
+to stay small will instead grow.
+
+**Thinking is on by default here**, as it is on `/v1` — a client that does not ask
+either way gets a `thinking` block next to the text. Send
+`"thinking": {"type": "disabled"}` to turn it off, exactly as the API specifies.
+
+Claude Code, pointed at the kit:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8888
+export ANTHROPIC_AUTH_TOKEN=local
+export ANTHROPIC_MODEL=qwen3.8-27b-exl3-2.5bpw     # the MODEL_ID from .env
+claude
+```
+
+It warns that the model is not in its catalog (`unrecognized_model`) — expected, and
+harmless. Claude Code assumes a 200k window; set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to
+your `CONTEXT_SIZE` if yours is smaller, so it compacts at the right point.
+
+Anything else that speaks the Messages API — the Python/TypeScript SDKs, Cline,
+Continue — works too:
+
+```bash
+curl http://127.0.0.1:8888/v1/messages \
+  -H "x-api-key: local" -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.8-27b-exl3-2.5bpw",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "What is the weather in Tel Aviv?"}],
+    "tools": [{
+      "name": "get_weather",
+      "description": "Current weather for a city",
+      "input_schema": {"type": "object", "properties": {"city": {"type": "string"}},
+                       "required": ["city"]}
+    }]
+  }'
+```
+
+`max_tokens` is required, as it is on the real API. The reply's `stop_reason` is
+`tool_use` when the model called something; send the assistant turn back untouched
+and answer it with a `tool_result` block.
+
 ### Cherry Studio (optional, off by default)
 
 The kit used to ship [Cherry Studio](https://github.com/CherryHQ/cherry-studio) as
@@ -617,8 +778,8 @@ fine. The ones you are most likely to touch:
 | `CACHE_QUANT` | set by setup | `4` (int4), `8,4`, `none`, or `k,v` |
 | `GPU_MEM_GB` | set by setup | the process's VRAM budget |
 | `VISION` | `auto` | `off` to skip the vision tower |
-| `PORT` | `8888` | the OpenAI API port |
-| `HOST` | `0.0.0.0` | set to `127.0.0.1` to keep `/v1` off your network |
+| `PORT` | `8888` | the API port (both OpenAI and Anthropic) |
+| `HOST` | `0.0.0.0` | set to `127.0.0.1` to keep the APIs off your network |
 | `UI` | `browser` | `browser`, `server`, or `no` |
 | `SIMPLEX_HARNESS_PORT` | `3080` | the chat UI's port. Do **not** set `DSH_PORT` in `.env` — current dsh treats that key in a file as fatal and the harness never binds |
 | `DRAFT` | `mtp` | `none` turns off speculative decoding |

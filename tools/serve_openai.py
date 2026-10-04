@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Minimal OpenAI-compatible server for the EXL3 serving target.
+Minimal OpenAI- and Anthropic-compatible server for the EXL3 serving target.
 
 Drafter: MTP by default (`-dm mtp`; the draft head lives inside the target
 checkpoint, so there are no separate draft weights to download). Alternative:
@@ -17,13 +17,25 @@ downscaled to --image_max_pixels first (1 MP ~ 1024 prompt tokens). If the
 tower does not fit under the VRAM cap the server keeps running text-only.
 
 Endpoints:
-  GET  /                      built-in chat UI (--ui off to disable)
-  GET  /v1/models
+  GET  /                      landing page: where the APIs and the harness are
+  GET  /v1/models             one model; OpenAI shape, or Anthropic shape when
+                              the request carries `anthropic-version`
+  GET  /v1/models/{id}        the same, for one id
   GET  /health
-  POST /v1/chat/completions   (stream and non-stream, tool calling)
+  POST /v1/chat/completions   OpenAI: stream and non-stream, tool calling
+  POST /v1/messages           Anthropic Messages API: stream and non-stream
+  POST /v1/messages/count_tokens
 
 `stream_options: {"include_usage": true}` adds a final chunk carrying the
 token counts, which is how the built-in UI reports tokens/second.
+
+Anthropic clients (Claude Code, Cline, Continue, Zed, the Anthropic SDKs) are
+served by this same process on the same port. POST /v1/messages is a
+translation layer, not a second engine: the request is converted to the
+OpenAI-shaped body below, generation runs once, and the result is converted
+back into Anthropic content blocks (`text`, `thinking`, `tool_use`) and
+Anthropic SSE events. No API key is needed; `x-api-key` is accepted and
+ignored, and `anthropic-version` only selects the /v1/models shape.
 
 Defaults match the serving convention: temperature 0.6, top-k 20, top-p 0.95,
 thinking enabled (reasoning arrives inline in `<think>`), speculative
@@ -47,7 +59,7 @@ Launch (from repo root; 16 GB NVIDIA recipe):
   .venv/bin/python tools/serve_openai.py \
       -m models/Qwen3.8-27B-EXL3-2.0bpw -gs 14.7 -cs 199936 -cq 8,4 --port 8888
 """
-import argparse, asyncio, json, os, re, sys, time, threading, uuid
+import argparse, asyncio, base64, json, math, os, re, sys, time, threading, uuid
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aiohttp import web
 
@@ -88,6 +100,7 @@ def _result_new_tokens(r):
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
 HOLD_BACK = 16                       # marker-safe holdback for streamed text
+THINK_CLOSE = "</think>"             # where the Qwen template puts the reasoning/reply seam
 
 
 class _DropTritonRemarks:
@@ -197,31 +210,148 @@ def _quiet_triton():
     threading.Thread(target = pump, daemon = True, name = "quiet-triton").start()
 
 
-def _cap_process_vram(gb):
-    """Hard-cap this process to `gb` GiB so a large unified-memory box
-    behaves like a discrete card with that much free VRAM. ExLlama lifts
-    the CUDA fraction after autosplit; pin it back to the same cap."""
+def parse_split(s):
+    """GPU_MEM_GB / --grid_size: one budget ("14.7") or one per GPU ("14.9,7.2")."""
+    return [float(x) for x in str(s).replace(" ", "").split(",") if x]
+
+
+def _cap_process_vram(budgets):
+    """Hard-cap this process to budgets[i] GiB on GPU i, so a large
+    unified-memory box behaves like a discrete card with that much free VRAM.
+    ExLlama lifts the CUDA fraction after autosplit; pin it back to the cap."""
     import torch
     from exllamav3.util import memory as _mem
     torch.cuda.init()
-    total = torch.cuda.get_device_properties(0).total_memory
-    cap_bytes = int(float(gb) * 1024 ** 3)
-    frac = min(max(cap_bytes / total, 0.01), 1.0)
+    frac = {}
+    for i, gb in enumerate(budgets):
+        total = torch.cuda.get_device_properties(i).total_memory
+        frac[i] = min(max(int(gb * 1024 ** 3) / total, 0.01), 1.0)
+        print(f" == VRAM cap GPU {i} ({torch.cuda.get_device_name(i)}): {gb} GB "
+              f"(fraction {frac[i]:.4f} of {total / 1024**3:.1f} GB)", flush = True)
 
     def _pin(devices=None):
-        for i in (devices if devices is not None else [0]):
-            torch.cuda.set_per_process_memory_fraction(frac, device = i)
+        for i in (devices if devices is not None else frac):
+            if i in frac:
+                torch.cuda.set_per_process_memory_fraction(frac[i], device = i)
 
     _pin()
     _mem.set_memory_fraction_use = lambda use, device: _pin([device])
     _mem.set_memory_fraction_reserve = lambda reserve, device: _pin([device])
     _mem.unset_memory_fraction = lambda active: _pin(active)
-    print(f" == VRAM cap: {gb} GB "
-          f"({cap_bytes / 1024**3:.2f} GiB, fraction {frac:.4f} of "
-          f"{total / 1024**3:.1f} GB device)", flush = True)
 
 
-def build_model(argv, use_draft = True):
+# Two-GPU placement. exllamav3's layer split fills GPU 0 in order and puts
+# whatever is left - the last layers, their KV cache and the 248k-vocab output
+# head - on GPU 1. On an unequal pair (RTX 5080 + RTX 3050: ~960 vs ~224 GB/s)
+# that is the worst choice: decode reads every weight and, at long context,
+# every KV page (dequantized to fp16, several times its stored size) once per
+# forward. So the slow card gets only linear-attention (GDN) blocks, which hold
+# no KV; full-attention blocks, their cache and lm_head stay on the fast one.
+# OFFLOAD["layers"]: None = size the offload to fit GPU 0's budget, N = offload
+# exactly N GDN blocks. See README "Two GPUs" for the measurements.
+# Headroom kept free on each card beyond weights + KV (GiB), measured at load and
+# through a full-context prefill on 3.0 bpw: GPU 0 needs CUDA workspace plus one
+# attention layer's KV dequantized to fp16 (CacheLayer_quant.get_kv allocates the
+# whole cache's shape, 4 KiB/token: 1 GiB at 262k), GPU 1 the vision tower and
+# its own prefill workspace (1.5 GiB in use at idle; 1.6 ran out on a 115k prompt).
+OFFLOAD = {"layers": None, "reserve0_gb": 1.8, "reserve1_gb": 2.2}
+
+
+def _plan_offload(model, budgets, want):
+    """Module index -> device for a two-GPU text model: GDN blocks to GPU 1,
+    taken as whole runs of three (one GPU hop each way per run), from the end."""
+    import torch
+    blocks = [(i, m) for i, m in enumerate(model.modules)
+              if type(m).__name__ == "TransformerBlock"]
+    has_kv = lambda m: any(sm.caps.get("kv_cache") for sm in m)
+    stc = model.config.stc
+    gib = lambda b: b / 1024 ** 3
+    wsize = {i: gib(sum(stc.get_tensor_sizes(m.key))) for i, m in enumerate(model.modules)
+             if not m.caps.get("prefer_cpu")}
+    kv, deq = 0.0, 0.0
+    for _, m in blocks:
+        for sm in m:
+            for cl in getattr(sm, "cache_layers", None) or []:
+                kv += gib(cl.storage_size() + cl.overhead_size())
+                if getattr(cl, "shape", None):
+                    deq = max(deq, gib(2 * 2 * math.prod(cl.shape)))   # fp16 K + V
+    # GPU 0 already holds the MTP head and its cache (loaded first).
+    free0 = budgets[0] - gib(torch.cuda.memory_reserved(0)) - OFFLOAD["reserve0_gb"] - deq
+    free1 = budgets[1] - OFFLOAD["reserve1_gb"]
+    need0 = sum(wsize.values()) + kv
+    gdn = [i for i, m in reversed(blocks) if not has_kv(m)]
+    if want is None:
+        n, excess = 0, need0 - free0
+        while excess > 0 and n < len(gdn):
+            excess -= wsize[gdn[n]]
+            n += 1
+        if excess > 0:
+            raise RuntimeError(
+                f"CONTEXT_SIZE does not fit: KV cache {kv:.2f} GiB leaves GPU 0 "
+                f"{excess:.2f} GiB short even with every linear-attention block on "
+                f"GPU 1. Lower CONTEXT_SIZE.")
+    else:
+        n = min(int(want), len(gdn))
+    moved = sorted(gdn[:n])
+    on1 = sum(wsize[i] for i in moved)
+    print(f" == split plan: weights {sum(wsize.values()):.2f} GiB + KV {kv:.2f} GiB, "
+          f"GPU 0 room {free0:.2f} GiB -> {n} GDN blocks ({on1:.2f} GiB) to GPU 1", flush = True)
+    if on1 > free1:
+        raise RuntimeError(
+            f"CONTEXT_SIZE does not fit: GPU 1 would need {on1:.2f} GiB of layers "
+            f"but has room for {free1:.2f} GiB. Lower CONTEXT_SIZE.")
+    return {i: 1 for i in moved}
+
+
+def _install_offload_loader(budgets):
+    """Wrap exllamav3's layer-split loader so the text model follows
+    _plan_offload(). The stock measuring loop still runs (it allocates each
+    block's KV and does a reference forward per block, so an OOM surfaces at
+    load time); only its device choice is replaced. A block that still does
+    not fit on GPU 0 makes the loop spill everything after it to GPU 1, the
+    stock behaviour, and is reported."""
+    from exllamav3.model import model_ls
+    orig = model_ls.Model_LSMixin._load_autosplit
+
+    class _Planned(list):
+        # active_devices[current_device_i]: 0 = "no OOM yet" -> the plan's pick
+        def __getitem__(self, i):
+            if isinstance(i, int) and i == 0:
+                return self.plan.get(self.cur, 0)
+            return list.__getitem__(self, i)
+
+    def patched(self, progressbar, reserve_per_device, use_per_device, active_devices,
+                max_chunk_size, max_output_size, max_output_factor, callback_sync,
+                *rest):
+        if getattr(self, "component", "text") != "text" or list(active_devices) != [0, 1]:
+            yield from orig(self, progressbar, reserve_per_device, use_per_device,
+                            active_devices, max_chunk_size, max_output_size,
+                            max_output_factor, callback_sync, *rest)
+            return
+        dev = _Planned([0, 1])
+        dev.plan, dev.cur = _plan_offload(self, budgets, OFFLOAD["layers"]), 0
+
+        def track(idx, n):
+            dev.cur = idx
+            if callback_sync:
+                callback_sync(idx, n)
+
+        yield from orig(self, progressbar, reserve_per_device, use_per_device, dev,
+                        max_chunk_size, max_output_size, max_output_factor, track, *rest)
+        self.active_devices = [0, 1]
+        where = [str(m.device.index) if m.device is not None and m.device.type == "cuda" else "c"
+                 for m in self.modules]
+        spilled = [i for i, m in enumerate(self.modules)
+                   if where[i] == "1" and i not in dev.plan]
+        print(f" == layer map (c=cpu): {''.join(where)}", flush = True)
+        if spilled:
+            print(f" !! {len(spilled)} modules did not fit GPU 0 and spilled to GPU 1 "
+                  f"(lower CONTEXT_SIZE or raise GPU_OFFLOAD_LAYERS)", flush = True)
+
+    model_ls.Model_LSMixin._load_autosplit = patched
+
+
+def build_model(argv, use_draft = True, draft_kw = None):
     from argparse import ArgumentParser
 
     # The one-time JIT build of the CUDA extension can look like a hang;
@@ -251,7 +381,9 @@ def build_model(argv, use_draft = True):
             draft_model = draft_model, draft_cache = draft_cache,
             # num_draft_tokens defaults to the draft model's arch-declared
             # default_draft_size (MTP head: 4). Must
-            # match model_init's max_history sizing, which reads the same caps.
+            # match model_init's max_history sizing, which reads the same caps
+            # - so an override goes to both (-ndt in argv, and here).
+            **(draft_kw or {}),
         )
     else:
         model, config, cache, tokenizer = model_init.init(args, progress = True)
@@ -259,9 +391,11 @@ def build_model(argv, use_draft = True):
     return generator, tokenizer, config
 
 
-def load_vision(config, max_pixels):
+def load_vision(config, max_pixels, device = 0):
     """Load the checkpoint's vision tower (Qwen3.8: 27 layers, 3-bit, ~0.3 GB)
-    after the text model. Never fatal: on failure the server stays text-only."""
+    after the text model. Never fatal: on failure the server stays text-only.
+    With two GPUs it goes on the second: it only runs while a picture is
+    encoded, so it should not take room from the fast card's KV cache."""
     vision["max_pixels"] = int(max_pixels)
     if not getattr(config, "vision", None):
         vision["reason"] = "checkpoint has no vision tower"
@@ -275,7 +409,7 @@ def load_vision(config, max_pixels):
     try:
         from exllamav3 import Model
         vm = Model.from_config(config, component = "vision")
-        vm.load(progressbar = True)
+        vm.load(device = f"cuda:{device}", progressbar = True)
         vision["model"] = vm
         vision["reason"] = "ok"
         return vm
@@ -562,57 +696,149 @@ def template_effort(tokenizer, effort):
     return {"reasoning_effort": want} if want in levels else {}
 
 
+def apply_tool_choice(messages, tools, tool_choice):
+    """tool_choice -> (messages, tools) with any forced-choice nudge applied.
+
+    Counted as part of the prompt: counting tokens on the untouched history
+    would price a different prompt than the one that gets generated."""
+    tools, directive = tool_choice_directive(tool_choice, tools)
+    if not directive:
+        return messages, tools
+    messages = list(messages)
+    if messages and messages[0].get("role") == "system":
+        # Qwen template allows only ONE leading system message — merge
+        first = dict(messages[0])
+        c = first.get("content") or ""
+        if isinstance(c, list):          # content parts (multimodal-style clients)
+            first["content"] = list(c) + [{"type": "text", "text": "\n\n" + directive}]
+        else:
+            first["content"] = c.rstrip() + "\n\n" + directive
+        messages[0] = first
+    else:
+        messages = [{"role": "system", "content": directive}] + messages
+    return messages, tools
+
+
+def build_inputs(tokenizer, messages, tools, enable_thinking, reasoning_effort):
+    """History -> (input_ids, image embeddings or None).
+
+    The one place a prompt is rendered, so generation and token counting
+    cannot drift apart. Images are embedded through the vision tower first and
+    their placeholder slots replaced by the embedding's own text alias."""
+    messages, image_urls = extract_images(messages)
+    if not image_urls:
+        return tokenizer.hf_chat_template(
+            messages, add_generation_prompt = True,
+            enable_thinking = enable_thinking, tools = tools,
+            **template_effort(tokenizer, reasoning_effort)), None
+    vm = vision["model"]
+    if vm is None:
+        raise ValueError(f"this server is running text-only ({vision['reason']}); "
+                         "remove the image or restart with VISION=auto")
+    images = [decode_image(u) for u in image_urls]
+    # GPU work: keep it out of the way of a running generation.
+    with gen_lock:
+        embeddings = [vm.get_image_embeddings(tokenizer = tokenizer, image = img)
+                      for img in images]
+    rendered = tokenizer.hf_render_chat_template(
+        messages, add_generation_prompt = True,
+        enable_thinking = enable_thinking, tools = tools,
+        **template_effort(tokenizer, reasoning_effort))
+    n = rendered.count(IMAGE_TRIPLE)
+    if n != len(embeddings):
+        raise ValueError(f"chat template rendered {n} image slot(s) for "
+                         f"{len(embeddings)} image(s)")
+    for e in embeddings:   # alias -> <|vision_start|> + N image tokens + <|vision_end|>
+        rendered = rendered.replace(IMAGE_TRIPLE, e.text_alias, 1)
+    return tokenizer.encode(rendered, encode_special_tokens = True,
+                            embeddings = embeddings), embeddings
+
+
+class StreamSplitter:
+    """Raw generated text -> ("reasoning"|"content"|"call", payload) events.
+
+    The model emits reasoning, reply and tool calls in one undelimited stream:
+    generation starts inside `<think>` when thinking is on, calls arrive as XML
+    in the middle of the text, and `<tool_call>` can span chunk boundaries.
+    Both wire formats need the same three answers out of it, so the parsing -
+    including the holdback that keeps a half-arrived marker out of the reply -
+    lives here once and each protocol renders the events in its own shape.
+
+    Feed chunks with feed(); feed(final = True) releases the holdback."""
+    def __init__(self, enable_thinking, schemas = None):
+        self.pending = ""
+        # With thinking on the template ends the prompt with "<think>" and
+        # generation starts inside it. With thinking off it emits an empty
+        # "<think></think>" pair instead, so the first token is already the
+        # answer - starting in_think True there would swallow the reply into a
+        # reasoning block nobody asked for.
+        self.in_think = bool(enable_thinking)
+        self.schemas = schemas or None
+
+    def feed(self, chunk = "", final = False):
+        self.pending += chunk
+        while True:
+            if self.in_think:
+                close = self.pending.find(THINK_CLOSE)
+                if close >= 0:
+                    head = self.pending[:close]
+                    self.pending = self.pending[close + len(THINK_CLOSE):]
+                    if head.strip():
+                        yield ("reasoning", head.lstrip("\n"))
+                    self.in_think = False
+                    continue
+                cut = len(self.pending) if final else max(0, len(self.pending) - HOLD_BACK)
+                piece, self.pending = self.pending[:cut], self.pending[cut:]
+                # `if piece`, not `if piece.strip()`: a chunk that is nothing
+                # but whitespace is still part of the reasoning, and dropping
+                # it silently glues the words around it together.
+                if piece:
+                    yield ("reasoning", piece)
+                return
+            if TOOL_CALL_OPEN in self.pending:
+                head, rest = self.pending.split(TOOL_CALL_OPEN, 1)
+                if head.strip() or (final and head):
+                    yield ("content", head)
+                if TOOL_CALL_CLOSE in rest:
+                    block, self.pending = rest.split(TOOL_CALL_CLOSE, 1)
+                    _, calls = parse_tool_calls(
+                        TOOL_CALL_OPEN + block + TOOL_CALL_CLOSE, self.schemas)
+                    for c in calls:
+                        yield ("call", c)
+                    continue
+                # unterminated call: final -> implicit close, else hold
+                if final and "<function=" in rest:
+                    _, calls = parse_tool_calls(TOOL_CALL_OPEN + rest, self.schemas)
+                    for c in calls:
+                        yield ("call", c)
+                    self.pending = ""
+                else:
+                    self.pending = TOOL_CALL_OPEN + rest
+                return
+            cut = len(self.pending) if final else max(0, len(self.pending) - HOLD_BACK)
+            piece, self.pending = self.pending[:cut], self.pending[cut:]
+            if piece:
+                yield ("content", piece)
+            return
+
+
 def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                   top_p, top_k, seed, tools, tool_choice = None, stop = None,
                   on_text = None, enable_thinking = True, should_stop = None,
-                  reasoning_effort = None):
+                  reasoning_effort = None, on_prompt = None):
     """Blocking generation; returns (text, tool_calls, finish, p_toks, o_toks,
-    reasoning, content)."""
+    reasoning, content).
+
+    on_prompt is called once with the prompt token count, before the first
+    token: a streaming client that reports input tokens in its opening frame
+    has no other way to know them."""
     schemas = build_tool_schemas(tools)
-    tools, directive = tool_choice_directive(tool_choice, tools)
-    if directive:
-        messages = list(messages)
-        if messages and messages[0].get("role") == "system":
-            # Qwen template allows only ONE leading system message — merge
-            first = dict(messages[0])
-            c = first.get("content") or ""
-            if isinstance(c, list):      # content parts (multimodal-style clients)
-                first["content"] = list(c) + [{"type": "text", "text": "\n\n" + directive}]
-            else:
-                first["content"] = c.rstrip() + "\n\n" + directive
-            messages[0] = first
-        else:
-            messages = [{"role": "system", "content": directive}] + messages
-    messages, image_urls = extract_images(messages)
-    embeddings = None
-    if image_urls:
-        vm = vision["model"]
-        if vm is None:
-            raise ValueError(f"this server is running text-only ({vision['reason']}); "
-                             "remove the image or restart with VISION=auto")
-        images = [decode_image(u) for u in image_urls]
-        # GPU work: keep it out of the way of a running generation.
-        with gen_lock:
-            embeddings = [vm.get_image_embeddings(tokenizer = tokenizer, image = img)
-                          for img in images]
-        rendered = tokenizer.hf_render_chat_template(
-            messages, add_generation_prompt = True,
-            enable_thinking = enable_thinking, tools = tools,
-            **template_effort(tokenizer, reasoning_effort))
-        n = rendered.count(IMAGE_TRIPLE)
-        if n != len(embeddings):
-            raise ValueError(f"chat template rendered {n} image slot(s) for "
-                             f"{len(embeddings)} image(s)")
-        for e in embeddings:   # alias -> <|vision_start|> + N image tokens + <|vision_end|>
-            rendered = rendered.replace(IMAGE_TRIPLE, e.text_alias, 1)
-        input_ids = tokenizer.encode(rendered, encode_special_tokens = True,
-                                     embeddings = embeddings)
-    else:
-        input_ids = tokenizer.hf_chat_template(
-            messages, add_generation_prompt = True,
-            enable_thinking = enable_thinking, tools = tools,
-            **template_effort(tokenizer, reasoning_effort))
+    messages, tools = apply_tool_choice(messages, tools, tool_choice)
+    input_ids, embeddings = build_inputs(tokenizer, messages, tools,
+                                         enable_thinking, reasoning_effort)
     prompt_toks = int(input_ids.shape[-1])
+    if on_prompt is not None:
+        on_prompt(prompt_toks)
     from exllamav3.generator.sampler.presets import ComboSampler
     from exllamav3 import Job
     forced_choice = tool_choice not in (None, "auto", "none")
@@ -713,6 +939,11 @@ async def models(request):
         "input_modalities": ["text", "image"] if vision["model"] else ["text"],
         "output_modalities": ["text"],
     }
+    # One row, two envelopes. An Anthropic client asking what is loaded gets
+    # the Anthropic one; everything else gets the OpenAI one - including
+    # tools/dsh.py, which reads this row to configure the harness.
+    if wants_anthropic(request):
+        return anthropic_json(anthropic_model_list(row))
     return web.json_response({"object": "list", "data": [row]})
 
 
@@ -775,6 +1006,42 @@ def parse_request(body):
     ), None
 
 
+async def run_generation(req, generator, tokenizer):
+    """One non-streaming request, run off the event loop.
+
+    Returns (result, error): a failed prompt is a 400, not a 500 - the cache
+    and the context are the two things a caller can actually do something
+    about - while anything else keeps propagating."""
+    try:
+        return await asyncio.to_thread(
+            generate_full, generator, tokenizer, req["messages"],
+            req["max_tokens"], req["temperature"], req["top_p"], req["top_k"],
+            req["seed"], req["tools"], req["tool_choice"], req["stop"],
+            None, req["enable_thinking"], None,
+            req["reasoning_effort"]), None
+    except AssertionError as e:
+        return None, f"context/cache: {e}"
+    except ValueError as e:
+        return None, str(e)
+
+
+async def client_watcher(request, gone):
+    """A reply that is still in prefill writes nothing, so a failed write would
+    never notice the browser had gone. Watch the socket instead.
+
+    `gone` is what the worker thread polls, so this is also the only path by
+    which the Stop button reaches the GPU. Both protocols use it."""
+    try:
+        while not gone.is_set():
+            transport = request.transport
+            if transport is None or transport.is_closing():
+                gone.set()
+                return
+            await asyncio.sleep(0.2)
+    except asyncio.CancelledError:
+        pass
+
+
 async def chat_completions(request):
     app = request.app
     generator, tokenizer = app["generator"], app["tokenizer"]
@@ -795,23 +1062,13 @@ async def chat_completions(request):
     if err:
         return web.json_response({"error": {"message": err}}, status = 400)
 
-    import asyncio
     if not req["stream"]:
-        try:
-            text, calls, finish, ptoks, otoks, reasoning, content = await asyncio.to_thread(
-                generate_full, generator, tokenizer, req["messages"],
-                req["max_tokens"], req["temperature"], req["top_p"], req["top_k"],
-                req["seed"], req["tools"], req["tool_choice"], req["stop"],
-                None, req["enable_thinking"], None,
-                req["reasoning_effort"])
-        except AssertionError as e:
+        result, err = await run_generation(req, generator, tokenizer)
+        if err:
             return web.json_response(
-                {"error": {"message": f"context/cache: {e}", "type": "invalid_request_error"}},
+                {"error": {"message": err, "type": "invalid_request_error"}},
                 status = 400)
-        except ValueError as e:
-            return web.json_response(
-                {"error": {"message": str(e), "type": "invalid_request_error"}},
-                status = 400)
+        text, calls, finish, ptoks, otoks, reasoning, content = result
         msg = {"role": "assistant", "content": content or None}
         if reasoning:
             msg["reasoning_content"] = reasoning
@@ -852,7 +1109,10 @@ async def chat_completions(request):
 
         def worker():
             try:
-                text, calls, finish, ptoks, otoks, reasoning, content = generate_full(
+                # generate_full's own tuple goes on the queue unrepacked: both
+                # protocols unpack it the same way, so neither can agree with a
+                # reordering the other never made.
+                result = generate_full(
                     generator, tokenizer, req["messages"], req["max_tokens"],
                     req["temperature"], req["top_p"], req["top_k"],
                     req["seed"], req["tools"], req["tool_choice"], req["stop"],
@@ -860,9 +1120,7 @@ async def chat_completions(request):
                     enable_thinking = req["enable_thinking"],
                     reasoning_effort = req["reasoning_effort"],
                     should_stop = gone.is_set)
-                loop.call_soon_threadsafe(
-                    queue.put_nowait,
-                    ("done", (calls, finish, reasoning, content, ptoks, otoks)))
+                loop.call_soon_threadsafe(queue.put_nowait, ("done", result))
             except Exception as e:
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
         loop.run_in_executor(None, worker)
@@ -878,15 +1136,9 @@ async def chat_completions(request):
                 gone.set()          # tell the GPU, not just the event loop
                 raise
 
-        pending, finish, calls_emitted = "", None, False
+        finish, calls_emitted = None, False
         call_idx = [0]
-        # With thinking on, the template ends the prompt with "<think>" and the
-        # generation therefore starts inside it. With thinking off it emits an
-        # empty "<think></think>" pair instead, so the first token is already
-        # the answer - starting in_think True there would swallow the reply into
-        # a reasoning block nobody asked for.
-        in_think = [bool(req["enable_thinking"])]
-        THINK_CLOSE = "</think>"
+        splitter = StreamSplitter(req["enable_thinking"], req_schemas)
 
         async def send_call(c):
             nonlocal calls_emitted
@@ -894,66 +1146,18 @@ async def chat_completions(request):
             await send({"tool_calls": [dict(c, index = call_idx[0])]})
             call_idx[0] += 1
 
-        async def flush_pending(final = False):
-            """Emit everything parseable from pending; keep marker-safe tail."""
-            nonlocal pending
-            while True:
-                if in_think[0]:
-                    close = pending.find(THINK_CLOSE)
-                    if close >= 0:
-                        head, pending = pending[:close], pending[close + len(THINK_CLOSE):]
-                        if head.strip():
-                            await send({"reasoning_content": head.lstrip("\n")})
-                        in_think[0] = False
-                        continue
-                    cut = len(pending) if final else max(0, len(pending) - HOLD_BACK)
-                    piece = pending[:cut]
-                    if piece.strip():
-                        await send({"reasoning_content": piece})
-                    pending = pending[cut:]
-                    return
-                if TOOL_CALL_OPEN in pending:
-                    head, rest = pending.split(TOOL_CALL_OPEN, 1)
-                    if head.strip() or (final and head):
-                        await send({"content": head})
-                    if TOOL_CALL_CLOSE in rest:
-                        block, pending = rest.split(TOOL_CALL_CLOSE, 1)
-                        _, calls = parse_tool_calls(
-                            TOOL_CALL_OPEN + block + TOOL_CALL_CLOSE,
-                            req_schemas)
-                        for c in calls:
-                            await send_call(c)
-                        continue
-                    # unterminated call: final -> implicit close, else hold
-                    if final and "<function=" in rest:
-                        _, calls = parse_tool_calls(TOOL_CALL_OPEN + rest,
-                                                    req_schemas)
-                        for c in calls:
-                            await send_call(c)
-                        pending = ""
-                    else:
-                        pending = TOOL_CALL_OPEN + rest
-                    return
-                cut = len(pending) if final else max(0, len(pending) - HOLD_BACK)
-                await send({"content": pending[:cut]})
-                pending = pending[cut:]
-                return
-
-        async def watch_client():
-            """A reply that is still in prefill writes nothing, so a failed
-            write would never notice the browser had gone. Watch the socket."""
-            try:
-                while not gone.is_set():
-                    transport = request.transport
-                    if transport is None or transport.is_closing():
-                        gone.set()
-                        return
-                    await asyncio.sleep(0.2)
-            except asyncio.CancelledError:
-                pass
+        async def flush_pending(chunk = "", final = False):
+            """Render what the splitter can parse; it holds back the tail that
+            might still be half a marker."""
+            for kind, payload in splitter.feed(chunk, final = final):
+                if kind == "call":
+                    await send_call(payload)
+                elif kind == "reasoning":
+                    await send({"reasoning_content": payload})
+                else:
+                    await send({"content": payload})
 
         async def consume():
-            nonlocal pending            # flush_pending owns it too
             while True:
                 kind, payload = await queue.get()
                 if kind == "error":
@@ -961,10 +1165,9 @@ async def chat_completions(request):
                         f'data: {json.dumps({"error": {"message": payload}})}\n\n'.encode())
                     break
                 if kind == "delta":
-                    pending += payload
-                    await flush_pending()
+                    await flush_pending(payload)
                 elif kind == "done":
-                    calls, finish, reasoning, content, ptoks, otoks = payload
+                    _text, calls, finish, ptoks, otoks, reasoning, content = payload
                     await flush_pending(final = True)
                     if forced_choice:
                         # Buffered path (no deltas were streamed): emit the
@@ -989,7 +1192,7 @@ async def chat_completions(request):
                     break
             await resp.write_eof()
 
-        watcher = asyncio.ensure_future(watch_client())
+        watcher = asyncio.ensure_future(client_watcher(request, gone))
         try:
             await consume()
         finally:
@@ -1001,6 +1204,649 @@ async def chat_completions(request):
         # the client went away mid-write; `gone` has already told the worker
         pass
     return resp
+
+
+# ---------------------------------------------------------------------------
+# Anthropic Messages API
+#
+# The same model on the same port, in a second wire format. Claude Code,
+# Cline, Continue, Zed and the Anthropic SDKs speak the Messages API, not Chat
+# Completions. This is a translation layer rather than a second engine: the
+# request is converted to the OpenAI-shaped body parse_request() already
+# validates, generation runs once, and the result is converted back into
+# Anthropic content blocks - and, when asked for, Anthropic SSE events.
+#
+# What a strict client checks was read off the client, not guessed at. From
+# anthropic-sdk-python 1.7.0: every frame must carry an `event:` line (its SSE
+# reader dispatches on the event name, not on the JSON), message_start must be
+# first, message_start.message.usage must carry input_tokens *and*
+# output_tokens, message_delta.usage must carry output_tokens, every thinking
+# block needs a signature, and content_block_stop must arrive for each index
+# that was opened.
+#
+# No authentication is invented here. `x-api-key` and `Authorization: Bearer`
+# are accepted and ignored, exactly as /v1 ignores them, and
+# `anthropic-version` is not required - it only selects the /v1/models shape.
+ANTHROPIC_VERSION = "2023-06-01"
+
+# finish_reason -> stop_reason. Anthropic's enum is closed; these are the
+# members this engine can produce. A stop of ours that matches a caller's
+# stop_sequence is reported as end_turn: the engine does not say which of the
+# job's stop conditions fired, and guessing would be worse than the plain
+# answer. stop_sequence stays null to match.
+_STOP_REASONS = {"tool_calls": "tool_use", "length": "max_tokens",
+                 "content_filter": "refusal", "stop": "end_turn"}
+
+
+class _Unsupported(Exception):
+    """A request asks for something this server cannot render."""
+
+
+def _request_id():
+    return f"req_{uuid.uuid4().hex[:24]}"
+
+
+def anthropic_json(payload, status = 200):
+    """A reply in the Anthropic shape, with the request id Anthropic always
+    sends - the SDKs keep it as `_request_id` and prompts to quote it."""
+    return web.json_response(payload, status = status,
+                             headers = {"request-id": _request_id()})
+
+
+def anthropic_error(message, etype = "invalid_request_error", status = 400):
+    """The Anthropic error envelope, which is not the OpenAI one. The request
+    id is in the body too, which is where it gets pasted from."""
+    rid = _request_id()
+    return web.json_response(
+        {"type": "error", "error": {"type": etype, "message": message},
+         "request_id": rid},
+        status = status, headers = {"request-id": rid})
+
+
+def _anth_signature():
+    """A stand-in for the signature Anthropic puts on a thinking block.
+
+    The field is opaque - clients store it and hand it back verbatim, and the
+    SDK models it as a required plain string - so a value of the right shape is
+    all a client can check. Nothing verifies it here: thinking blocks in the
+    history are rendered back to the model as its own reasoning rather than
+    checked against this."""
+    return base64.b64encode(os.urandom(48)).decode("ascii")
+
+
+def _anth_blocks(content):
+    """An Anthropic `content` -> a list of blocks. A bare string is one text
+    block, which is what the Messages API says it is shorthand for."""
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return [b for b in content if isinstance(b, dict)]
+
+
+def _anth_text_of(content):
+    """Anthropic content -> plain text (text blocks joined, others dropped)."""
+    if isinstance(content, str):
+        return content
+    return "\n".join(str(b.get("text") or "") for b in _anth_blocks(content)
+                     if b.get("type") == "text")
+
+
+def _anth_image_part(block):
+    """Anthropic image block -> an OpenAI image_url part.
+
+    Both spellings become a data: URL or an http(s) URL, which is exactly what
+    the vision path already decodes, so an attached picture needs no second
+    code path to reach the tower."""
+    src = block.get("source") or {}
+    kind = src.get("type")
+    if kind == "base64":
+        media = src.get("media_type") or "image/png"
+        return {"type": "image_url",
+                "image_url": {"url": f"data:{media};base64,{src.get('data') or ''}"}}
+    if kind == "url":
+        return {"type": "image_url", "image_url": {"url": src.get("url") or ""}}
+    raise _Unsupported(f"image source {kind!r} is not supported "
+                       "(the Files API is not served here; send base64 or a URL)")
+
+
+def _anth_tool_result_content(content):
+    """tool_result `content` -> an OpenAI tool message's content.
+
+    A result may carry images - an agent that reads a screenshot returns one -
+    and the chat template renders pictures inside <tool_response> as readily as
+    anywhere else, so they travel as content parts instead of being flattened
+    away."""
+    blocks = _anth_blocks(content)
+    if not blocks:
+        return ""
+    if all(b.get("type") == "text" for b in blocks):
+        return _anth_text_of(blocks)
+    parts = []
+    for b in blocks:
+        if b.get("type") == "text":
+            parts.append({"type": "text", "text": str(b.get("text") or "")})
+        elif b.get("type") == "image":
+            parts.append(_anth_image_part(b))
+        else:
+            raise _Unsupported(f"{b.get('type')!r} inside a tool_result is not supported")
+    return parts
+
+
+def _anth_system(system):
+    """Top-level `system` -> one system message's text.
+
+    The Messages API has no system *role*: the prompt is a top-level field, as
+    a string or as text blocks. The Qwen template allows exactly one leading
+    system message, so several blocks are joined into it."""
+    if not system:
+        return ""
+    if isinstance(system, str):
+        return system
+    for b in _anth_blocks(system):
+        if b.get("type") != "text":
+            raise _Unsupported(f"{b.get('type')!r} in `system` is not supported")
+    return _anth_text_of(system)
+
+
+def anthropic_to_openai(body, require_max_tokens = True):
+    """Anthropic Messages request -> OpenAI chat-completions body.
+
+    Returns (body, error). The conversion stops at the same door every other
+    client goes through - parse_request() - so the two wire formats cannot
+    disagree about defaults, limits or validation."""
+    messages = body.get("messages")
+    if not messages or not isinstance(messages, list):
+        return None, "`messages` (list) is required"
+
+    max_tokens = body.get("max_tokens")
+    if max_tokens is None and require_max_tokens:
+        return None, "`max_tokens` is required"
+    if max_tokens is None:
+        max_tokens = 1024           # count_tokens never generates; any value will do
+    try:
+        max_tokens = int(max_tokens)
+    except (TypeError, ValueError):
+        return None, "`max_tokens` must be an integer"
+    if require_max_tokens and max_tokens < 1:
+        return None, "`max_tokens` must be at least 1"
+
+    try:
+        out = []
+        # The Qwen template allows exactly one system message and only at the
+        # start ("System message must be at the beginning"), but the Messages
+        # API puts the prompt in a top-level field and Claude Code adds further
+        # system messages *inside* `messages` (the mid-conversation-system
+        # beta). Their text is collected here and joined into the one system
+        # message the template will accept - as system-level instruction, not
+        # as a user turn, which would put words in the user's mouth.
+        system_parts = [_anth_system(body.get("system"))]
+        for m in messages:
+            m = m if isinstance(m, dict) else {}
+            role = m.get("role")
+            if role not in ("user", "assistant", "system"):
+                return None, f"`messages[].role` must be user or assistant (got {role!r})"
+            if role == "system":
+                system_parts.append(_anth_text_of(m.get("content")))
+                continue
+            blocks = _anth_blocks(m.get("content"))
+            if role == "assistant":
+                texts, calls, thinking = [], [], []
+                for b in blocks:
+                    t = b.get("type")
+                    if t == "text":
+                        texts.append(str(b.get("text") or ""))
+                    elif t == "thinking":
+                        thinking.append(str(b.get("thinking") or ""))
+                    elif t == "redacted_thinking":
+                        continue        # encrypted; there is nothing usable inside
+                    elif t == "tool_use":
+                        calls.append({
+                            "id": b.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                            "type": "function",
+                            "function": {"name": b.get("name"),
+                                         "arguments": json.dumps(b.get("input") or {})}})
+                    else:
+                        raise _Unsupported(f"{t!r} in an assistant turn is not supported")
+                msg = {"role": "assistant", "content": "\n".join(texts)}
+                # The template renders a `reasoning_content` on an assistant
+                # turn as that turn's <think> block, so returned thinking goes
+                # back in as the reasoning it was rather than being dropped.
+                if thinking:
+                    msg["reasoning_content"] = "\n".join(thinking)
+                if calls:
+                    msg["tool_calls"] = calls
+                out.append(msg)
+                continue
+
+            # user: tool results become their own turns, and they come first -
+            # the same order the Messages API requires of the blocks.
+            results, parts = [], []
+            for b in blocks:
+                t = b.get("type")
+                if t == "text":
+                    parts.append({"type": "text", "text": str(b.get("text") or "")})
+                elif t == "image":
+                    parts.append(_anth_image_part(b))
+                elif t == "tool_result":
+                    results.append({"role": "tool",
+                                    "tool_call_id": b.get("tool_use_id") or "",
+                                    "content": _anth_tool_result_content(b.get("content"))})
+                elif t == "thinking":
+                    continue            # only valid on an assistant turn; ignore
+                else:
+                    raise _Unsupported(f"{t!r} in a user turn is not supported")
+            out.extend(results)
+            if parts:
+                if all(p.get("type") == "text" for p in parts):
+                    out.append({"role": "user",
+                                "content": "\n".join(p["text"] for p in parts)})
+                else:
+                    out.append({"role": "user", "content": parts})
+    except _Unsupported as e:
+        return None, str(e)
+    system = "\n\n".join(p for p in system_parts if p.strip())
+    if system:
+        out.insert(0, {"role": "system", "content": system})
+
+    tools = []
+    for t in body.get("tools") or []:
+        t = t if isinstance(t, dict) else {}
+        ttype = t.get("type")
+        if ttype not in (None, "custom"):
+            return None, (f"tool type {ttype!r} is not supported - this server "
+                          "runs client tools only")
+        tools.append({"type": "function",
+                      "function": {
+                          "name": t.get("name"),
+                          "description": t.get("description") or "",
+                          "parameters": t.get("input_schema")
+                                        or {"type": "object", "properties": {}}}})
+
+    choice = body.get("tool_choice") or {}
+    if not isinstance(choice, dict):
+        choice = {}
+    ctype = choice.get("type")
+    if ctype == "any":
+        tool_choice = "required"        # "any" is Anthropic's must-call-something
+    elif ctype == "tool":
+        tool_choice = {"type": "function", "function": {"name": choice.get("name")}}
+    elif ctype == "none":
+        tool_choice = "none"
+    else:
+        tool_choice = "auto"
+
+    openai = {"model": body.get("model") or MODEL_ID,
+              "messages": out, "max_tokens": max_tokens,
+              "stream": bool(body.get("stream"))}
+    for key in ("temperature", "top_p", "top_k"):
+        if body.get(key) is not None:
+            openai[key] = body[key]
+    if body.get("stop_sequences"):
+        openai["stop"] = body["stop_sequences"]
+    if tools:
+        openai["tools"] = tools
+        openai["tool_choice"] = tool_choice
+    thinking = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
+    if thinking.get("type") == "disabled":
+        openai["chat_template_kwargs"] = {"enable_thinking": False}
+    elif thinking.get("type") in ("enabled", "adaptive"):
+        openai["chat_template_kwargs"] = {"enable_thinking": True}
+    # output_config.effort is the same request the OpenAI path spells
+    # reasoning_effort, and this model's template acts on it - so it is passed
+    # on rather than dropped.
+    effort = (body.get("output_config") or {}).get("effort") \
+        if isinstance(body.get("output_config"), dict) else None
+    if effort:
+        openai["reasoning_effort"] = effort
+    # `metadata`, `service_tier`, `cache_control`, `context_management` and
+    # unknown future fields are deliberately not forwarded: nothing here can
+    # act on them, and accepting a knob we ignore is how a caller ends up
+    # trusting it.
+    return openai, None
+
+
+def anthropic_thinking_omitted(body):
+    """`thinking.display: "omitted"` - the client wants the block and its
+    signature but not the reasoning text. Claude Code asks for this, and
+    honouring it is the difference between every later turn carrying this
+    turn's whole thought process and carrying none of it."""
+    t = body.get("thinking")
+    return bool(isinstance(t, dict) and t.get("display") == "omitted")
+
+
+def anthropic_no_parallel(body):
+    """Does the request forbid parallel tool use?
+
+    The engine cannot cap that mid-generation, so it is enforced where it can
+    be: the response keeps the first tool call and drops the rest."""
+    choice = body.get("tool_choice")
+    return bool(isinstance(choice, dict) and choice.get("disable_parallel_tool_use"))
+
+
+def anthropic_message(model_id, content, reasoning, calls, finish, ptoks, otoks,
+                      no_parallel = False, thinking_omitted = False):
+    """A finished generation -> an Anthropic Message object."""
+    blocks = []
+    if reasoning:
+        blocks.append({"type": "thinking",
+                       "thinking": "" if thinking_omitted else reasoning,
+                       "signature": _anth_signature()})
+    if content:
+        blocks.append({"type": "text", "text": content})
+    for c in (calls[:1] if no_parallel else calls):
+        fn = c.get("function") or {}
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except ValueError:
+            args = {}
+        blocks.append({"type": "tool_use",
+                       "id": c.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                       "name": fn.get("name"),
+                       "input": args if isinstance(args, dict) else {}})
+    if not blocks:
+        blocks.append({"type": "text", "text": ""})   # a reply is never no blocks
+    return {"id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message",
+            "role": "assistant", "model": model_id, "content": blocks,
+            "stop_reason": _STOP_REASONS.get(finish, "end_turn"),
+            "stop_sequence": None,
+            # No cache fields: this server has no prompt cache, and reporting
+            # zeroes for one would describe a mechanism the caller cannot use.
+            "usage": {"input_tokens": ptoks, "output_tokens": otoks}}
+
+
+def wants_anthropic(request):
+    """Is this a client that speaks the Messages API?
+
+    The version header is the one every Anthropic client sends and no OpenAI
+    client does, which is what /v1/models keys off to pick a shape."""
+    return "anthropic-version" in request.headers
+
+
+def anthropic_model_list(row):
+    """The OpenAI /v1/models row -> the Anthropic list response."""
+    entry = anthropic_model_row(row)
+    return {"data": [entry], "has_more": False,
+            "first_id": entry["id"], "last_id": entry["id"]}
+
+
+def anthropic_model_row(row):
+    """The OpenAI /v1/models row -> an Anthropic ModelInfo.
+
+    created_at is an epoch value, which the docs allow when a release date is
+    unknown - the honest answer for a quant someone exported themselves."""
+    entry = {"type": "model", "id": row["id"], "display_name": row["id"],
+             "created_at": "1970-01-01T00:00:00Z"}
+    if row.get("max_model_len"):
+        entry["max_input_tokens"] = row["max_model_len"]
+    return entry
+
+
+async def model_retrieve(request):
+    """GET /v1/models/{id} - served in whichever shape asked for it."""
+    model_id = request.match_info["model_id"]
+    row = {"id": MODEL_ID}
+    ctx = stats.get("context_length")
+    if ctx:
+        row["max_model_len"] = ctx
+    if wants_anthropic(request):
+        if model_id != MODEL_ID:
+            return anthropic_error(f"model {model_id!r} not found",
+                                   "not_found_error", 404)
+        return anthropic_json(anthropic_model_row(row))
+    if model_id != MODEL_ID:
+        return web.json_response({"error": {"message": f"model {model_id!r} not found"}},
+                                 status = 404)
+    return web.json_response({"id": MODEL_ID, "object": "model", "owned_by": "exl3"})
+
+
+async def anthropic_stream(request, req, generator, tokenizer, no_parallel,
+                           thinking_omitted = False):
+    """The Anthropic SSE protocol, rendered from the same generation.
+
+    The event order is fixed and the SDKs depend on it: message_start, then per
+    block start/delta*/stop, then message_delta - which is where the stop
+    reason lives, not in message_start - and message_stop. input_tokens is
+    unknowable before the prompt is rendered, so generation reports the count
+    before the first token rather than after the last, and the opening frame
+    carries the real number instead of a guess."""
+    resp = web.StreamResponse(headers = {
+        "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+        "Connection": "keep-alive"})
+    await resp.prepare(request)
+    mid = f"msg_{uuid.uuid4().hex[:24]}"
+    model_id = req["model_id"]
+    schemas = build_tool_schemas(req["tools"])
+
+    async def send(etype, payload):
+        await resp.write(f"event: {etype}\ndata: {json.dumps(payload)}\n\n".encode())
+
+    async def run():
+        loop = asyncio.get_event_loop()
+        queue = asyncio.Queue()
+        # The client hanging up is the Stop button in both protocols, and the
+        # only thing that tells the GPU is this event.
+        gone = threading.Event()
+        forced_choice = req["tool_choice"] not in (None, "auto", "none")
+
+        def on_text(chunk):
+            loop.call_soon_threadsafe(queue.put_nowait, ("delta", chunk))
+
+        def worker():
+            try:
+                result = generate_full(
+                    generator, tokenizer, req["messages"], req["max_tokens"],
+                    req["temperature"], req["top_p"], req["top_k"], req["seed"],
+                    req["tools"], req["tool_choice"], req["stop"],
+                    on_text = None if forced_choice else on_text,
+                    enable_thinking = req["enable_thinking"],
+                    reasoning_effort = req["reasoning_effort"],
+                    should_stop = gone.is_set,
+                    on_prompt = lambda n: loop.call_soon_threadsafe(
+                        queue.put_nowait, ("prompt", n)))
+                loop.call_soon_threadsafe(queue.put_nowait, ("done", result))
+            except Exception as e:
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
+        loop.run_in_executor(None, worker)
+
+        splitter = StreamSplitter(req["enable_thinking"], schemas)
+        state = {"index": -1, "open": None, "started": False, "calls": 0}
+
+        async def close_block():
+            if state["open"] is None:
+                return
+            if state["open"] == "thinking":
+                # Exactly one signature_delta, immediately before the stop.
+                # This is the only place a client ever gets a signature, and a
+                # thinking block without one is a block it cannot hand back.
+                await send("content_block_delta",
+                           {"type": "content_block_delta", "index": state["index"],
+                            "delta": {"type": "signature_delta",
+                                      "signature": _anth_signature()}})
+            await send("content_block_stop",
+                       {"type": "content_block_stop", "index": state["index"]})
+            state["open"] = None
+
+        async def open_block(kind, block):
+            await close_block()
+            state["index"] += 1
+            state["open"] = kind
+            await send("content_block_start",
+                       {"type": "content_block_start", "index": state["index"],
+                        "content_block": block})
+
+        async def emit(kind, payload):
+            if kind == "reasoning":
+                if state["open"] != "thinking":
+                    await open_block("thinking", {"type": "thinking", "thinking": "",
+                                                  "signature": ""})
+                if not thinking_omitted:
+                    await send("content_block_delta",
+                               {"type": "content_block_delta", "index": state["index"],
+                                "delta": {"type": "thinking_delta", "thinking": payload}})
+                return
+            if state["open"] != "text":
+                await open_block("text", {"type": "text", "text": ""})
+            await send("content_block_delta",
+                       {"type": "content_block_delta", "index": state["index"],
+                        "delta": {"type": "text_delta", "text": payload}})
+
+        async def emit_call(c):
+            """A tool call is its own block, closed as soon as its input is out
+            - so two calls in a row stay two blocks."""
+            if state["calls"] and no_parallel:
+                return
+            state["calls"] += 1
+            fn = c.get("function") or {}
+            await open_block("tool_use",
+                             {"type": "tool_use",
+                              "id": c.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                              "name": fn.get("name"), "input": {}})
+            await send("content_block_delta",
+                       {"type": "content_block_delta", "index": state["index"],
+                        "delta": {"type": "input_json_delta",
+                                  "partial_json": fn.get("arguments") or "{}"}})
+            await close_block()
+
+        async def drain(chunk = "", final = False):
+            for kind, payload in splitter.feed(chunk, final = final):
+                if kind == "call":
+                    await emit_call(payload)
+                else:
+                    await emit(kind, payload)
+
+        async def start_message(ptoks):
+            state["started"] = True
+            await send("message_start", {
+                "type": "message_start",
+                "message": {"id": mid, "type": "message", "role": "assistant",
+                            "model": model_id, "content": [],
+                            "stop_reason": None, "stop_sequence": None,
+                            "usage": {"input_tokens": ptoks, "output_tokens": 0}}})
+
+        async def consume():
+            while True:
+                kind, payload = await queue.get()
+                if kind == "prompt":
+                    if not state["started"]:
+                        await start_message(payload)
+                    continue
+                if kind == "error":
+                    await send("error", {"type": "error",
+                                         "error": {"type": "api_error",
+                                                   "message": payload}})
+                    break
+                if kind == "delta":
+                    await drain(payload)
+                    continue
+                _text, calls, finish, ptoks, otoks, reasoning, content = payload
+                if not state["started"]:
+                    await start_message(ptoks)
+                await drain(final = True)
+                if forced_choice:
+                    # Buffered path (no deltas were streamed): render the
+                    # authoritative complete result instead.
+                    if reasoning:
+                        await emit("reasoning", reasoning)
+                    if content:
+                        await emit("content", content)
+                if not state["calls"] and calls:
+                    for c in calls:
+                        await emit_call(c)
+                await close_block()
+                await send("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": _STOP_REASONS.get(finish, "end_turn"),
+                              "stop_sequence": None},
+                    # output_tokens only. Usage on this event is cumulative and
+                    # would overwrite message_start's, so re-sending the same
+                    # input count a frame later buys nothing and risks saying
+                    # something else.
+                    "usage": {"output_tokens": otoks}})
+                await send("message_stop", {"type": "message_stop"})
+                break
+            await resp.write_eof()
+
+        watcher = asyncio.ensure_future(client_watcher(request, gone))
+        try:
+            await consume()
+        finally:
+            gone.set()              # the turn is over either way
+            watcher.cancel()
+    try:
+        await run()
+    except (ConnectionError, RuntimeError):
+        # the client went away mid-write; `gone` has already told the worker
+        pass
+    return resp
+
+
+async def anthropic_messages(request):
+    """POST /v1/messages."""
+    app = request.app
+    generator, tokenizer = app["generator"], app["tokenizer"]
+    try:
+        body = await request.json()
+    except web.HTTPRequestEntityTooLarge:
+        return anthropic_error(
+            f"request body exceeds {app['max_body_mb']} MiB limit",
+            "request_too_large", 413)
+    except Exception:
+        return anthropic_error("invalid JSON")
+    openai, err = anthropic_to_openai(body)
+    if err:
+        return anthropic_error(err)
+    req, err = parse_request(openai)
+    if err:
+        return anthropic_error(err)
+    no_parallel = anthropic_no_parallel(body)
+    thinking_omitted = anthropic_thinking_omitted(body)
+
+    if not req["stream"]:
+        result, err = await run_generation(req, generator, tokenizer)
+        if err:
+            return anthropic_error(err)
+        text, calls, finish, ptoks, otoks, reasoning, content = result
+        return anthropic_json(anthropic_message(
+            req["model_id"], content, reasoning, calls, finish, ptoks, otoks,
+            no_parallel, thinking_omitted))
+    return await anthropic_stream(request, req, generator, tokenizer, no_parallel,
+                                  thinking_omitted)
+
+
+async def anthropic_count_tokens(request):
+    """POST /v1/messages/count_tokens - what the prompt costs, without running it.
+
+    A real count, not an estimate: the same template renders the same prompt
+    generation would use, including any forced-tool-choice directive, and the
+    ids are counted once. Claude Code calls this before a turn to decide
+    whether it has to compact, so "roughly" would be the wrong answer."""
+    app = request.app
+    tokenizer = app["tokenizer"]
+    try:
+        body = await request.json()
+    except web.HTTPRequestEntityTooLarge:
+        return anthropic_error(
+            f"request body exceeds {app['max_body_mb']} MiB limit",
+            "request_too_large", 413)
+    except Exception:
+        return anthropic_error("invalid JSON")
+    openai, err = anthropic_to_openai(body, require_max_tokens = False)
+    if err:
+        return anthropic_error(err)
+    req, err = parse_request(openai)
+    if err:
+        return anthropic_error(err)
+    try:
+        messages, tools = apply_tool_choice(req["messages"], req["tools"],
+                                            req["tool_choice"])
+        input_ids, _ = build_inputs(tokenizer, messages, tools,
+                                    req["enable_thinking"], req["reasoning_effort"])
+    except AssertionError as e:
+        return anthropic_error(f"context/cache: {e}")
+    except ValueError as e:
+        return anthropic_error(str(e))
+    return anthropic_json({"input_tokens": int(input_ids.shape[-1])})
 
 
 LANDING = """<!doctype html>
@@ -1032,8 +1878,9 @@ LANDING = """<!doctype html>
   hr {{ border:0; border-top:1px solid var(--line); margin:1.25rem 0 }}
 </style></head><body><div class="card">
 <h1>{model}</h1>
-<p>The model is loaded and serving the OpenAI API at
-   <code>{api}</code> &mdash; API key <code>local</code>.</p>
+<p>The model is loaded and serving <code>{api}</code> (OpenAI) and
+   <code>{anthropic}</code> (Anthropic) &mdash; API key <code>local</code>,
+   ignored either way.</p>
 <hr>
 <p id="s"><span class="dot"></span>Waiting for the DeepSeek Harness at
    <code>{harness}</code> &hellip; it opens here by itself.</p>
@@ -1076,8 +1923,9 @@ def mount_landing(app, args):
     /v1 is untouched, and a failure here must never stop the model serving."""
     try:
         api = f"http://127.0.0.1:{args.port}/v1"
+        anthropic = f"http://127.0.0.1:{args.port}"
         harness = f"http://127.0.0.1:{args.harness_port}/"
-        body = LANDING.format(model = MODEL_ID, api = api,
+        body = LANDING.format(model = MODEL_ID, api = api, anthropic = anthropic,
                               harness = harness).encode("utf-8")
 
         async def landing(_request):
@@ -1146,9 +1994,19 @@ def main():
                     help = "'mtp' for MTP drafting (head inside the "
                            "main checkpoint: no extra weights, much smaller KV footprint) "
                            "or 'none' to disable drafting")
-    ap.add_argument("-gs", "--grid_size", type = float, default = 14.7,
-                    help = "GPU memory budget in GB (autosplit + process cap). "
+    ap.add_argument("-gs", "--grid_size", type = str, default = "14.7",
+                    help = "GPU memory budget in GB (autosplit + process cap), "
+                           "or one per GPU, e.g. 14.9,7.2 to split across two. "
                            "14.7 is the 16 GB-card recipe")
+    ap.add_argument("--num_draft_tokens", type = int, default = 0,
+                    help = "MTP draft length per round (0 = the head's default, 4)")
+    ap.add_argument("--dynamic_draft", type = float, default = 0,
+                    help = "cut each draft where the head's confidence drops "
+                           "below this (e.g. 0.4); 0 = always draft the full length")
+    ap.add_argument("--offload_layers", type = str, default = "auto",
+                    help = "two GPUs: how many linear-attention blocks go to "
+                           "GPU 1 (auto = just enough to fit GPU 0's budget; "
+                           "stock = exllamav3's own in-order split)")
     ap.add_argument("-cs", "--cache_size", type = int, default = 199936,
                     help = "KV cache size in tokens (default 199936 ~200k for "
                            "16 GB VRAM; must be a multiple of 256)")
@@ -1184,12 +2042,22 @@ def main():
                            "set + a long transcript)")
     args = ap.parse_args()
     MODEL_ID = (args.model_id or os.path.basename(os.path.normpath(args.model))).strip().lower() or MODEL_ID
-    _cap_process_vram(args.grid_size)
+    budgets = parse_split(args.grid_size)
+    _cap_process_vram(budgets)
+    if len(budgets) > 1 and args.offload_layers != "stock":
+        OFFLOAD["layers"] = None if args.offload_layers == "auto" else int(args.offload_layers)
+        _install_offload_loader(budgets)
     _draft = args.draft_model.lower()
     use_mtp = _draft == "mtp"
     use_draft = _draft not in ("none", "", "-")
     argv = ["-m", args.model,
-            "-gs", str(args.grid_size), "-cs", str(args.cache_size)]
+            "-gs", ",".join(str(b) for b in budgets), "-cs", str(args.cache_size)]
+    draft_kw = {}
+    if use_draft and args.num_draft_tokens:
+        argv += ["-ndt", str(args.num_draft_tokens)]
+        draft_kw["num_draft_tokens"] = args.num_draft_tokens
+    if use_draft and args.dynamic_draft:
+        draft_kw.update(dynamic_draft_tokens = True, draft_confidence = args.dynamic_draft)
     if use_mtp:
         argv += ["-mtp"]
     elif use_draft:
@@ -1203,19 +2071,20 @@ def main():
           + (" + MTP head" if use_mtp else
              (f" + draft {args.draft_model}" if use_draft else " (no draft)"))
           + " ...", flush = True)
-    generator, tokenizer, config = build_model(argv, use_draft = use_draft)
+    generator, tokenizer, config = build_model(argv, use_draft = use_draft, draft_kw = draft_kw)
     stats["context_length"] = int(args.cache_size)
     if args.vision == "auto":
         print(" == loading vision tower (images) ...", flush = True)
-        load_vision(config, args.image_max_pixels)
+        load_vision(config, args.image_max_pixels, device = len(budgets) - 1)
     else:
         vision["reason"] = "disabled (--vision off)"
     try:
         import torch
-        a = torch.cuda.memory_allocated(0) / 1024 ** 3
-        r = torch.cuda.memory_reserved(0) / 1024 ** 3
-        print(f" == cuda allocated {a:.2f} GiB, reserved {r:.2f} GiB "
-              f"(cap {args.grid_size} GB)", flush = True)
+        for i, cap in enumerate(budgets):
+            a = torch.cuda.memory_allocated(i) / 1024 ** 3
+            r = torch.cuda.memory_reserved(i) / 1024 ** 3
+            print(f" == cuda:{i} allocated {a:.2f} GiB, reserved {r:.2f} GiB "
+                  f"(cap {cap} GB)", flush = True)
     except Exception as e:
         print(f" == cuda memory stats unavailable: {e}", flush = True)
     # Build and mount first, bind the port next, and only then say Ready: a
@@ -1226,8 +2095,11 @@ def main():
     app["tokenizer"] = tokenizer
     app["max_body_mb"] = args.max_body_mb
     app.router.add_get("/v1/models", models)
+    app.router.add_get("/v1/models/{model_id}", model_retrieve)
     app.router.add_get("/health", health)
     app.router.add_post("/v1/chat/completions", chat_completions)
+    app.router.add_post("/v1/messages", anthropic_messages)
+    app.router.add_post("/v1/messages/count_tokens", anthropic_count_tokens)
     landing_on = mount_landing(app, args) if args.ui == "on" else False
 
     def ready_box():
@@ -1236,9 +2108,10 @@ def main():
         print("  +" + "-" * inner + "+")
         for line in (
             "  Ready",
-            f"  http://127.0.0.1:{args.port}/v1",
+            f"  OpenAI:    http://127.0.0.1:{args.port}/v1",
+            f"  Anthropic: http://127.0.0.1:{args.port}",
             f"  model: {MODEL_ID}"[:inner],
-            "  OpenAI-compatible  |  API key: local",
+            "  API key: local (ignored)",
             ("  Images: ON  (max %.1f MP per image)" % (vision["max_pixels"] / 1e6))
             if vision["model"] is not None else "  Images: off (text only)",
             (f"  Chat: http://127.0.0.1:{args.harness_port}/  (harness)"[:inner]
