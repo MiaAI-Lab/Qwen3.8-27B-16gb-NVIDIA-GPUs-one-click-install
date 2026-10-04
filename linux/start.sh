@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the OpenAI-compatible exllamav3 server (tools/serve_openai.py).
+# Start the OpenAI- and Anthropic-compatible exllamav3 server (tools/serve_openai.py).
 # Configuration lives in .env — created from .env.example on first run.
 #
 # Works from the deployment kit or from the engine repo itself. First run
@@ -484,6 +484,10 @@ esac
 if [ "$CPU_CACHE_GB" != "0" ]; then
     cmd+=(--cpu_cache_size "$CPU_CACHE_GB")
 fi
+# Two GPUs (GPU_MEM_GB=14.9,7.2) and MTP draft length - see .env.example.
+[ -n "${GPU_OFFLOAD_LAYERS:-}" ] && cmd+=(--offload_layers "$GPU_OFFLOAD_LAYERS")
+[ -n "${DRAFT_TOKENS:-}" ] && cmd+=(--num_draft_tokens "$DRAFT_TOKENS")
+[ -n "${DRAFT_CONFIDENCE:-}" ] && cmd+=(--dynamic_draft "$DRAFT_CONFIDENCE")
 
 # --- the harness ----------------------------------------------------------
 # The model server serves /v1 and a small page at / saying where things are.

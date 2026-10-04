@@ -79,6 +79,11 @@ GENERATED_MARKER = ".settings.generated"
 # settings.yaml belongs to whoever put it there and is spliced back around
 # these on every rewrite.
 OWNED_KEYS = ("llm-pi-ai", "agent-default-model")
+# Lines dsh itself writes inside a block we own: picking a reasoning effort in
+# the chat saves it under agent-default-model. They are dsh's state, not an
+# edit - counting them as one froze the block, so a model switch never reached
+# the chat - and they are carried into the block when it is rewritten.
+DSH_STATE = {"agent-default-model": ("reasoningEffort",)}
 # dsh takes a key with or without its package prefix, and a document it has
 # round-tripped can come back carrying the long form. Both name one key here.
 KEY_PREFIX = "@deepseek-ai/dsh-"
@@ -387,14 +392,27 @@ def _cut(text: str) -> list[tuple[str | None, str]]:
     return out
 
 
+def _state_lines(key: str, block: str) -> list[str]:
+    """The DSH_STATE lines of one block, as written."""
+    subs = DSH_STATE.get(key, ())
+    return [ln for ln in block.splitlines(keepends=True)
+            if ln[:1] in (" ", "\t") and ln.strip().split(":", 1)[0] in subs]
+
+
 def _splice(have: str, want: str) -> str:
-    """`want`'s blocks put back into `have`, every other block left alone."""
+    """`want`'s blocks put back into `have`, every other block left alone,
+    and dsh's own state lines (DSH_STATE) kept inside the block they were in."""
     fresh = {k: t for k, t in _cut(want) if k in OWNED_KEYS}
     out: list[str] = []
     seen: set[str] = set()
     for k, t in _cut(have):
         if k in fresh and k not in seen:
-            out.append(fresh[k])
+            keep = _state_lines(k, t)
+            block = fresh[k]
+            if keep:
+                block = block.rstrip("\n") + "\n" + "".join(
+                    ln if ln.endswith("\n") else ln + "\n" for ln in keep)
+            out.append(block)
             seen.add(k)
         elif k in fresh:
             continue                      # a duplicate of a key we own
@@ -428,12 +446,21 @@ def _owned(text: str) -> dict | None:
     if not isinstance(doc, dict):
         return None
     got = {_canon(k): v for k, v in doc.items()}
-    return {k: got[k] for k in OWNED_KEYS if k in got}
+    out = {k: got[k] for k in OWNED_KEYS if k in got}
+    for k, subs in DSH_STATE.items():
+        if isinstance(out.get(k), dict):
+            out[k] = {s: v for s, v in out[k].items() if s not in subs}
+    return out
 
 
 def _owned_text(text: str) -> dict:
     """The same question without PyYAML: our blocks as they are written."""
-    return {k: t for k, t in _cut(text) if k in OWNED_KEYS}
+    out = {}
+    for k, t in _cut(text):
+        if k in OWNED_KEYS:
+            drop = set(_state_lines(k, t))
+            out[k] = "".join(ln for ln in t.splitlines(keepends=True) if ln not in drop)
+    return out
 
 
 def _mine(*texts: str) -> tuple:
@@ -666,14 +693,23 @@ def main() -> int:
         print("\n  " + missing.replace("\n", "\n  "), file=sys.stderr)
         return 1
 
-    proc = start(root, port, version, cfg.get("API_KEY") or "local")
+    # npx installs dsh on the way in and keeps npm's reason to itself when
+    # that install fails, so a first run that dies - a version npm does not
+    # have, or a machine that cannot build dsh's one native module - says
+    # nothing at all. A death with no address is therefore retried on the
+    # newest release: what windows\start.bat has always done, and what
+    # DSH_VERSION in .env promises. A process still alive without an address is
+    # not a version problem, so it gets its time instead of a second harness
+    # racing it for the port.
+    attempts = (version,) if version in ("", "latest") else (version, "latest")
+    proc = None
 
     # linux/start.sh backgrounds this and stops it with a signal on the way out.
     # Python does not run `finally` for SIGTERM, so the harness would outlive
     # the launcher and the dead token would outlive the harness. Turn the
     # signal into an ordinary exit and both are cleaned up.
     def _bye(signum, _frame):
-        if proc.poll() is None:
+        if proc is not None and proc.poll() is None:
             try:
                 proc.terminate()
             except OSError:
@@ -687,14 +723,28 @@ def main() -> int:
         except (ValueError, OSError):     # not the main thread, or no such signal
             pass
 
-    found = watch_output(proc, echo=lambda text: (sys.stdout.write(text),
-                                                  sys.stdout.flush()))
-    opening = await_url(proc, found)
+    opening = None
+    for attempt in attempts:
+        proc = start(root, port, attempt, cfg.get("API_KEY") or "local")
+        found = watch_output(proc, echo=lambda text: (sys.stdout.write(text),
+                                                      sys.stdout.flush()))
+        opening = await_url(proc, found)
+        if opening is not None or proc.poll() is None:
+            break
+        if attempt != attempts[-1]:
+            print(f"\n  dsh {attempt} stopped before it printed its address - "
+                  f"trying the newest release instead.", file=sys.stderr)
+
     if opening is None:
         if proc.poll() is not None:
             print(f"\n  The harness stopped before it could serve (exit "
-                  f"{proc.returncode}). The reason is in the lines above.",
-                  file=sys.stderr)
+                  f"{proc.returncode}).\n"
+                  f"  If npm printed no reason above, this was a first run it "
+                  f"could not build: dsh compiles one native module, which "
+                  f"needs a C++ compiler (Fedora: gcc-c++, Debian and Ubuntu: "
+                  f"build-essential).\n"
+                  f"  `npm i {PACKAGE}@{version}` in an empty folder prints "
+                  f"npm's own error either way.", file=sys.stderr)
             clear_url(root)
             return proc.returncode or 1
         print(f"  The harness did not print its address. It is meant to be at "
