@@ -4,6 +4,35 @@ Notable changes to this kit. Newest first.
 
 ## Unreleased
 
+### Fixed
+- Console setup (`SETUP=console`) installs the prebuilt engine wheel before
+  compiling, like the browser setup; fixes a failed compile on machines whose only
+  CUDA toolkit is newer than torch's CUDA line (#3).
+- `linux/start.sh` no longer crashes with an arithmetic error under a non-English
+  locale: `free` is read by row position under `LC_ALL=C` (#4).
+- `CUDA_HOME` is detected (PATH, `/usr/local/cuda`, `/opt/cuda`, versioned
+  installs) instead of assumed to be `/usr/local/cuda` (#5).
+- Source builds stop early, with the `CC=gcc-13 CXX=g++-13` hint, when the host
+  compiler is GCC 14+ and CUDA is 12.x; `SKIP_COMPILER_CHECK=1` disables it (#6).
+- A model folder missing `tokenizer.json` is no longer reported complete, so an
+  interrupted download is resumed instead of failing at start (#8).
+- `max_tokens` is clamped to what the KV cache can admit, so a client's large
+  `max_tokens` on a long prompt no longer fails with "Job requires N pages (only M
+  available)"; a prompt that cannot fit is a clear error (#11).
+- Requests that omit `max_tokens` now default to 32768 instead of 1024, which cut
+  off long summaries with `finish_reason=length` (#14).
+- A `#` inside a quoted `.env` value is kept by the Windows reader, the profile
+  writer and the harness launcher, matching `linux/start.sh`. Thanks to Sasha
+  Mitchell (PR #12).
+
+### Added
+- Per-request stats: one ` == stats` line per request, live ` .. ` progress lines
+  (`PROGRESS_EVERY`), and `last_request` in `/health`. Thanks to Ivan Ribeiro Rocha
+  (PR #7).
+- `tests/` (stdlib `unittest` and one bash script) for the `.env` readers, the
+  token budget, the downloader's completeness check and the Linux pre-flight
+  helpers.
+
 ### Changed
 - **ExLlamaV3 1.6.0 is now the default engine for every `DRAFT` value**
   (`mtp`, `none`, `dflash2`), replacing 1.4.4. All values share one `.venv`.

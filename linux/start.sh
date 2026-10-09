@@ -469,15 +469,15 @@ DRAFT="$(echo "$DRAFT" | tr '[:upper:]' '[:lower:]')"
 # Set HF_TOKEN=<token> in .env, or `hf auth login`.
 HF_TARGET_REPO="${HF_TARGET_REPO:-Mia-AiLab/Qwen3.8-27B-EXL3-2.0bpw}"
 
-dl_model() {   # dl_model <repo_id> <dir> <label> [revision; default HF_REVISION]
-    local repo="$1" dir="$2" label="$3" revision="${4-${HF_REVISION:-}}"
+dl_model() {   # dl_model <repo_id> <dir> <label> [revision; default HF_REVISION] [required file; "" = none]
+    local repo="$1" dir="$2" label="$3" revision="${4-${HF_REVISION:-}}" required="${5-tokenizer.json}"
     # "config.json exists" used to be the test, and config.json is one of the
     # first small files a download fetches - so a run that stopped in the
     # middle of a shard was called "already present", and the server then met
     # half a model. tools/downloader.py answers the question properly (every
     # shard the index names, and no .part still waiting) and is what the
     # Windows launcher and the setup page ask as well.
-    if "$PYTHON" -c "import sys; sys.path.insert(0, 'tools'); import downloader; sys.exit(0 if downloader.is_complete(sys.argv[1]) else 1)" "$dir" 2>/dev/null; then
+    if "$PYTHON" -c "import sys; sys.path.insert(0, 'tools'); import downloader; sys.exit(0 if downloader.is_complete(sys.argv[1], tuple(f for f in sys.argv[2:] if f)) else 1)" "$dir" "$required" 2>/dev/null; then
         echo "$label: $dir already present — skipping download."
         return 0
     fi
@@ -493,7 +493,7 @@ dl_model() {   # dl_model <repo_id> <dir> <label> [revision; default HF_REVISION
 dl_model "$HF_TARGET_REPO" "$MODEL_DIR" "target model"
 if [ "$DRAFT" = "dflash2" ]; then
     # pinned to a commit, and its one weight file to a checksum (tools/dflash2.py)
-    dl_model "$DFLASH2_REPO" "$DFLASH2_DIR" "dflash2 drafter" "$DFLASH2_REVISION"
+    dl_model "$DFLASH2_REPO" "$DFLASH2_DIR" "dflash2 drafter" "$DFLASH2_REVISION" ""
     "$PYTHON" tools/dflash2.py verify "$DFLASH2_DIR" || exit 1
 fi
 

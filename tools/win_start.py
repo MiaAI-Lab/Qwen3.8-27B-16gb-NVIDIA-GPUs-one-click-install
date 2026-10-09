@@ -497,7 +497,8 @@ def dflash2_drafter(cfg: dict[str, str]) -> None:
     if not dflash2.wanted(cfg.get("DRAFT")):
         return
     drafter = ROOT / dflash2.DRAFT_DIR
-    download_model(VENV_PY, dflash2.DRAFT_REPO, drafter, "dflash2 drafter", dflash2.DRAFT_REVISION)
+    download_model(VENV_PY, dflash2.DRAFT_REPO, drafter, "dflash2 drafter",
+                   dflash2.DRAFT_REVISION, required=())   # the drafter ships no tokenizer
     why = dflash2.verify(drafter)
     if why:
         die(why)
@@ -648,7 +649,8 @@ def vram_preflight(gpu_mem_gb: str, margin_gib: float = 0.3) -> None:
     step_ok(f"VRAM  {gib(free)} free of {gib(total)}  (need ~{gib(need_mib)})")
 
 
-def download_model(py: Path, repo: str, dest: Path, label: str, revision: str | None = None) -> None:
+def download_model(py: Path, repo: str, dest: Path, label: str, revision: str | None = None,
+                   required: tuple[str, ...] | None = None) -> None:
     """Fetch the weights with tools/downloader.py: no dependency on the venv,
     resumes a half-finished download, and prints a real percentage and ETA
     instead of a cursor that sits still for twenty minutes."""
@@ -656,7 +658,7 @@ def download_model(py: Path, repo: str, dest: Path, label: str, revision: str | 
     import downloader
 
     dest.mkdir(parents=True, exist_ok=True)
-    if downloader.is_complete(dest):
+    if downloader.is_complete(dest, downloader.DEFAULT_REQUIRED if required is None else required):
         info(f"Weights already in {dest}")
         return
     print()

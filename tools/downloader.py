@@ -541,7 +541,15 @@ def _index_shards(dest: Path) -> set[str] | None:
     return {str(v) for v in weight_map.values() if v}
 
 
-def folder_state(dest: Path) -> dict:
+# Files a target model folder must have before the server can load it. The
+# files are fetched in name order, so a run stopped after the last shard has the
+# config and every shard but no tokenizer.json, and used to be reported as
+# complete ("Exception: The system cannot find the file specified" at start).
+# The DFlash2 drafter repo ships no tokenizer and passes required=().
+DEFAULT_REQUIRED = ("tokenizer.json",)
+
+
+def folder_state(dest: Path, required: tuple[str, ...] = DEFAULT_REQUIRED) -> dict:
     """What is actually in a model folder: missing, partial, or complete.
 
     The old test was "config.json is there", and config.json is one of the
@@ -587,17 +595,20 @@ def folder_state(dest: Path) -> dict:
     if shards is None:
         if not any(dest.glob("*.safetensors")):
             return out("partial", "no weight file has arrived yet")
-        return out("complete", "")
-    absent = sorted(s for s in shards if not (dest / s).is_file())
-    if absent:
-        return out("partial",
-                   f"{len(absent)} of {len(shards)} weight files are missing", absent)
+    else:
+        absent = sorted(s for s in shards if not (dest / s).is_file())
+        if absent:
+            return out("partial",
+                       f"{len(absent)} of {len(shards)} weight files are missing", absent)
+    lacking = [f for f in required if not (dest / f).is_file()]
+    if lacking:
+        return out("partial", ", ".join(lacking) + " has not arrived yet", lacking)
     return out("complete", "")
 
 
-def is_complete(dest: Path) -> bool:
+def is_complete(dest: Path, required: tuple[str, ...] = DEFAULT_REQUIRED) -> bool:
     """What the launcher checks before deciding a download is needed at all."""
-    return folder_state(dest)["state"] == "complete"
+    return folder_state(dest, required)["state"] == "complete"
 
 
 def main(argv: list[str]) -> int:
