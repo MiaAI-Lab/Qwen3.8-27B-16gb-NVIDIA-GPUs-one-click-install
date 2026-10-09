@@ -203,6 +203,25 @@ _load_env() {
 }
 _load_env
 
+# --- which engine, which venv ---------------------------------------------
+# DRAFT=dflash2 (tools/dflash2.py) needs ExLlamaV3 1.6.0. It gets a virtualenv
+# of its own, so switching DRAFT back and forth never reinstalls anything and
+# the 1.4.4 install used by every other value is not touched. A card that is
+# too small is refused here, before a venv or a download exists.
+VENV=".venv"
+ENGINE_VERSION="1.4.4"
+_wheel_engine=()
+if [ "$(echo "${DRAFT:-}" | tr '[:upper:]' '[:lower:]')" = "dflash2" ]; then
+    if [ -z "$_pyprof" ]; then
+        echo "DRAFT=dflash2 needs python3 on PATH to check this machine, and none was found." >&2
+        exit 1
+    fi
+    "$_pyprof" tools/dflash2.py gate || exit 1
+    VENV=".venv-dflash2"
+    ENGINE_VERSION="1.6.0"
+    _wheel_engine=(--engine-version "$ENGINE_VERSION")
+fi
+
 # .env is sourced as shell vars; the model-download subprocess needs the HF
 # token in its environment, so export it if set.
 if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; fi
@@ -210,8 +229,8 @@ if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; fi
 # --- bootstrap: build the venv + install the engine on first run ----------
 # Re-enters if the venv is missing OR the install is incomplete (e.g. a
 # Ctrl-C during the first run left a half-installed venv) — pip is idempotent.
-if [ ! -x .venv/bin/python ] \
-   || ! .venv/bin/python -c "import torch, exllamav3, aiohttp, huggingface_hub" 2>/dev/null; then
+if [ ! -x "$VENV/bin/python" ] \
+   || ! "$VENV/bin/python" -c "import torch, exllamav3, aiohttp, huggingface_hub" 2>/dev/null; then
     if [ "$MODE" != "setup" ]; then
         echo "This kit is not ready to start: the Python environment is missing or incomplete."
         _ask_yes "Install it now?" || {
@@ -267,9 +286,9 @@ if [ ! -x .venv/bin/python ] \
         return 1
     }
 
-    _step "1/5 creating Python virtualenv" python3 -m venv .venv
+    _step "1/5 creating Python virtualenv" python3 -m venv "$VENV"
     _quiet_step "2/5 build tools (pip, setuptools, wheel)" \
-        .venv/bin/pip install --quiet --upgrade pip setuptools wheel typing_extensions packaging
+        "$VENV/bin/pip" install --quiet --upgrade pip setuptools wheel typing_extensions packaging
     # GPU torch + its NVIDIA runtime deps; PyPI stays primary so the
     # nvidia-* runtime wheels resolve too (the local-version wheel wins).
     #
@@ -291,11 +310,12 @@ if [ ! -x .venv/bin/python ] \
     # Uncapped, a 3.10 user gets a torch no wheel matches and compiles for
     # twenty minutes. tools/wheels.py owns that table and answers from it;
     # it prints a plain "torch" when capping would buy nothing.
-    _torch_req="$(.venv/bin/python tools/wheels.py --torch-req --cuda "$_torch_index" 2>/dev/null || echo torch)"
+    _torch_req="$("$VENV/bin/python" tools/wheels.py --torch-req --cuda "$_torch_index" \
+        ${_wheel_engine[@]+"${_wheel_engine[@]}"} 2>/dev/null || echo torch)"
     [ -n "$_torch_req" ] || _torch_req=torch
     # Output NOT hidden: pip's own download progress bars show here.
     _step "3/5 PyTorch (~2–3 GB download the first time)" \
-        .venv/bin/pip install "$_torch_req" \
+        "$VENV/bin/pip" install "$_torch_req" \
             --extra-index-url "$_torch_index"
     # The engine itself; its setup.py pulls in the rest of the deps.
     # Inside the engine repo: build from the local checkout (EXL3_REPO is
@@ -310,8 +330,9 @@ if [ ! -x .venv/bin/python ] \
     else
         # Pinned to the v1.4.4 tag. PyPI has no 1.4.4 wheel (it jumps
         # 1.4.2 -> 1.4.5), so the tag is the only way to get exactly v1.4.4,
-        # which this quant needs (quantized vision tower).
-        _engine_src="${EXL3_REPO:-git+https://github.com/turboderp-org/exllamav3.git@v1.4.4}"
+        # which this quant needs (quantized vision tower). DRAFT=dflash2 pins
+        # v1.6.0 the same way.
+        _engine_src="${EXL3_REPO:-git+https://github.com/turboderp-org/exllamav3.git@v$ENGINE_VERSION}"
         _engine_note="exllamav3 engine — clone + compile CUDA kernels"
     fi
     if [ -n "${TORCH_CUDA_ARCH_LIST:-}" ]; then
@@ -334,35 +355,36 @@ if [ ! -x .venv/bin/python ] \
     # instead of a 5-20 minute compile that needs the CUDA Toolkit.
     _engine_wheel=""
     if [ "$_engine_src" != "." ] && [ -z "${EXL3_REPO:-}" ]; then
-        _engine_wheel="$(.venv/bin/python tools/wheels.py --url --python .venv/bin/python 2>/dev/null || true)"
+        _engine_wheel="$("$VENV/bin/python" tools/wheels.py --url --python "$VENV/bin/python" \
+            ${_wheel_engine[@]+"${_wheel_engine[@]}"} 2>/dev/null || true)"
     fi
     if [ -n "$_engine_wheel" ]; then
         _quiet_step "4/5 exllamav3 engine — prebuilt wheel (no compiler needed)" \
-            .venv/bin/pip install --only-binary :all: --no-build-isolation "$_engine_wheel" \
+            "$VENV/bin/pip" install --only-binary :all: --no-build-isolation "$_engine_wheel" \
             || _engine_wheel=""
     fi
     if [ -z "$_engine_wheel" ]; then
         _quiet_step "4/5 ${_engine_note} (5–20 min depending on machine)" \
-            .venv/bin/pip install --no-build-isolation \
+            "$VENV/bin/pip" install --no-build-isolation \
                 "${_engine_src}"
     fi
     _quiet_step "5/5 server dependencies (aiohttp, huggingface_hub)" \
-        .venv/bin/pip install --quiet aiohttp huggingface_hub
+        "$VENV/bin/pip" install --quiet aiohttp huggingface_hub
     echo "Setup complete."
 fi
 
-PYTHON=.venv/bin/python
+PYTHON="$VENV/bin/python"
 # venv tools (ninja, …) must stay findable for the engine's JIT fallback.
-export PATH="$(pwd)/.venv/bin:$PATH"
+export PATH="$(pwd)/$VENV/bin:$PATH"
 
 # --- engine version guard ---------------------------------------------------
 # v1.4.4 is mandatory: this quant ships a quantized vision tower (vision_bits 3),
 # which older builds decode incorrectly, and stock v1.4.4 is what this kit is
-# validated against.
-if ! "$PYTHON" -c 'import sys; from exllamav3.version import __version__ as v; sys.exit(0 if v == "1.4.4" else (print(" !! unexpected exllamav3 version:", v) or 1))' 2>/dev/null; then
+# validated against. DRAFT=dflash2 requires v1.6.0 in its own venv instead.
+if ! "$PYTHON" -c "import sys; from exllamav3.version import __version__ as v; sys.exit(0 if v == \"$ENGINE_VERSION\" else (print(\" !! unexpected exllamav3 version:\", v) or 1))" 2>/dev/null; then
     _gotver="$("$PYTHON" -c 'from exllamav3.version import __version__; print(__version__)' 2>/dev/null || echo unknown)"
-    echo "ERROR: this kit requires ExLlamaV3 v1.4.4, but the venv has '$_gotver'." >&2
-    echo "Fix: EXL3_REPO=git+https://github.com/turboderp-org/exllamav3.git@v1.4.4 then rm -rf .venv && ./start.sh" >&2
+    echo "ERROR: this kit requires ExLlamaV3 v$ENGINE_VERSION, but the venv has '$_gotver'." >&2
+    echo "Fix: EXL3_REPO=git+https://github.com/turboderp-org/exllamav3.git@v$ENGINE_VERSION then rm -rf $VENV && ./start.sh" >&2
     exit 1
 fi
 
@@ -388,11 +410,26 @@ if [ "$MODE" = "start" ] && [ "$PICK" = "1" ]; then
 fi
 
 MODEL_DIR="${MODEL_DIR:?MODEL_DIR must be set in .env}"
+# DRAFT=dflash2 runs the settings it was measured with, for this run only (.env
+# is not changed), and only for the quants that were measured. tools/dflash2.py
+# says which, and refuses the rest here - before anything is downloaded.
+_gpu_from=".env"
+if [ "$VENV" = ".venv-dflash2" ]; then
+    _pin="$("$PYTHON" tools/dflash2.py pin --model-dir "$MODEL_DIR")" || exit 1
+    while IFS='=' read -r _k _v; do
+        case "$_k" in
+            CONTEXT_SIZE|GPU_MEM_GB|CACHE_QUANT|DFLASH2_REPO|DFLASH2_REVISION|DFLASH2_DIR)
+                printf -v "$_k" '%s' "$_v" ;;
+        esac
+    done <<< "$_pin"
+    _gpu_from="the DRAFT=dflash2 measurement, not .env"
+    echo "DRAFT=dflash2: context $CONTEXT_SIZE, KV cache $CACHE_QUANT-bit (the measured settings)"
+fi
 PORT="${PORT:-8888}"
 HOST="${HOST:-0.0.0.0}"
 CONTEXT_SIZE="${CONTEXT_SIZE:-199936}"
 if [ -n "${GPU_MEM_GB:-}" ]; then
-    echo "GPU memory budget: ${GPU_MEM_GB} GB (from .env)"
+    echo "GPU memory budget: ${GPU_MEM_GB} GB (from ${_gpu_from})"
 else
     _vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1) || true
     if [ "${_vram:-0}" -gt 0 ] 2>/dev/null; then
@@ -410,7 +447,7 @@ CACHE_QUANT="${CACHE_QUANT:-none}"
 CPU_CACHE_GB="${CPU_CACHE_GB:-0}"
 
 # --- speculative decoding method ---------------------------------------------
-# DRAFT = mtp | none (see .env.example for the trade-offs).
+# DRAFT = mtp | none | dflash2 (see .env.example for the trade-offs).
 DRAFT="${DRAFT:-mtp}"
 DRAFT="$(echo "$DRAFT" | tr '[:upper:]' '[:lower:]')"
 
@@ -418,8 +455,8 @@ DRAFT="$(echo "$DRAFT" | tr '[:upper:]' '[:lower:]')"
 # Set HF_TOKEN=<token> in .env, or `hf auth login`.
 HF_TARGET_REPO="${HF_TARGET_REPO:-Mia-AiLab/Qwen3.8-27B-EXL3-2.0bpw}"
 
-dl_model() {   # dl_model <repo_id> <dir> <label>
-    local repo="$1" dir="$2" label="$3"
+dl_model() {   # dl_model <repo_id> <dir> <label> [revision; default HF_REVISION]
+    local repo="$1" dir="$2" label="$3" revision="${4-${HF_REVISION:-}}"
     # "config.json exists" used to be the test, and config.json is one of the
     # first small files a download fetches - so a run that stopped in the
     # middle of a shard was called "already present", and the server then met
@@ -432,14 +469,19 @@ dl_model() {   # dl_model <repo_id> <dir> <label>
     fi
     echo "$label: fetching from huggingface.co/$repo (resumes if it was interrupted) …"
     mkdir -p "$dir"
-    if [ -n "${HF_REVISION:-}" ]; then
-        "$PYTHON" tools/downloader.py "$repo" "$dir" --revision "$HF_REVISION"
+    if [ -n "$revision" ]; then
+        "$PYTHON" tools/downloader.py "$repo" "$dir" --revision "$revision"
     else
         "$PYTHON" tools/downloader.py "$repo" "$dir"
     fi
 }
 
 dl_model "$HF_TARGET_REPO" "$MODEL_DIR" "target model"
+if [ "$DRAFT" = "dflash2" ]; then
+    # pinned to a commit, and its one weight file to a checksum (tools/dflash2.py)
+    dl_model "$DFLASH2_REPO" "$DFLASH2_DIR" "dflash2 drafter" "$DFLASH2_REVISION"
+    "$PYTHON" tools/dflash2.py verify "$DFLASH2_DIR" || exit 1
+fi
 
 if [ "$MODE" = "setup" ]; then
     echo
@@ -476,8 +518,9 @@ fi
 case "$DRAFT" in
     mtp)      cmd+=(--draft_model mtp) ;;
     none)     cmd+=(--draft_model none) ;;
+    dflash2)  cmd+=(--draft_model "$DFLASH2_DIR") ;;
     *)
-        echo "DRAFT must be mtp or none (got: $DRAFT)" >&2
+        echo "DRAFT must be mtp, none or dflash2 (got: $DRAFT)" >&2
         exit 1
         ;;
 esac

@@ -11,6 +11,7 @@ models/
 
 # The Python environment start.bat builds, and anything compiled into it.
 .venv/
+.venv-dflash2/
 __pycache__/
 *.py[cod]
 *.egg-info/

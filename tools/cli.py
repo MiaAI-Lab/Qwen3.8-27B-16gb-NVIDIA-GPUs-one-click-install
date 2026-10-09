@@ -53,6 +53,7 @@ WINDOWS = os.name == "nt"
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
+import dflash2
 import dsh
 
 
@@ -128,7 +129,9 @@ def env_int(cfg: dict, key: str, default: int) -> int:
 
 
 def venv_python() -> Path:
-    return ROOT / ".venv" / ("Scripts/python.exe" if WINDOWS else "bin/python")
+    # .venv, or .venv-dflash2 while DRAFT=dflash2 (see tools/dflash2.py)
+    venv = dflash2.venv_name(read_env().get("DRAFT"))
+    return ROOT / venv / ("Scripts/python.exe" if WINDOWS else "bin/python")
 
 
 def any_python() -> str:
@@ -767,8 +770,10 @@ def cmd_doctor(a) -> int:
         ok("python version", platform.python_version())
 
     vp = venv_python()
+    venv = dflash2.venv_name(cfg.get("DRAFT"))
+    engine = dflash2.engine_version(cfg.get("DRAFT"), "1.4.4")
     if not vp.is_file():
-        bad("the kit's .venv", "run: simplex setup")
+        bad(f"the kit's {venv}", "run: simplex setup")
     else:
         probe = subprocess.run(
             [str(vp), "-c",
@@ -787,12 +792,12 @@ def cmd_doctor(a) -> int:
             info = json.loads(probe.stdout.strip().splitlines()[-1])
         except Exception:                                   # noqa: BLE001
             info = {}
-        if info.get("engine") == "1.4.4":
-            ok("exllamav3", "1.4.4")
+        if info.get("engine") == engine:
+            ok("exllamav3", engine)
         elif info.get("engine"):
-            bad("exllamav3 version", f"{info['engine']} (this kit needs 1.4.4)")
+            bad("exllamav3 version", f"{info['engine']} (this kit needs {engine})")
         else:
-            bad("exllamav3", "not importable in .venv - run: simplex setup")
+            bad("exllamav3", f"not importable in {venv} - run: simplex setup")
         for mod in ("torch", "aiohttp", "huggingface_hub"):
             (ok if info.get(mod) else bad)(mod, "" if info.get(mod) else "missing")
         if not info.get("PIL"):

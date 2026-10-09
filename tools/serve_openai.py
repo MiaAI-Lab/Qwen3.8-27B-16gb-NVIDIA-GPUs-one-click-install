@@ -3,9 +3,10 @@
 Minimal OpenAI-compatible server for the EXL3 serving target.
 
 Drafter: MTP by default (`-dm mtp`; the draft head lives inside the target
-checkpoint, so there are no separate draft weights to download). Alternative:
-no drafting at all (`-dm none`). The linux/start.sh launcher maps the .env `DRAFT`
-knob onto these. This kit ships no external draft model.
+checkpoint, so there are no separate draft weights to download). Alternatives:
+no drafting at all (`-dm none`), or a separate draft model's directory
+(`-dm <dir>`), which is how DRAFT=dflash2 runs (it needs ExLlamaV3 1.6.0, see
+tools/dflash2.py). The launchers map the .env `DRAFT` knob onto these.
 
 Requires ExLlamaV3 >= 1.4.4: the served quant carries a quantized vision
 tower (vision_bits 3), which only v1.4.4+ decodes correctly.
@@ -1144,8 +1145,8 @@ def main():
     ap.add_argument("-m", "--model", default = MODEL_DIR)
     ap.add_argument("-dm", "--draft_model", default = DRAFT_DIR,
                     help = "'mtp' for MTP drafting (head inside the "
-                           "main checkpoint: no extra weights, much smaller KV footprint) "
-                           "or 'none' to disable drafting")
+                           "main checkpoint: no extra weights, much smaller KV footprint), "
+                           "a draft model's directory, or 'none' to disable drafting")
     ap.add_argument("-gs", "--grid_size", type = float, default = 14.7,
                     help = "GPU memory budget in GB (autosplit + process cap). "
                            "14.7 is the 16 GB-card recipe")
