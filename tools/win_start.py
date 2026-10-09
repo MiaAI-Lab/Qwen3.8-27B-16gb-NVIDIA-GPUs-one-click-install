@@ -403,16 +403,37 @@ def bootstrap(cfg: dict[str, str]) -> None:
     scripts = str(VENV_PY.parent)
     os.environ["PATH"] = scripts + os.pathsep + os.environ.get("PATH", "")
 
-    if not shutil.which("git"):
-        die("Git was not found on PATH. Install Git for Windows, then run windows\\start.bat again.")
-
     t3 = time.time()
-    step(4, 5, f"{note}  (5-20 min, needs VS C++ tools)")
-    run(
-        pip_cmd("install", "--no-build-isolation", engine_src),
-        cwd=str(ROOT),
-    )
-    step_ok("engine", time.time() - t3)
+    # Prebuilt wheel first, exactly as the browser setup does (setup_core.py): a
+    # source build needs a CUDA toolkit that matches torch's CUDA line, which a
+    # machine with only a newer toolkit cannot satisfy. An explicit EXL3_REPO
+    # or a local engine checkout is a request for a build, so it is honoured.
+    installed = False
+    explicit_src = bool((cfg.get("EXL3_REPO") or os.environ.get("EXL3_REPO") or "").strip())
+    if engine_src != str(ROOT) and not explicit_src:
+        tags = wheels.interpreter_tags(VENV_PY)
+        wheel_note = wheels.describe(wheels.ENGINE_PACKAGE, tags, cfg,
+                                     venv_python=VENV_PY, engine=ENGINE_VERSION)
+        args = wheels.prebuilt_args(wheels.ENGINE_PACKAGE, tags, cfg,
+                                    venv_python=VENV_PY, engine=ENGINE_VERSION)
+        if wheel_note and args:
+            step(4, 5, f"ExLlamaV3 v{ENGINE_VERSION}  - prebuilt wheel: {wheel_note}")
+            cmd = pip_cmd(*args)
+            print(dim("      > " + " ".join(cmd)), flush=True)
+            if subprocess.run(cmd, cwd=str(ROOT)).returncode == 0:
+                installed = True
+                step_ok("engine (prebuilt wheel)", time.time() - t3)
+            else:
+                warn("The prebuilt engine could not be installed; building from source instead.")
+    if not installed:
+        if not shutil.which("git"):
+            die("Git was not found on PATH. Install Git for Windows, then run windows\\start.bat again.")
+        step(4, 5, f"{note}  (5-20 min, needs VS C++ tools)")
+        run(
+            pip_cmd("install", "--no-build-isolation", engine_src),
+            cwd=str(ROOT),
+        )
+        step_ok("engine", time.time() - t3)
 
     t4 = time.time()
     step(5, 5, "Server dependencies (aiohttp, huggingface_hub, pillow"
