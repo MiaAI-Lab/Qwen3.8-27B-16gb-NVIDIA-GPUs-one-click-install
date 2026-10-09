@@ -26,6 +26,22 @@ Notable changes to this kit. Newest first.
   Mitchell (PR #12).
 
 ### Added
+- Anthropic Messages API (`/v1/messages`, `/v1/messages/count_tokens`,
+  `/v1/models/{id}`) so Claude Code, Cline, Continue and the Anthropic SDKs can use
+  the same server, and a two-GPU split (`GPU_MEM_GB=14.9,7.2`) that keeps full
+  attention and the KV cache on the fast card, plus `tools/bench.py`. Thanks to Tiago
+  Dias (PR #13). Hardened on the way in: image URLs are fetched only from public
+  hosts with redirects re-checked and at most 8 per request (this also closes the
+  same hole on `/v1/chat/completions`); `count_tokens` runs off the event loop and
+  never fetches or embeds images; `max_tokens` is clamped to the cache; tool results
+  with `is_error` say so to the model; a per-GPU `GPU_MEM_GB` survives the profile
+  planner and is validated against the visible cards; the loader patch is checked
+  against exllamav3 1.6.0 and disabled if its signature differs; `DRAFT=dflash2` is
+  refused on a split; the harness's fallback to unpinned `dsh@latest` is opt-in
+  (`DSH_ALLOW_LATEST=1`); oversized or corrupt images are a 400, not a 500 or an
+  out-of-memory; a long session keeps working once it has read more than 8 images
+  (older ones become a text note); a prompt that cannot fit is a 400 before a
+  stream opens instead of an error inside a 200.
 - Per-request stats: one ` == stats` line per request, live ` .. ` progress lines
   (`PROGRESS_EVERY`), and `last_request` in `/health`. Thanks to Ivan Ribeiro Rocha
   (PR #7).

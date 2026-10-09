@@ -587,6 +587,13 @@ def write_env(path: Path, updates: dict[str, str]) -> None:
     import os, stat, tempfile
     updates = {k: _env_value(v) for k, v in updates.items()}
     lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    # "14.9,7.2" is a two-GPU split a person wrote by hand. The profile planner
+    # knows one card, so it must not turn the list back into a single budget.
+    for raw in lines:
+        m = re.match(r"^\s*GPU_MEM_GB\s*=\s*(.*)$", raw)
+        if m and "," in m.group(1) and "," not in updates.get("GPU_MEM_GB", ""):
+            updates.pop("GPU_MEM_GB", None)
+            break
     done = set()
     for i, raw in enumerate(lines):
         m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", raw)

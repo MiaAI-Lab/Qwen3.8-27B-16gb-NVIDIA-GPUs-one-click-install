@@ -89,6 +89,15 @@ def gate_message(total_gib: float) -> str:
     return ""
 
 
+def multi_gpu_message(gpu_mem_gb: str | None) -> str:
+    """Why DRAFT=dflash2 is refused with a per-GPU GPU_MEM_GB list, or ""."""
+    if "," in (gpu_mem_gb or ""):
+        return ("DRAFT=dflash2 was only measured on a single card; GPU_MEM_GB="
+                f"{gpu_mem_gb} splits the model across two.\n"
+                "Set DRAFT=mtp (the default) in .env, or a single GPU_MEM_GB value.")
+    return ""
+
+
 def pin(model_dir: str) -> tuple[dict[str, str] | None, str]:
     """(settings, "") for a measured quant, else (None, why not).
 
@@ -127,6 +136,7 @@ def main(argv: list[str]) -> int:
     g.add_argument("--vram", type=float, help="pretend the card has this many GiB")
     p = sub.add_parser("pin", help="print the settings to run a measured quant with")
     p.add_argument("--model-dir", required=True)
+    p.add_argument("--gpu-mem", default="", help="GPU_MEM_GB as configured (refused if per-GPU list)")
     v = sub.add_parser("verify", help="check the drafter's checksum")
     v.add_argument("dir")
     a = ap.parse_args(argv)
@@ -135,7 +145,9 @@ def main(argv: list[str]) -> int:
         import profiles
         why = gate_message(a.vram if a.vram is not None else profiles.detect_gpu().total_gib)
     elif a.cmd == "pin":
-        settings, why = pin(a.model_dir)
+        settings, why = (None, multi_gpu_message(a.gpu_mem))
+        if not why:
+            settings, why = pin(a.model_dir)
         if settings is not None:
             for k, val in {**settings, "DFLASH2_REPO": DRAFT_REPO, "DFLASH2_REVISION": DRAFT_REVISION,
                            "DFLASH2_DIR": DRAFT_DIR}.items():
