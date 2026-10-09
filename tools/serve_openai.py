@@ -860,15 +860,26 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
         attempt = {"eos": eos, "wall": time.time() - t0}
         return job
 
-    job = run_once()
+    req_t0 = time.time()
     retried = False
-    # Forced tool_choice is a prompt nudge; at temperature > 0 the model can
-    # occasionally skip the call. One greedy retry makes it deterministic -
-    # but not after a cancel, or Stop would start a second generation.
-    if reason != "cancelled" and forced_choice and not parse_tool_calls(text, schemas)[1]:
-        temperature = 0.0
+    try:
         job = run_once()
-        retried = True
+        # Forced tool_choice is a prompt nudge; at temperature > 0 the model can
+        # occasionally skip the call. One greedy retry makes it deterministic -
+        # but not after a cancel, or Stop would start a second generation.
+        if reason != "cancelled" and forced_choice and not parse_tool_calls(text, schemas)[1]:
+            temperature = 0.0
+            job = run_once()
+            retried = True
+    except Exception as e:
+        # a request that dies in the engine (e.g. admission refused) would
+        # otherwise leave no line at all in the log
+        print(f" == stats {_req_tag(rid, streaming)} failed after "
+              f"{time.time() - req_t0:.2f} s: {type(e).__name__}: {e}", flush = True)
+        raise
+    if retried:
+        # the caller waited for both attempts, not just the one it got
+        attempt["wall"] = time.time() - req_t0
     seq = job.sequences[0]
     out_toks = int(seq.sequence_ids.seq_len - prompt_toks)
     # One stats line per request, for the run that produced the returned
