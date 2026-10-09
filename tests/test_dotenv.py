@@ -10,6 +10,7 @@ from cli import read_env
 from profiles import read_env as profile_read_env
 from profiles import write_env
 from win_start import load_dotenv
+from dsh import env_value
 
 
 def _write(text: str) -> Path:
@@ -47,6 +48,19 @@ class DotenvHash(unittest.TestCase):
         self.assertEqual(load_dotenv(path)["HF_TOKEN"], "hf_abc#def")
         self.assertEqual(profile_read_env(path)["HF_TOKEN"], "hf_abc#def")
         self.assertEqual(read_env(path)["CONTEXT_SIZE"], "262144")
+
+
+class DshEnvValue(unittest.TestCase):
+    """The harness launcher read API_KEY with its own parser and cut it at '#'."""
+
+    def test_quoted_hash_kept(self):
+        self.assertEqual(env_value('"key#1"'), "key#1")
+
+    def test_trailing_comment_removed(self):
+        self.assertEqual(env_value("abc   # note"), "abc")
+
+    def test_hash_without_space_kept(self):
+        self.assertEqual(env_value("abc#def"), "abc#def")
 
 
 if __name__ == "__main__":

@@ -590,6 +590,17 @@ def wait_ready(proc: subprocess.Popen | None, port: int,
 
 
 # ------------------------------------------------------------------ cli -----
+def env_value(raw: str) -> str:
+    """One .env value, read the way linux/start.sh and the other launchers read
+    it: a quoted value keeps a '#', an unquoted one ends at ' #'."""
+    v = raw.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        return v[1:-1]
+    if " #" in v:
+        v = v.split(" #", 1)[0].rstrip()
+    return v
+
+
 def main() -> int:
     """`python tools/dsh.py [--port N] [--base URL]` - configure and run it.
 
@@ -616,7 +627,7 @@ def main() -> int:
             line = raw.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, _, v = line.partition("=")
-                cfg[k.strip()] = v.split("#")[0].strip().strip('"').strip("'")
+                cfg[k.strip()] = env_value(v)
 
     port = args.port or int(
         cfg.get("SIMPLEX_HARNESS_PORT") or cfg.get("DSH_PORT") or DEFAULT_PORT)
