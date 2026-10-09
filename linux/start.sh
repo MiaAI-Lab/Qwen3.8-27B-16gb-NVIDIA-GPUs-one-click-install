@@ -10,6 +10,8 @@ set -euo pipefail
 # This script lives in linux/; the kit is its parent.
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SELF_DIR/.."
+# shellcheck source=linux/preflight.sh
+. "$SELF_DIR/preflight.sh"
 
 # --- background mode ------------------------------------------------------
 # On Windows the kit lives in the tray with no console; the honest equivalent
@@ -342,10 +344,12 @@ if [ ! -x "$VENV/bin/python" ] \
         # GB10/Spark needs the arch list spelled out; x86 auto-detects.
         export TORCH_CUDA_ARCH_LIST="12.0;12.1"
     fi
-    export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+    # nvcc lives in /usr/local/cuda on Debian/Ubuntu but /opt/cuda on Arch;
+    # take whichever exists instead of assuming one.
+    export CUDA_HOME="${CUDA_HOME:-$(detect_cuda_home || echo /usr/local/cuda)}"
     # 8 parallel nvcc jobs when the machine can take it (halves wall time on
     # many-core boxes); 4 otherwise. Override in .env if needed.
-    export MAX_JOBS="${MAX_JOBS:-$(( $(nproc) >= 8 && $(free -g | awk '/^Mem:/{print $2}') >= 32 ? 8 : 4 ))}"
+    export MAX_JOBS="${MAX_JOBS:-$(( $(nproc) >= 8 && $(_free_gib 2) >= 32 ? 8 : 4 ))}"
     # Fail fast (clear error) instead of hanging if the engine repo needs
     # auth (GIT_ASKPASS: proven on git 2.43 where GIT_TERMINAL_PROMPTS
     # alone does not suppress the credential prompt).
@@ -365,6 +369,9 @@ if [ ! -x "$VENV/bin/python" ] \
             || _engine_wheel=""
     fi
     if [ -z "$_engine_wheel" ]; then
+        # about to compile: stop here, with the fix, if the host compiler is one
+        # this CUDA release cannot use (rolling-release distros ship GCC 14+)
+        check_host_compiler "$CUDA_HOME" || exit 1
         _quiet_step "4/5 ${_engine_note} (5–20 min depending on machine)" \
             "$VENV/bin/pip" install --no-build-isolation \
                 "${_engine_src}"
@@ -442,7 +449,7 @@ else
     else
         # GB10/unified memory (nvidia-smi reports no total): available system
         # RAM minus a reserve for the OS and anything else on the box
-        GPU_MEM_GB=$(( $(free -g | awk '/^Mem:/{print $7}') - 16 ))
+        GPU_MEM_GB=$(( $(_free_gib 7) - 16 ))
     fi
     if [ "$GPU_MEM_GB" -lt 8 ]; then GPU_MEM_GB=8; fi
     echo "GPU_MEM_GB not set — auto-detected budget: ${GPU_MEM_GB} GB (override in .env)"
