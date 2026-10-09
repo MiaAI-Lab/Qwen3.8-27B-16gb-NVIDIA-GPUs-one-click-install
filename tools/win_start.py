@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Windows launcher (called by windows\\start.bat). Port of linux/start.sh:
 
-  first run  -> venv, torch, ExLlamaV3 v1.4.4 (CUDA compile), server deps
+  first run  -> venv, torch, ExLlamaV3 v1.6.0 (prebuilt wheel or CUDA compile), server deps
   every run  -> download weights if missing, serve, then start the DeepSeek
                 Harness against it and open that once the server is Ready
                 (UI in .env: browser | server | no; see tools/dsh.py).
@@ -22,9 +22,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 VENV_PY = ROOT / ".venv" / "Scripts" / "python.exe"
-ENGINE_VERSION = "1.4.4"
-DEFAULT_ENGINE_VERSION = ENGINE_VERSION
-EXTRA_PACKAGES: tuple[str, ...] = ()     # DRAFT=dflash2 only (tools/dflash2.py)
+ENGINE_VERSION = "1.6.0"
+EXTRA_PACKAGES: tuple[str, ...] = ("transformers",)   # 1.6.0 chat template needs it (tools/dflash2.py)
 ENV_FILE = ROOT / ".env"
 ENV_EXAMPLE = ROOT / ".env.example"
 SERVE = ROOT / "tools" / "serve_openai.py"
@@ -251,7 +250,7 @@ def venv_ok() -> bool:
 
 
 def ensure_triton() -> None:
-    """ExLlamaV3 v1.4.4 imports Triton kernels at module load. On Windows the
+    """ExLlamaV3 imports Triton kernels at module load. On Windows the
     stock `triton` package is not available; without `triton-windows` you get:
     ImportError: cannot import name '_dsa_attn_split_kernel' from dsa_triton."""
     if sys.platform != "win32" or not VENV_PY.is_file():
@@ -310,11 +309,7 @@ def resolve_engine_src(cfg: dict[str, str]) -> str:
     install on Windows."""
     if (ROOT / "exllamav3" / "__init__.py").is_file():
         return str(ROOT)
-    # read from cfg, not from a module name: setup_core imports this file a
-    # second time, so a name rebound by select_environment() is not seen there
-    import dflash2
-    default = (f"git+https://github.com/turboderp-org/exllamav3.git@v{dflash2.ENGINE_VERSION}"
-               if dflash2.wanted(cfg.get("DRAFT")) else DEFAULT_ENGINE)
+    default = DEFAULT_ENGINE
     raw = (cfg.get("EXL3_REPO") or os.environ.get("EXL3_REPO") or "").strip()
     if not raw:
         return default
@@ -444,27 +439,15 @@ def require_engine_version() -> None:
 
 
 def select_environment(cfg: dict[str, str]) -> None:
-    """DRAFT=dflash2 (tools/dflash2.py) runs on ExLlamaV3 1.6.0 in a virtualenv
-    of its own, so the 1.4.4 one every other DRAFT value uses is never touched.
-    Everything below reads the module-level names this rebinds - here and in
-    setup_core, which the setup page and the console fallback share. A card
-    that is too small is refused before anything is created. Windows is
-    untested for this path (see README)."""
+    """Every DRAFT value shares the one .venv on ExLlamaV3 1.6.0 (tools/dflash2.py).
+    Only DRAFT=dflash2 has a gate: a card that is too small is refused before
+    anything is created. Windows is untested for this path (see README)."""
     import dflash2
-    global VENV_PY, ENGINE_VERSION, EXTRA_PACKAGES
     if not dflash2.wanted(cfg.get("DRAFT")):
         return
     why = dflash2.gate_message(nvidia_total_mib() / 1024)
     if why:
         die(why)
-    import setup_core
-    VENV_PY = ROOT / dflash2.VENV_NAME / "Scripts" / "python.exe"
-    ENGINE_VERSION = dflash2.ENGINE_VERSION
-    EXTRA_PACKAGES = dflash2.EXTRA_PACKAGES
-    setup_core.VENV_DIR = ROOT / dflash2.VENV_NAME
-    setup_core.VENV_PY = VENV_PY
-    setup_core.ENGINE_VERSION = ENGINE_VERSION
-    setup_core.EXTRA_PACKAGES = EXTRA_PACKAGES
 
 
 def dflash2_pin(cfg: dict[str, str]) -> dict[str, str] | None:
@@ -1629,13 +1612,9 @@ def main() -> int:
                 # The UI asked for another model: .env has the new settings, so
                 # rebuild the command line and load again in this same window.
                 cfg = load_dotenv(ENV_FILE)
-                drafted_before = ENGINE_VERSION != DEFAULT_ENGINE_VERSION
-                import dflash2
-                if dflash2.wanted(cfg.get("DRAFT")) != drafted_before:
-                    # linux/start.sh re-execs itself here and so picks the other
-                    # environment; this loop keeps the one it started with
-                    die("DRAFT was changed in .env while the kit was running.\n"
-                        "Close this window and run windows\\start.bat again.")
+                # re-apply the card gate for DRAFT=dflash2; server_command
+                # refuses an unmeasured quant and fetches the drafter
+                select_environment(cfg)
                 cmd, host, port, gpu_mem, ui, context = server_command(cfg)
                 rt.url = f"http://127.0.0.1:{port}/"   # a switch may change PORT
                 print()

@@ -38,7 +38,7 @@ workload, once per Python version:
     build-env\Scripts\python -m pip install -U pip wheel setuptools ninja
     build-env\Scripts\python -m pip install torch --extra-index-url https://download.pytorch.org/whl/cu128
     build-env\Scripts\python -m pip wheel --no-build-isolation --no-deps ^
-        git+https://github.com/turboderp-org/exllamav3.git@v1.4.4 -w wheels
+        git+https://github.com/turboderp-org/exllamav3.git@v1.6.0 -w wheels
 
 The wheel is tied to the torch build the line above installed, so build one per
 CUDA line you intend to support.

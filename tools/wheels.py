@@ -15,7 +15,7 @@ Sources are tried in this order, and the first that yields a matching wheel wins
      exact URL rather than a --find-links page.
   3. WHEEL_INDEX in .env - one or more `pip --find-links` targets (a GitHub
      Releases page, a file share, an internal index).
-  4. PyPI - triton-windows lives there; exllamav3 does not.
+  4. PyPI - triton-windows lives there; the kit does not take the engine from it.
   5. Compiling from source, which is what the kit did before this module.
 
 Nothing here trusts a filename blindly: a wheel is only offered to pip when
@@ -154,47 +154,26 @@ def cuda_tag(driver_index_url: str = "") -> str:
 
 # --------------------------------------------------- the engine's release -----
 
-# What turboderp-org/exllamav3 v1.4.4 actually published. Written down rather
+# What turboderp-org/exllamav3 v1.6.0 actually published. Written down rather
 # than discovered, because setup has to be able to say what it will do before
 # it has a network - and because the answer has to be exact.
 #
 # Why exact: the CUDA line and the torch version live in the wheel's *local
-# version* ("1.4.4+cu128.torch2.10.0"), which pip does not match against
+# version* ("1.6.0+cu128.torch2.10.0"), which pip does not match against
 # anything. Point pip at the release with --find-links and it filters on the
 # Python and platform tags only, then takes the highest version string - so a
 # torch 2.10 venv is happily handed the torch2.11 build, and the failure comes
 # later as an undefined-symbol ImportError that reads like a corrupt install.
 # So the wheel is resolved here and pip is given one URL it cannot argue with.
 ENGINE_PACKAGE = "exllamav3"
-ENGINE_VERSION = "1.4.4"
+ENGINE_VERSION = "1.6.0"
 ENGINE_RELEASE = ("https://github.com/turboderp-org/exllamav3/releases/download/"
                   f"v{ENGINE_VERSION}/")
 
-# cuda line -> torch version -> the cp tags built for it (same on both platforms)
+# cuda line -> torch version -> the cp tags built for it (same on both platforms).
+# Taken from the v1.6.0 release's asset list. The ROCm wheels in that release are
+# not listed; the kit is NVIDIA only.
 ENGINE_WHEELS: dict[str, dict[str, tuple[str, ...]]] = {
-    "cu128": {
-        "2.7.0":  ("cp310", "cp311", "cp312", "cp313"),
-        "2.8.0":  ("cp310", "cp311", "cp312", "cp313"),
-        "2.9.0":  ("cp310", "cp311", "cp312", "cp313", "cp314"),
-        "2.10.0": ("cp310", "cp311", "cp312", "cp313", "cp314"),
-        "2.11.0": ("cp312", "cp313", "cp314"),
-    },
-    "cu132": {
-        "2.11.0": ("cp312", "cp313", "cp314"),
-    },
-}
-# Only these platforms are built. A wheel for anything else does not exist, so
-# the source build stays the answer there (aarch64 / GB10, for one).
-ENGINE_PLATFORMS = ("win_amd64", "linux_x86_64")
-
-# The same table for v1.6.0, which DRAFT=dflash2 installs (see tools/dflash2.py).
-# Taken from that release's asset list, not from this one: it was built against
-# other torch versions (no 2.7, and cu132 now carries 2.12 and 2.13). The ROCm
-# wheels in that release are not listed; the kit is NVIDIA only. Everything that
-# resolves a wheel takes `engine=` and defaults to the version above, so the
-# default install is decided by the table above exactly as before.
-ENGINE_VERSION_DFLASH2 = "1.6.0"
-ENGINE_WHEELS_DFLASH2: dict[str, dict[str, tuple[str, ...]]] = {
     "cu128": {
         "2.8.0":  ("cp310", "cp311", "cp312", "cp313"),
         "2.9.0":  ("cp310", "cp311", "cp312", "cp313", "cp314"),
@@ -207,7 +186,27 @@ ENGINE_WHEELS_DFLASH2: dict[str, dict[str, tuple[str, ...]]] = {
         "2.13.0": ("cp310", "cp311", "cp312", "cp313", "cp314"),
     },
 }
-ENGINE_TABLES = {ENGINE_VERSION: ENGINE_WHEELS, ENGINE_VERSION_DFLASH2: ENGINE_WHEELS_DFLASH2}
+# Only these platforms are built. A wheel for anything else does not exist, so
+# the source build stays the answer there (aarch64 / GB10, for one).
+ENGINE_PLATFORMS = ("win_amd64", "linux_x86_64")
+
+# The previous default, v1.4.4, kept so `wheels.py --engine-version 1.4.4` still
+# resolves (the launchers themselves require 1.6.0). It was built against other torch versions
+# (it has 2.7, and cu132 carries only 2.11).
+ENGINE_VERSION_LEGACY = "1.4.4"
+ENGINE_WHEELS_LEGACY: dict[str, dict[str, tuple[str, ...]]] = {
+    "cu128": {
+        "2.7.0":  ("cp310", "cp311", "cp312", "cp313"),
+        "2.8.0":  ("cp310", "cp311", "cp312", "cp313"),
+        "2.9.0":  ("cp310", "cp311", "cp312", "cp313", "cp314"),
+        "2.10.0": ("cp310", "cp311", "cp312", "cp313", "cp314"),
+        "2.11.0": ("cp312", "cp313", "cp314"),
+    },
+    "cu132": {
+        "2.11.0": ("cp312", "cp313", "cp314"),
+    },
+}
+ENGINE_TABLES = {ENGINE_VERSION: ENGINE_WHEELS, ENGINE_VERSION_LEGACY: ENGINE_WHEELS_LEGACY}
 
 
 def _ver_key(v: str) -> tuple:
@@ -316,15 +315,14 @@ def prebuilt_args(package: str, tags: dict, cfg: dict, folder: Path = WHEEL_DIR,
     args = ["install", "--only-binary", ":all:", "--no-build-isolation"]
     for url in links:
         args += ["--find-links", url]
-    args.append(package if engine == ENGINE_VERSION else f"{package}=={engine}")
+    args.append(f"{package}=={engine}")
     return args
 
 
 def _local_version(package: str, engine: str) -> str | None:
     """The engine release a wheel in wheels\\ must be, or None for any other
-    package. With both venvs in use (DRAFT=dflash2) the folder can hold a 1.4.4
-    and a 1.6.0 engine wheel side by side, and newest-wins would put 1.6.0 into
-    .venv."""
+    package. The folder can hold wheels of more than one engine release side
+    by side, and newest-wins would pick the wrong one."""
     return engine if package.lower().replace("_", "-") == ENGINE_PACKAGE else None
 
 

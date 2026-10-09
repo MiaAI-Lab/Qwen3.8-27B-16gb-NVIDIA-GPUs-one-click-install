@@ -32,8 +32,8 @@ ENV_FILE = ROOT / ".env"
 ENV_EXAMPLE = ROOT / ".env.example"
 
 ENGINE_PACKAGE = "exllamav3"
-ENGINE_VERSION = "1.4.4"
-EXTRA_PACKAGES: tuple[str, ...] = ()     # DRAFT=dflash2 only (tools/dflash2.py)
+ENGINE_VERSION = "1.6.0"
+EXTRA_PACKAGES: tuple[str, ...] = ("transformers",)   # 1.6.0 chat template needs it (tools/dflash2.py)
 
 
 class SetupError(RuntimeError):
