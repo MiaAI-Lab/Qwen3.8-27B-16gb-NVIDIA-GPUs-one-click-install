@@ -30,13 +30,34 @@ class BlockedURL(ValueError):
     pass
 
 
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+_V4_COMPAT = ipaddress.ip_network("::/96")
+_SIIT = ipaddress.ip_network("::ffff:0:0:0/96")      # IPv4-translated (RFC 2765)
+
+
+def _embedded_v4(ip: ipaddress.IPv6Address):
+    """The IPv4 address a v6 address carries, if it carries one (mapped, 6to4,
+    Teredo, NAT64, deprecated IPv4-compatible); otherwise None."""
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    if ip.sixtofour is not None:
+        return ip.sixtofour
+    if ip.teredo is not None:
+        return ip.teredo[1]
+    if ip in _NAT64 or ip in _V4_COMPAT or ip in _SIIT:
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
+
+
 def _allowed(addr: str) -> bool:
     try:
         ip = ipaddress.ip_address(addr.split("%", 1)[0])
     except ValueError:
         return False
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv6Address):
+        v4 = _embedded_v4(ip)
+        if v4 is not None:
+            return _allowed(str(v4))
     return ip.is_global and not ip.is_multicast
 
 
@@ -44,9 +65,13 @@ def check_url(url: str, resolver=socket.getaddrinfo) -> None:
     """Raise BlockedURL unless `url` is http(s) and resolves only to public addresses."""
     if os.environ.get("ALLOW_PRIVATE_IMAGE_URLS", "").strip().lower() in ("1", "true", "yes"):
         return
+    if "\\" in url or any(ord(c) < 33 for c in url):
+        raise BlockedURL("malformed URL")
     parts = urllib.parse.urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise BlockedURL("not an http(s) URL")
+    if parts.username is not None or parts.password is not None:
+        raise BlockedURL("credentials in the URL")
     try:
         infos = resolver(parts.hostname, parts.port or (443 if parts.scheme == "https" else 80),
                          type=socket.SOCK_STREAM)
@@ -66,13 +91,25 @@ class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def fetch(url: str, *, timeout: float = 20, limit: int = 48 * 1024 * 1024,
-          headers: dict | None = None) -> bytes:
-    """GET a public URL; at most `limit` bytes. Raises BlockedURL / OSError / ValueError."""
+          headers: dict | None = None, deadline: float = 30.0) -> bytes:
+    """GET a public URL; at most `limit` bytes and `deadline` seconds in total
+    (`timeout` is per socket operation, which a host that drips bytes never
+    trips). Raises BlockedURL / OSError / ValueError."""
+    import time
     check_url(url)
+    end = time.monotonic() + deadline
     opener = urllib.request.build_opener(_GuardedRedirect)
     req = urllib.request.Request(url, headers = headers or {})
+    chunks, size = [], 0
     with opener.open(req, timeout = timeout) as r:
-        raw = r.read(limit + 1)
-    if len(raw) > limit:
-        raise ValueError(f"larger than {limit // (1024 * 1024)} MB")
-    return raw
+        while True:
+            chunk = r.read(64 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > limit:
+                raise ValueError(f"larger than {limit // (1024 * 1024)} MB")
+            if time.monotonic() > end:
+                raise TimeoutError("fetch took too long")
+            chunks.append(chunk)
+    return b"".join(chunks)

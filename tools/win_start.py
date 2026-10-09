@@ -1586,6 +1586,8 @@ def main() -> int:
         info("After Ready you will be asked whether to open Cherry Studio.")
     print()
     env = dict(os.environ)
+    if (cfg.get("ALLOW_PRIVATE_IMAGE_URLS") or "").strip():   # read by tools/url_guard.py
+        env["ALLOW_PRIVATE_IMAGE_URLS"] = cfg["ALLOW_PRIVATE_IMAGE_URLS"].strip()
     # On a pipe, Python falls back to the ANSI code page; this side decodes
     # UTF-8, so say so rather than letting an accented path arrive as mojibake.
     env.setdefault("PYTHONIOENCODING", "utf-8")

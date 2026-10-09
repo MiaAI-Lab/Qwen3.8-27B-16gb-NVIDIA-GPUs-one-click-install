@@ -38,7 +38,10 @@ Notable changes to this kit. Newest first.
   planner and is validated against the visible cards; the loader patch is checked
   against exllamav3 1.6.0 and disabled if its signature differs; `DRAFT=dflash2` is
   refused on a split; the harness's fallback to unpinned `dsh@latest` is opt-in
-  (`DSH_ALLOW_LATEST=1`).
+  (`DSH_ALLOW_LATEST=1`); oversized or corrupt images are a 400, not a 500 or an
+  out-of-memory; a long session keeps working once it has read more than 8 images
+  (older ones become a text note); a prompt that cannot fit is a 400 before a
+  stream opens instead of an error inside a 200.
 - Per-request stats: one ` == stats` line per request, live ` .. ` progress lines
   (`PROGRESS_EVERY`), and `last_request` in `/health`. Thanks to Ivan Ribeiro Rocha
   (PR #7).

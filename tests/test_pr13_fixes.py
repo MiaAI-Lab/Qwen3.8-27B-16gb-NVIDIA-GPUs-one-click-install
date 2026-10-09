@@ -46,17 +46,51 @@ class CountOnly(unittest.TestCase):
             ]}]
             ids, emb = so.build_inputs(tok, msgs, None, True, None, count_only = True)
             self.assertIsNone(emb)
-            self.assertEqual(tok.encoded.count("<|image_pad|>"), 2 * 1024)
+            # 1 MP / 1024 tokens, plus the rounding allowance, for each of 2 images
+            self.assertEqual(tok.encoded.count("<|image_pad|>"), 2 * (1024 + 256))
         finally:
             so.vision.clear(); so.vision.update(saved)
 
 
 class Images(unittest.TestCase):
-    def test_too_many_images_refused(self):
-        part = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
-        msgs = [{"role": "user", "content": [part] * (so.MAX_IMAGES + 1)}]
+    PART = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+
+    def test_too_many_images_in_the_current_turn_refused(self):
+        msgs = [{"role": "user", "content": [self.PART] * (so.MAX_IMAGES + 1)}]
         with self.assertRaises(ValueError):
             so.extract_images(msgs)
+
+    def test_long_history_of_screenshots_keeps_working(self):
+        # a session that read 12 screenshots over earlier turns, then asks again
+        msgs = []
+        for _ in range(12):
+            msgs += [{"role": "user", "content": [self.PART]},
+                     {"role": "assistant", "content": "ok"}]
+        msgs.append({"role": "user", "content": [self.PART, {"type": "text", "text": "and this?"}]})
+        out, urls = so.extract_images(msgs)
+        self.assertEqual(len(urls), so.MAX_IMAGES)
+        flat = [p for m in out if isinstance(m["content"], list) for p in m["content"]]
+        self.assertEqual(sum(1 for p in flat if p.get("type") == "image"), so.MAX_IMAGES)
+        self.assertEqual(sum(1 for p in flat if p.get("text") == "[earlier image omitted]"),
+                         13 - so.MAX_IMAGES)
+        # the newest image is the one that is kept
+        self.assertEqual(out[-1]["content"][0], {"type": "image"})
+
+    def test_decompression_bomb_is_a_400_not_a_500(self):
+        import base64, io, zlib
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("L", (9000, 9000)).save(buf, "PNG")        # 81 MP, tiny file
+        url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        with self.assertRaises(ValueError) as cm:
+            so.decode_image(url)
+        self.assertIn("megapixels", str(cm.exception))
+
+    def test_corrupt_image_is_a_value_error(self):
+        import base64
+        url = "data:image/png;base64," + base64.b64encode(b"not an image at all").decode()
+        with self.assertRaises(ValueError):
+            so.decode_image(url)
 
     def test_internal_urls_refused_without_saying_why(self):
         for url in ("http://127.0.0.1:8888/health", "http://169.254.169.254/latest/meta-data/",
@@ -152,3 +186,24 @@ class HttpSmoke(unittest.IsolatedAsyncioTestCase):
             self.client.post("/v1/messages/count_tokens", json = body), timeout = 3)
         self.assertEqual(r.status, 200, await r.text())
         self.assertIn("input_tokens", await r.json())
+
+
+class PreStreamCheck(unittest.IsolatedAsyncioTestCase):
+    async def test_prompt_too_long_is_reported_before_the_stream_opens(self):
+        class Tok(FakeTokenizer):
+            def hf_chat_template(self, messages, **kw):
+                class Ids:
+                    shape = (1, 100_000)
+                return Ids()
+        saved = so.stats.get("context_length")
+        so.stats["context_length"] = 65536
+        try:
+            req = {"messages": [{"role": "user", "content": "hi"}], "tools": None,
+                   "tool_choice": None, "enable_thinking": True, "reasoning_effort": None}
+            msg = await so.prompt_too_long(req, Tok())
+            self.assertIsNotNone(msg)
+            self.assertIn("too long", msg)
+            so.stats["context_length"] = 262144
+            self.assertIsNone(await so.prompt_too_long(req, Tok()))
+        finally:
+            so.stats["context_length"] = saved

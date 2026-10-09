@@ -85,7 +85,9 @@ MODEL_ID = "qwen3.8-27b-exl3-2.0bpw"
 
 gen_lock = threading.Lock()          # serialize generation (batch-1 draft)
 vision = {"model": None, "max_pixels": 1048576, "reason": "not loaded"}
-MAX_IMAGES = 8   # per request
+MAX_IMAGES = 8   # images the model sees in one request (newest win)
+MAX_DECODE_PIXELS = 64_000_000   # ~190 MB as RGB; larger is refused before decoding
+_decode_slots = threading.BoundedSemaphore(2)   # concurrent image decodes
 IMAGE_TRIPLE = "<|vision_start|><|image_pad|><|vision_end|>"   # what the chat template emits per image
 stats_lock = threading.Lock()
 # Cumulative counters for sparkDash live tok/s (GET /health).
@@ -401,6 +403,16 @@ def _check_budgets(budgets):
                          f"visible (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r}).")
     if len(budgets) > 2:
         raise SystemExit("at most two GPUs are supported (GPU_MEM_GB=<gpu0>,<gpu1>)")
+    totals = [torch.cuda.get_device_properties(i).total_memory / 1024 ** 3
+              for i in range(len(budgets))]
+    for i, (gb, tot) in enumerate(zip(budgets, totals)):
+        if gb > tot:
+            raise SystemExit(f"GPU_MEM_GB budget {gb:g} GB for GPU {i} is more than the card has "
+                             f"({tot:.1f} GB). Lower it.")
+    if len(budgets) == 2 and totals[1] > totals[0]:
+        print(f" !! GPU 1 ({totals[1]:.0f} GB) is larger than GPU 0 ({totals[0]:.0f} GB). The split "
+              "keeps attention, the KV cache and the output head on GPU 0 - list the "
+              "faster card first, in nvidia-smi order.", flush = True)
 
 
 def _cap_process_vram(budgets):
@@ -655,10 +667,23 @@ def decode_image(url):
             raise ValueError("could not fetch the image URL")
     else:
         raise ValueError("image_url must be a data: URL or an http(s) URL")
-    img = Image.open(io.BytesIO(raw))
-    img.load()
-    if img.mode != "RGB":
-        img = img.convert("RGB")
+    with _decode_slots:
+        try:
+            img = Image.open(io.BytesIO(raw))
+            w0, h0 = img.size                    # header only, nothing decoded yet
+            if w0 * h0 > MAX_DECODE_PIXELS:
+                raise ValueError(f"image has {w0 * h0 / 1e6:.0f} megapixels; "
+                                 f"the limit is {MAX_DECODE_PIXELS // 1_000_000}")
+            if getattr(img, "format", None) == "JPEG" and w0 * h0 > vision["max_pixels"]:
+                # let the decoder produce a smaller picture instead of the full one
+                img.draft("RGB", (max(32, w0 // 2), max(32, h0 // 2)))
+            img.load()
+        except ValueError:
+            raise
+        except Exception:                        # corrupt, truncated, unsupported, bomb
+            raise ValueError("could not decode the image")
+        if img.mode != "RGB":
+            img = img.convert("RGB")
     w, h = img.size
     if w * h > vision["max_pixels"]:
         k = math.sqrt(vision["max_pixels"] / float(w * h))
@@ -670,8 +695,22 @@ def extract_images(messages):
     """Pull image_url parts out of the OpenAI messages. Returns
     (messages with the parts rewritten as {"type": "image"}, [urls]).
     The chat template turns each {"type": "image"} into IMAGE_TRIPLE.
-    More than MAX_IMAGES in one request is refused: each is decoded in memory
-    and embedded on the GPU while the generation lock is held."""
+    Each image is decoded in memory and embedded on the GPU, so at most
+    MAX_IMAGES go to the model: more than that in the current turn (everything
+    after the last assistant message) is refused, while older images in a long
+    session are replaced by a short text note, oldest first, so a conversation
+    that has read many screenshots keeps working."""
+    last_assistant = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"),
+                         default = -1)
+
+    def count(m):
+        c = m.get("content")
+        return sum(1 for part in c if isinstance(part, dict)
+                   and part.get("type") in ("image_url", "image")) if isinstance(c, list) else 0
+    current = sum(count(m) for m in messages[last_assistant + 1:])
+    if current > MAX_IMAGES:
+        raise ValueError(f"too many images in one message ({current}; the limit is {MAX_IMAGES})")
+    drop = max(0, sum(count(m) for m in messages) - MAX_IMAGES)
     urls = []
     out = []
     for m in messages:
@@ -682,6 +721,10 @@ def extract_images(messages):
                 if isinstance(part, dict) and part.get("type") in ("image_url", "image"):
                     iu = part.get("image_url")
                     url = iu.get("url") if isinstance(iu, dict) else (iu or part.get("image"))
+                    if url and drop > 0:
+                        drop -= 1
+                        parts.append({"type": "text", "text": "[earlier image omitted]"})
+                        continue
                     if url:
                         urls.append(url)
                         parts.append({"type": "image"})
@@ -689,8 +732,6 @@ def extract_images(messages):
                 parts.append(part)
             m = dict(m, content = parts)
         out.append(m)
-    if len(urls) > MAX_IMAGES:
-        raise ValueError(f"too many images in one request ({len(urls)}; the limit is {MAX_IMAGES})")
     return out, urls
 
 
@@ -958,7 +999,9 @@ def build_inputs(tokenizer, messages, tools, enable_thinking, reasoning_effort,
         raise ValueError(f"this server is running text-only ({vision['reason']}); "
                          "remove the image or restart with VISION=auto")
     if count_only:
-        per_image = max(1, int(vision.get("max_pixels") or 1_048_576) // 1024)
+        # + 256: the engine rounds each side to the nearest multiple of 32, which
+        # at the extreme aspect ratios it accepts adds up to ~230 tokens
+        per_image = max(1, int(vision.get("max_pixels") or 1_048_576) // 1024) + 256
         rendered = tokenizer.hf_render_chat_template(
             messages, add_generation_prompt = True,
             enable_thinking = enable_thinking, tools = tools,
@@ -1371,6 +1414,10 @@ async def chat_completions(request):
         })
 
     # ---- streaming (SSE) ----
+    too_long = await prompt_too_long(req, tokenizer)
+    if too_long:
+        return web.json_response(
+            {"error": {"message": too_long, "type": "invalid_request_error"}}, status = 400)
     resp = web.StreamResponse(headers = {
         "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
         "Connection": "keep-alive"})
@@ -2109,8 +2156,42 @@ async def anthropic_messages(request):
         return anthropic_json(anthropic_message(
             req["model_id"], content, reasoning, calls, finish, ptoks, otoks,
             no_parallel, thinking_omitted))
+    too_long = await prompt_too_long(req, tokenizer)
+    if too_long:
+        return anthropic_error(too_long)
     return await anthropic_stream(request, req, generator, tokenizer, no_parallel,
                                   thinking_omitted)
+
+
+# count_tokens and the pre-stream prompt check run here, not in the loop's
+# default executor: that one is shared with the streaming workers, which sit
+# blocked on gen_lock, so a few queued requests would make a "cheap" call wait
+# for a whole generation.
+from concurrent.futures import ThreadPoolExecutor
+_AUX_POOL = ThreadPoolExecutor(max_workers = 4, thread_name_prefix = "aux")
+
+
+async def prompt_too_long(req, tokenizer):
+    """Before a stream opens: the message to send as a 400 when the prompt
+    cannot fit the KV cache, else None. Once the SSE headers are out the status
+    is already 200, and the client cannot tell "compact and retry" from a server
+    fault. Only text prompts are checked here (images are estimated, and a
+    wrong refusal would be worse than the late error)."""
+    if any(isinstance(m.get("content"), list) and any(
+            isinstance(p, dict) and p.get("type") in ("image_url", "image")
+            for p in m["content"]) for m in req["messages"]):
+        return None
+    try:
+        messages, tools = apply_tool_choice(req["messages"], req["tools"], req["tool_choice"])
+        ids, _ = await asyncio.get_running_loop().run_in_executor(
+            _AUX_POOL, build_inputs, tokenizer, messages, tools,
+            req["enable_thinking"], req["reasoning_effort"], True)
+        token_budget.clamp_max_tokens(int(ids.shape[-1]), 1, stats.get("context_length"))
+    except ValueError as e:
+        return "prompt is too long: " + str(e)
+    except Exception:
+        return None          # let generation report whatever this was
+    return None
 
 
 async def anthropic_count_tokens(request):
@@ -2142,8 +2223,8 @@ async def anthropic_count_tokens(request):
         # Off the event loop (rendering and tokenizing a long history is CPU
         # work that would stall /health and every stream), and with images
         # estimated rather than fetched or embedded (count_only).
-        input_ids, _ = await asyncio.to_thread(
-            build_inputs, tokenizer, messages, tools,
+        input_ids, _ = await asyncio.get_running_loop().run_in_executor(
+            _AUX_POOL, build_inputs, tokenizer, messages, tools,
             req["enable_thinking"], req["reasoning_effort"], True)
     except AssertionError as e:
         return anthropic_error(f"context/cache: {e}")
@@ -2358,6 +2439,8 @@ def main():
     _check_budgets(budgets)
     _cap_process_vram(budgets)
     if len(budgets) > 1 and args.offload_layers != "stock":
+        if args.offload_layers != "auto" and int(args.offload_layers) < 0:
+            raise SystemExit("GPU_OFFLOAD_LAYERS must be auto, stock or a number >= 0")
         OFFLOAD["layers"] = None if args.offload_layers == "auto" else int(args.offload_layers)
         _install_offload_loader(budgets)
     _draft = args.draft_model.lower()

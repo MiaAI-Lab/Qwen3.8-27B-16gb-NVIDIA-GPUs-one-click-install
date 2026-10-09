@@ -226,6 +226,9 @@ if [ "$(echo "${DRAFT:-}" | tr '[:upper:]' '[:lower:]')" = "dflash2" ]; then
     _dflash2=1
 fi
 
+# Read by the server itself (tools/url_guard.py), so it has to be exported.
+if [ -n "${ALLOW_PRIVATE_IMAGE_URLS:-}" ]; then export ALLOW_PRIVATE_IMAGE_URLS; fi
+
 # .env is sourced as shell vars; the model-download subprocess needs the HF
 # token in its environment, so export it if set.
 if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; fi
