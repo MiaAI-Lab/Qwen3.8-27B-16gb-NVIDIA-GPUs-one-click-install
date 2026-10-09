@@ -50,6 +50,7 @@ Launch (from repo root; 16 GB NVIDIA recipe):
       -m models/Qwen3.8-27B-EXL3-2.0bpw -gs 14.7 -cs 199936 -cq 8,4 --port 8888
 """
 import argparse, asyncio, json, os, re, sys, time, threading, uuid
+import token_budget          # tools/token_budget.py: cache-fit clamp on max_tokens
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aiohttp import web
 
@@ -615,6 +616,11 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
             enable_thinking = enable_thinking, tools = tools,
             **template_effort(tokenizer, reasoning_effort))
     prompt_toks = int(input_ids.shape[-1])
+    # The engine prices a job as prompt + max_new_tokens against the whole KV
+    # cache; ask for less than what is left rather than be refused
+    # (tools/token_budget.py).
+    max_tokens = token_budget.clamp_max_tokens(
+        prompt_toks, max_tokens, stats.get("context_length"))
     from exllamav3.generator.sampler.presets import ComboSampler
     from exllamav3 import Job
     forced_choice = tool_choice not in (None, "auto", "none")
@@ -735,8 +741,11 @@ def parse_request(body):
     messages = body.get("messages")
     if not messages or not isinstance(messages, list):
         return None, "`messages` (list) is required"
+    # OpenAI's default is "as much as fits"; 1024 cut off long summaries
+    # (finish_reason=length, e.g. Hermes /compress). The cache-fit clamp in
+    # generate_full keeps a large value from being rejected at admission.
     max_tokens = int(body.get("max_tokens") or
-                     body.get("max_completion_tokens") or 1024)
+                     body.get("max_completion_tokens") or token_budget.DEFAULT_MAX_TOKENS)
     temperature = float(body.get("temperature", 0.6))
     top_p = float(body.get("top_p", 0.95))
     top_k = int(body.get("top_k", 20))
