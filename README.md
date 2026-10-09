@@ -585,8 +585,116 @@ building one yourself.
 **Engine version.** This kit requires **ExLlamaV3 v1.4.4** — it is what the quantized
 vision tower needs, and what the kit is validated against. PyPI skips 1.4.4
 (`1.4.2` → `1.4.5`), so the launchers install the git tag, and both start paths
-refuse to run against any other version. Engine:
-[ExLlamaV3](https://github.com/turboderp-org/exllamav3).
+refuse to run against any other version. The one exception is the opt-in
+[`DRAFT=dflash2`](#optional-draftdflash2-32-gb-cards), which needs **v1.6.0** and
+installs it into a separate `.venv-dflash2`, checked the same way; `.venv` stays on
+1.4.4. Engine: [ExLlamaV3](https://github.com/turboderp-org/exllamav3).
+
+---
+
+## Optional: `DRAFT=dflash2` (32 GB cards)
+
+`DRAFT=dflash2` replaces the MTP head with a separate drafter, a DFlash2
+block-diffusion draft model, and needs ExLlamaV3 **1.6.0** instead of 1.4.4. It is
+off by default. With `DRAFT` unset, `mtp` or `none` nothing below applies: same
+engine, same `.venv`, same flags, same downloads.
+
+```
+DRAFT=dflash2        in .env, then ./linux/start.sh      (Windows: see the limits below)
+DRAFT=mtp            in .env (or delete the line) to go back; nothing is reinstalled
+```
+
+What it does:
+
+- **Own environment.** The engine goes into `.venv-dflash2`, built the first time you
+  start with `DRAFT=dflash2`. `.venv` (1.4.4) is not touched, so switching `DRAFT`
+  back and forth costs nothing after the first time. It also gets `transformers`,
+  which 1.6.0's chat template imports but no longer pulls in (1.4.4 got it through
+  `flash-linear-attention`).
+- **Engine wheel.** Resolved exactly as in [Prebuilt wheels](#prebuilt-wheels-no-compiler-needed),
+  from a table of what the v1.6.0 release actually published (`tools/wheels.py`). If
+  no wheel fits, the fallback is a source build of the `v1.6.0` tag.
+- **Drafter.** [`r0b0tlab/Qwen3.8-27B-DFlash2-EXL3-4.00bpw`](https://huggingface.co/r0b0tlab/Qwen3.8-27B-DFlash2-EXL3-4.00bpw)
+  (about 1.25 GB) into `models/Qwen3.8-27B-DFlash2-EXL3-4.00bpw`, with the kit's
+  downloader, pinned to commit `265b5240592907d2d55ff0dc4d5f66569692604d`. The weight
+  file is checked against sha256 `e278f218318565562af07fc333045e411ffa0d83523f8224fc8c2d24d5a68223`
+  on every start. The server gets `--draft_model <that folder>`.
+- **Refused on small cards.** Below 30 GiB of VRAM it stops before the environment
+  or any download exists, says why, and exits non-zero. Any quant other than the kit's
+  4.0 bpw one is refused the same way, before any model is downloaded. 5.0 bpw is
+  not enabled: it was not measured on the kit's own 5.0 file.
+- **Measured settings.** For these runs `CONTEXT_SIZE`, `CACHE_QUANT` and
+  `GPU_MEM_GB` from `.env` are replaced by the ones the numbers below were measured
+  with, and `.env` itself is not changed:
+
+  | quant | `CONTEXT_SIZE` | `CACHE_QUANT` | `GPU_MEM_GB` | images |
+  | --- | --- | --- | --- | --- |
+  | 4.0 bpw | `262144` | `4` | `22.8` | `VISION=auto` |
+
+### What was measured
+
+One RTX 5090 (32 GB) on Linux, driver 610.43.02, power limit 450 W with the SM clock
+capped at 2200 MHz. Both sides ran the same `tools/serve_openai.py` with
+`--grid_size 22.8 --cache_quant 4 --vision auto`. *Default* is this kit as it ships
+(ExLlamaV3 1.4.4 + MTP); *dflash2* is ExLlamaV3 1.6.0 + the drafter above. Decode
+tokens per second with RigMark 1.3.0 (commit `218c8ae`), median of 5 runs, thinking
+off. C1 is a single request, end to end.
+
+| | quant, context | code | prose | structured | C1 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| default | 4.0 bpw, 262144 | 180.0 | 103.3 | 205.9 | 155.0 |
+| dflash2 | 4.0 bpw, 262144 | 274.6 | 113.2 | 366.4 | 198.8 |
+
+That is +52.6 % code, +9.6 % prose, +78.0 % structured and +28.3 % C1. Structured
+output is the best case; prose gains the least.
+
+Quality, same questions, seed 42, thinking off (MMLU 200 questions, GSM8K 100):
+
+| quant | default | dflash2 |
+| --- | --- | --- |
+| 4.0 bpw | 80.0 % / 96 % | 79.5 % / 96 % |
+
+The differences are within one percentage point, which at this sample size is noise.
+
+Decode speed at depth, 4.0 bpw, tokens per second (llama-benchy, 2048-token prompt,
+128 generated, 3 runs), with the VRAM logged during the run:
+
+| context depth | 0 | 8k | 32k | 64k | 128k | 248k | VRAM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| default (1.4.4 + MTP) | 114.4 | 114.6 | 101.2 | 94.2 | 73.7 | 65.0 | 22704 MiB |
+| 1.6.0 + MTP | 121.8 | 115.9 | 112.5 | 122.6 | 102.9 | 79.3 | 22366 MiB |
+| dflash2 (1.6.0 + DFlash2) | 147.0 | 164.3 | 156.5 | 121.3 | 104.4 | 75.0 | 24850 MiB |
+
+### Limits
+
+- **One card, one OS.** Measured on a single RTX 5090 on Linux. Nothing was measured
+  on other 32 GB cards, on 16 or 24 GB cards, or on Windows. The Windows launcher
+  (`tools/win_start.py`) has the same logic but has **not been run**.
+- **The lead shrinks with depth.** Against 1.6.0 + MTP the gain is +42 % at 8k, about
+  level from 64k (121.3 against 122.6), and slightly behind at 248k (75.0 against
+  79.3). The large gains above are for answers of a few thousand tokens, not for a
+  full context window.
+- **Not for 16 or 24 GB cards.** It needs about 2.1 GiB more VRAM than the default (2.4 GiB more than 1.6.0 + MTP; table above).
+  A test on a 16 GB RTX 5060 Ti used a different combination (the 2.5 bpw quant and
+  the unquantised bf16 DFlash2 drafter, 3.85 GB): the context fell to 44032 tokens,
+  the vision tower no longer fit, and the server returned a growing number of empty
+  replies. The 4.0 bpw drafter was not tried on 16 GB. 24 GB was not measured; the
+  5090 run used 24850 MiB.
+- **Text only.** The measurements above are text benchmarks. Images are enabled
+  (`VISION=auto`) as in the default setup.
+- **Only the measured row.** The kit's 4.0 bpw quant at 262144. Other quants (5.0
+  bpw included), other contexts and a different `CACHE_QUANT` were not measured and
+  are refused or overridden.
+- **Unified-memory boards** (GB10) report no VRAM total to `nvidia-smi` and are
+  refused.
+- The drafter's model card names a fork of ExLlamaV3 as its requirement. The numbers
+  here were measured on the upstream **v1.6.0** release wheel, which this option
+  installs.
+
+Credits: [turboderp](https://github.com/turboderp-org) for ExLlamaV3 and its DFlash2
+support, [z-lab](https://github.com/z-lab/dflash) for DFlash2, and
+[r0b0tlab](https://huggingface.co/r0b0tlab) for the EXL3 4.00 bpw quant of the
+drafter.
 
 ---
 
@@ -621,13 +729,13 @@ fine. The ones you are most likely to touch:
 | `HOST` | `0.0.0.0` | set to `127.0.0.1` to keep `/v1` off your network |
 | `UI` | `browser` | `browser`, `server`, or `no` |
 | `SIMPLEX_HARNESS_PORT` | `3080` | the chat UI's port. Do **not** set `DSH_PORT` in `.env` — current dsh treats that key in a file as fatal and the harness never binds |
-| `DRAFT` | `mtp` | `none` turns off speculative decoding |
+| `DRAFT` | `mtp` | `none` turns off speculative decoding. `dflash2` swaps the MTP head for a separate drafter on ExLlamaV3 1.6.0: 32 GB cards, 4.0 bpw only, measured on Linux only — see [DRAFT=dflash2](#optional-draftdflash2-32-gb-cards) |
 | `SETUP` | `browser` | `console` for terminal questions on Windows |
 | `TRAY` | `auto` | Windows notification-area icon; `no` to skip |
 | `SHORTCUTS` | `auto` | Windows shortcuts; `no` to skip |
 | `HF_TOKEN` | — | only needed for gated repos |
 
-`.venv/`, `models/`, `logs/`, `apps/`, `.dsh/` and `.env` stay on your machine and
+`.venv/`, `.venv-dflash2/`, `models/`, `logs/`, `apps/`, `.dsh/` and `.env` stay on your machine and
 are not part of the git tree.
 
 ---

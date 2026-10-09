@@ -125,9 +125,13 @@ def local_wheels(tags: dict, folder: Path = WHEEL_DIR) -> list[Wheel]:
     return found
 
 
-def find_local(package: str, tags: dict, folder: Path = WHEEL_DIR) -> Wheel | None:
+def find_local(package: str, tags: dict, folder: Path = WHEEL_DIR,
+               version: str | None = None) -> Wheel | None:
+    """`version`, when given, keeps only wheels of that release ("1.6.0+cu128..."
+    counts as "1.6.0"); None is every version, as it always was."""
     want = re.sub(r"[-_.]+", "-", package).lower()
-    hits = [w for w in local_wheels(tags, folder) if w.canonical == want]
+    hits = [w for w in local_wheels(tags, folder) if w.canonical == want
+            and (version is None or w.version.partition("+")[0] == version)]
     if not hits:
         return None
     # newest version wins; ties broken by filename so the choice is stable
@@ -183,13 +187,35 @@ ENGINE_WHEELS: dict[str, dict[str, tuple[str, ...]]] = {
 # the source build stays the answer there (aarch64 / GB10, for one).
 ENGINE_PLATFORMS = ("win_amd64", "linux_x86_64")
 
+# The same table for v1.6.0, which DRAFT=dflash2 installs (see tools/dflash2.py).
+# Taken from that release's asset list, not from this one: it was built against
+# other torch versions (no 2.7, and cu132 now carries 2.12 and 2.13). The ROCm
+# wheels in that release are not listed; the kit is NVIDIA only. Everything that
+# resolves a wheel takes `engine=` and defaults to the version above, so the
+# default install is decided by the table above exactly as before.
+ENGINE_VERSION_DFLASH2 = "1.6.0"
+ENGINE_WHEELS_DFLASH2: dict[str, dict[str, tuple[str, ...]]] = {
+    "cu128": {
+        "2.8.0":  ("cp310", "cp311", "cp312", "cp313"),
+        "2.9.0":  ("cp310", "cp311", "cp312", "cp313", "cp314"),
+        "2.10.0": ("cp310", "cp311", "cp312", "cp313", "cp314"),
+        "2.11.0": ("cp312", "cp313", "cp314"),
+    },
+    "cu132": {
+        "2.11.0": ("cp312", "cp313", "cp314"),
+        "2.12.0": ("cp310", "cp311", "cp312", "cp313", "cp314"),
+        "2.13.0": ("cp310", "cp311", "cp312", "cp313", "cp314"),
+    },
+}
+ENGINE_TABLES = {ENGINE_VERSION: ENGINE_WHEELS, ENGINE_VERSION_DFLASH2: ENGINE_WHEELS_DFLASH2}
+
 
 def _ver_key(v: str) -> tuple:
     """'2.10.0' sorts above '2.9.0' - which it does not as a string."""
     return tuple(int(x) if x.isdigit() else 0 for x in v.split("."))
 
 
-def preferred_torch(tags: dict, cuda: str) -> str:
+def preferred_torch(tags: dict, cuda: str, engine: str = ENGINE_VERSION) -> str:
     """The newest torch this engine release has a wheel for, on this Python and
     CUDA line - or "" when it has none and torch should float.
 
@@ -202,14 +228,14 @@ def preferred_torch(tags: dict, cuda: str) -> str:
     """
     if (tags.get("plat") or "").lower() not in ENGINE_PLATFORMS:
         return ""                      # no wheel on any torch here; do not cap
-    builds = ENGINE_WHEELS.get(cuda) or {}
+    builds = ENGINE_TABLES[engine].get(cuda) or {}
     usable = [v for v, cps in builds.items() if tags.get("py") in cps]
     return max(usable, key=_ver_key) if usable else ""
 
 
-def torch_requirement(tags: dict, cuda: str) -> str:
+def torch_requirement(tags: dict, cuda: str, engine: str = ENGINE_VERSION) -> str:
     """'torch==2.11.0' when capping buys a prebuilt engine, else plain 'torch'."""
-    want = preferred_torch(tags, cuda)
+    want = preferred_torch(tags, cuda, engine)
     return f"torch=={want}" if want else "torch"
 
 
@@ -235,7 +261,8 @@ def torch_build(python: Path | str) -> tuple[str, str]:
     return "", ""
 
 
-def engine_wheel_url(tags: dict, torch_version: str, cuda: str) -> str | None:
+def engine_wheel_url(tags: dict, torch_version: str, cuda: str,
+                     engine: str = ENGINE_VERSION) -> str | None:
     """The one wheel that fits this venv, or None when the matrix has no entry.
 
     None is a normal answer - an unbuilt CUDA line, a platform nobody ships,
@@ -244,14 +271,15 @@ def engine_wheel_url(tags: dict, torch_version: str, cuda: str) -> str | None:
     plat = (tags.get("plat") or "").lower()
     if plat not in ENGINE_PLATFORMS or not torch_version or not cuda:
         return None
-    builds = ENGINE_WHEELS.get(cuda)
+    builds = ENGINE_TABLES[engine].get(cuda)
     if not builds:
         return None
     cps = builds.get(torch_version)
     if not cps or tags.get("py") not in cps:
         return None
     py = tags["py"]
-    return (f"{ENGINE_RELEASE}exllamav3-{ENGINE_VERSION}+{cuda}.torch{torch_version}"
+    release = ENGINE_RELEASE.replace(f"/v{ENGINE_VERSION}/", f"/v{engine}/")
+    return (f"{release}exllamav3-{engine}+{cuda}.torch{torch_version}"
             f"-{py}-{py}-{plat}.whl")
 
 
@@ -265,19 +293,20 @@ def index_urls(cfg: dict) -> list[str]:
 
 
 def prebuilt_args(package: str, tags: dict, cfg: dict, folder: Path = WHEEL_DIR,
-                  venv_python: Path | str | None = None) -> list[str] | None:
+                  venv_python: Path | str | None = None,
+                  engine: str = ENGINE_VERSION) -> list[str] | None:
     """pip arguments that install `package` from a prebuilt wheel and refuse
     to fall back to a source build, or None when no source can offer one.
 
     Returned as arguments only - running pip is the caller's job, so this
     stays testable on a machine with no network and no venv."""
-    local = find_local(package, tags, folder)
+    local = find_local(package, tags, folder, _local_version(package, engine))
     if local is not None:
         # An exact path is unambiguous: pip cannot decide it prefers something
         # else, and the version in the folder is the version installed.
         return ["install", "--only-binary", ":all:", "--no-build-isolation",
                 "--no-index", str(local.path)]
-    upstream = _engine_url_for(package, tags, venv_python)
+    upstream = _engine_url_for(package, tags, venv_python, engine)
     if upstream:
         # Also exact, and for the same reason: see ENGINE_WHEELS.
         return ["install", "--only-binary", ":all:", "--no-build-isolation", upstream]
@@ -287,26 +316,35 @@ def prebuilt_args(package: str, tags: dict, cfg: dict, folder: Path = WHEEL_DIR,
     args = ["install", "--only-binary", ":all:", "--no-build-isolation"]
     for url in links:
         args += ["--find-links", url]
-    args.append(package)
+    args.append(package if engine == ENGINE_VERSION else f"{package}=={engine}")
     return args
 
 
-def _engine_url_for(package: str, tags: dict,
-                    venv_python: Path | str | None) -> str | None:
+def _local_version(package: str, engine: str) -> str | None:
+    """The engine release a wheel in wheels\\ must be, or None for any other
+    package. With both venvs in use (DRAFT=dflash2) the folder can hold a 1.4.4
+    and a 1.6.0 engine wheel side by side, and newest-wins would put 1.6.0 into
+    .venv."""
+    return engine if package.lower().replace("_", "-") == ENGINE_PACKAGE else None
+
+
+def _engine_url_for(package: str, tags: dict, venv_python: Path | str | None,
+                    engine: str = ENGINE_VERSION) -> str | None:
     """The engine's own release wheel for this venv, when that is what is asked
     for and the venv already has a torch the release was built against."""
     if package.lower().replace("_", "-") != ENGINE_PACKAGE or venv_python is None:
         return None
     torch_version, cuda = torch_build(venv_python)
-    return engine_wheel_url(tags, torch_version, cuda)
+    return engine_wheel_url(tags, torch_version, cuda, engine)
 
 
 def describe(package: str, tags: dict, cfg: dict, folder: Path = WHEEL_DIR,
-             venv_python: Path | str | None = None) -> str:
-    local = find_local(package, tags, folder)
+             venv_python: Path | str | None = None,
+             engine: str = ENGINE_VERSION) -> str:
+    local = find_local(package, tags, folder, _local_version(package, engine))
     if local is not None:
         return f"{local.path.name}  (from wheels\\)"
-    upstream = _engine_url_for(package, tags, venv_python)
+    upstream = _engine_url_for(package, tags, venv_python, engine)
     if upstream:
         return f"{upstream.rsplit('/', 1)[-1]}  (from the engine's own release)"
     links = index_urls(cfg)
@@ -376,20 +414,22 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--url", action="store_true",
                     help="print just the engine wheel URL for --python (empty if none) "
                          "and exit; what the shell launcher uses")
+    ap.add_argument("--engine-version", default=ENGINE_VERSION, choices=sorted(ENGINE_TABLES),
+                    help="which engine release to resolve for (default: the kit's pinned one)")
     a = ap.parse_args(argv)
     tags = interpreter_tags(a.python)
     folder = Path(a.folder)
     if a.url:
         torch_version, cuda = torch_build(a.python)
-        print(engine_wheel_url(tags, torch_version, cuda) or "")
+        print(engine_wheel_url(tags, torch_version, cuda, a.engine_version) or "")
         return 0
     if a.torch_req:
-        print(torch_requirement(tags, cuda_tag(a.cuda)))
+        print(torch_requirement(tags, cuda_tag(a.cuda), a.engine_version))
         return 0
     torch_version, cuda = torch_build(a.python)
     print(json.dumps({
         "torch": torch_version, "cuda": cuda,
-        "engine_wheel": engine_wheel_url(tags, torch_version, cuda),
+        "engine_wheel": engine_wheel_url(tags, torch_version, cuda, a.engine_version),
 
         "tags": tags,
         "folder": str(folder),

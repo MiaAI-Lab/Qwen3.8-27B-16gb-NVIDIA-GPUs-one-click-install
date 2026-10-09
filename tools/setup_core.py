@@ -33,6 +33,7 @@ ENV_EXAMPLE = ROOT / ".env.example"
 
 ENGINE_PACKAGE = "exllamav3"
 ENGINE_VERSION = "1.4.4"
+EXTRA_PACKAGES: tuple[str, ...] = ()     # DRAFT=dflash2 only (tools/dflash2.py)
 
 
 class SetupError(RuntimeError):
@@ -129,7 +130,8 @@ def install_steps() -> list[Step]:
         items.append(Step("triton", "Triton for Windows", "GPU kernels the engine loads at import"))
     items += [
         Step("engine", "ExLlamaV3 engine", "prebuilt wheel if one fits this Python"),
-        Step("server", "Server libraries", "aiohttp, huggingface_hub, pillow"),
+        Step("server", "Server libraries", "aiohttp, huggingface_hub, pillow"
+             + "".join(", " + m for m in EXTRA_PACKAGES)),
         Step("check", "Checking the install", "imports the engine and asks the GPU to say hello"),
     ]
     return items
@@ -188,7 +190,7 @@ def venv_ready() -> tuple[bool, str]:
         "try:\n"
         "    from exllamav3.version import __version__ as v; out['engine'] = v\n"
         "except Exception as e: out['engine_error'] = str(e)[:300]\n"
-        "for mod in ('aiohttp', 'huggingface_hub', 'PIL'):\n"
+        f"for mod in {('aiohttp', 'huggingface_hub', 'PIL') + EXTRA_PACKAGES!r}:\n"
         "    try:\n"
         "        __import__(mod); out[mod] = True\n"
         "    except Exception: out[mod] = False\n"
@@ -207,7 +209,8 @@ def venv_ready() -> tuple[bool, str]:
         return False, "the ExLlamaV3 engine is not installed"
     if out.get("engine") != ENGINE_VERSION:
         return False, f"the engine is v{out['engine']}, this kit needs v{ENGINE_VERSION}"
-    for mod, label in (("aiohttp", "aiohttp"), ("huggingface_hub", "huggingface_hub"), ("PIL", "pillow")):
+    for mod, label in (("aiohttp", "aiohttp"), ("huggingface_hub", "huggingface_hub"), ("PIL", "pillow"),
+                       *((m, m) for m in EXTRA_PACKAGES)):
         if not out.get(mod):
             return False, f"{label} is missing"
     return True, ""
@@ -234,7 +237,7 @@ def probe(cfg: dict) -> dict:
     ok_venv, venv_reason = venv_ready()
     have_weights, model_path = weights_ready(cfg)
     tags = wheels.interpreter_tags(VENV_PY if VENV_PY.is_file() else sys.executable)
-    engine_wheel = wheels.describe(ENGINE_PACKAGE, tags, cfg)
+    engine_wheel = wheels.describe(ENGINE_PACKAGE, tags, cfg, engine=ENGINE_VERSION)
 
     return {
         "gpu": {"name": gpu.name, "vram_gib": round(gpu.total_gib, 1), "cc": gpu.cc,
@@ -387,7 +390,7 @@ def install_environment(cfg: dict, log, steps: Steps, cancelled=None) -> None:
         steps.skip("venv", "already there")
     else:
         if VENV_PY.is_file():
-            log("# the existing .venv cannot run - rebuilding it", "cmd")
+            log(f"# the existing {VENV_DIR.name} cannot run - rebuilding it", "cmd")
             steps.detail("venv", "the old one was broken, building a new one")
             shutil.rmtree(VENV_DIR, ignore_errors=True)
         steps.start("venv")
@@ -424,7 +427,7 @@ def install_environment(cfg: dict, log, steps: Steps, cancelled=None) -> None:
     tags = wheels.interpreter_tags(VENV_PY)
     steps.start("torch")
     index = win_start.torch_index_for_driver(cfg)
-    requirement = wheels.torch_requirement(tags, wheels.cuda_tag(index))
+    requirement = wheels.torch_requirement(tags, wheels.cuda_tag(index), ENGINE_VERSION)
     line = index.rsplit("/", 1)[-1]
     steps.detail("torch", f"CUDA build {line}" if requirement == "torch"
                  else f"{requirement.replace('==', ' ')}, CUDA build {line}"
@@ -462,12 +465,14 @@ def install_environment(cfg: dict, log, steps: Steps, cancelled=None) -> None:
 
     # --- engine ------------------------------------------------------------
     steps.start("engine")
-    wheel_note = wheels.describe(ENGINE_PACKAGE, tags, cfg, venv_python=VENV_PY)
+    wheel_note = wheels.describe(ENGINE_PACKAGE, tags, cfg, venv_python=VENV_PY,
+                                 engine=ENGINE_VERSION)
     installed = False
     if wheel_note:
         steps.detail("engine", wheel_note)
         tee(f"# trying the prebuilt engine: {wheel_note}", "cmd")
-        args = wheels.prebuilt_args(ENGINE_PACKAGE, tags, cfg, venv_python=VENV_PY)
+        args = wheels.prebuilt_args(ENGINE_PACKAGE, tags, cfg, venv_python=VENV_PY,
+                                    engine=ENGINE_VERSION)
         if args and _stream(_pip(*args), tee, cancelled=stop) == 0:
             installed = True
         else:
@@ -518,7 +523,8 @@ def install_environment(cfg: dict, log, steps: Steps, cancelled=None) -> None:
 
     # --- server libraries --------------------------------------------------
     steps.start("server")
-    if _stream(_pip("install", "aiohttp", "huggingface_hub", "pillow"), tee, cancelled=stop) != 0:
+    if _stream(_pip("install", "aiohttp", "huggingface_hub", "pillow", *EXTRA_PACKAGES),
+               tee, cancelled=stop) != 0:
         raise SetupError("The server libraries could not be installed.",
                          "Retry - this step is a plain download from pypi.org.")
     steps.finish("server")
@@ -530,7 +536,7 @@ def install_environment(cfg: dict, log, steps: Steps, cancelled=None) -> None:
     ok, reason = venv_ready()
     if not ok:
         raise SetupError(f"Setup finished but the environment is still not usable: {reason}.",
-                         "Delete the .venv folder and run setup again. If PyTorch cannot see "
+                         f"Delete the {VENV_DIR.name} folder and run setup again. If PyTorch cannot see "
                          "the GPU, update the NVIDIA driver first.")
     steps.finish("check", "engine v" + ENGINE_VERSION + ", GPU visible")
 
@@ -543,6 +549,13 @@ def download_weights(cfg: dict, on_progress=None, cancelled=None, token: str = "
     repo = cfg.get("HF_TARGET_REPO") or ""
     if not repo:
         raise SetupError("No model repository is set.", "Pick a profile first.")
+    import dflash2
+    if dflash2.wanted(cfg.get("DRAFT")):
+        # refused before the download, not after it (tools/dflash2.py)
+        pinned, why = dflash2.pin(cfg.get("MODEL_DIR") or "")
+        if pinned is None:
+            first, _, rest = why.partition("\n")
+            raise SetupError(first, rest)
     _, dest = weights_ready(cfg)
     dl = downloader.Download(
         repo, dest, cfg.get("HF_REVISION") or "",

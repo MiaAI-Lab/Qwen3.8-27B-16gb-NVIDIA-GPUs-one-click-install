@@ -22,10 +22,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 VENV_PY = ROOT / ".venv" / "Scripts" / "python.exe"
+ENGINE_VERSION = "1.4.4"
+DEFAULT_ENGINE_VERSION = ENGINE_VERSION
+EXTRA_PACKAGES: tuple[str, ...] = ()     # DRAFT=dflash2 only (tools/dflash2.py)
 ENV_FILE = ROOT / ".env"
 ENV_EXAMPLE = ROOT / ".env.example"
 SERVE = ROOT / "tools" / "serve_openai.py"
-DEFAULT_ENGINE = "git+https://github.com/turboderp-org/exllamav3.git@v1.4.4"
+DEFAULT_ENGINE = f"git+https://github.com/turboderp-org/exllamav3.git@v{ENGINE_VERSION}"
 # cu128, not the newest line: the engine's own release builds wheels for
 # cu128 and cu132 only, so torch from cu130 would mean no prebuilt engine
 # exists and every user compiles. cu128 covers Blackwell (driver 570+).
@@ -233,15 +236,16 @@ def venv_ok() -> bool:
     if not VENV_PY.is_file():
         return False
     probe = (
-        "import torch, exllamav3, aiohttp, huggingface_hub\n"
+        "import torch, exllamav3, aiohttp, huggingface_hub"
+        + "".join(", " + m for m in EXTRA_PACKAGES) + "\n"
         "import sys\n"
         "sys.exit(0 if torch.cuda.is_available() else 2)\n"
     )
     r = subprocess.run([str(VENV_PY), "-c", probe], capture_output=True, text=True)
     if r.returncode == 2:
         die(
-            "PyTorch in .venv cannot see a CUDA GPU. Install an NVIDIA driver,\n"
-            "delete the .venv folder, set TORCH_INDEX_URL in .env if needed, and run windows\\start.bat again."
+            f"PyTorch in {VENV_PY.parents[1].name} cannot see a CUDA GPU. Install an NVIDIA driver,\n"
+            f"delete the {VENV_PY.parents[1].name} folder, set TORCH_INDEX_URL in .env if needed, and run windows\\start.bat again."
         )
     return r.returncode == 0
 
@@ -267,7 +271,7 @@ def ensure_triton() -> None:
     if r2.returncode != 0:
         die(
             "Could not import Triton after installing triton-windows.\n"
-            "Install a matching wheel:  .venv\\Scripts\\python.exe -m pip install -U triton-windows\n"
+            f"Install a matching wheel:  {VENV_PY.parents[1].name}\\Scripts\\python.exe -m pip install -U triton-windows\n"
             + (r2.stderr or r2.stdout or "")[:800]
         )
     step_ok("triton-windows")
@@ -306,9 +310,14 @@ def resolve_engine_src(cfg: dict[str, str]) -> str:
     install on Windows."""
     if (ROOT / "exllamav3" / "__init__.py").is_file():
         return str(ROOT)
+    # read from cfg, not from a module name: setup_core imports this file a
+    # second time, so a name rebound by select_environment() is not seen there
+    import dflash2
+    default = (f"git+https://github.com/turboderp-org/exllamav3.git@v{dflash2.ENGINE_VERSION}"
+               if dflash2.wanted(cfg.get("DRAFT")) else DEFAULT_ENGINE)
     raw = (cfg.get("EXL3_REPO") or os.environ.get("EXL3_REPO") or "").strip()
     if not raw:
-        return DEFAULT_ENGINE
+        return default
     if raw.startswith(("git+", "http://", "https://", "file:")):
         return raw
     p = Path(raw)
@@ -319,8 +328,8 @@ def resolve_engine_src(cfg: dict[str, str]) -> str:
     ):
         return str(p.resolve())
     print(f"  {yellow('!')} EXL3_REPO is not a usable path here ({raw})")
-    print(f"     falling back to {DEFAULT_ENGINE}")
-    return DEFAULT_ENGINE
+    print(f"     falling back to {default}")
+    return default
 
 
 def bootstrap(cfg: dict[str, str]) -> None:
@@ -342,7 +351,7 @@ def bootstrap(cfg: dict[str, str]) -> None:
 
     t0 = time.time()
     step(1, 5, "Creating Python virtualenv")
-    run(sys_py + ["-m", "venv", str(ROOT / ".venv")], cwd=str(ROOT))
+    run(sys_py + ["-m", "venv", str(VENV_PY.parents[1])], cwd=str(ROOT))
     step_ok("virtualenv", time.time() - t0)
 
     t1 = time.time()
@@ -361,7 +370,7 @@ def bootstrap(cfg: dict[str, str]) -> None:
     # certain (CUDA line x torch x Python) combinations, so installing the
     # newest torch can cost a twenty-minute compile. wheels.py owns that table.
     torch_req = wheels.torch_requirement(wheels.interpreter_tags(VENV_PY),
-                                         wheels.cuda_tag(torch_index))
+                                         wheels.cuda_tag(torch_index), ENGINE_VERSION)
     t2 = time.time()
     step(3, 5, "PyTorch  (~2-3 GB the first time)")
     run(
@@ -375,7 +384,7 @@ def bootstrap(cfg: dict[str, str]) -> None:
     if engine_src == str(ROOT):
         note = "Local engine  - compiling CUDA kernels"
     else:
-        note = "ExLlamaV3 v1.4.4  - clone + compile CUDA kernels"
+        note = f"ExLlamaV3 v{ENGINE_VERSION}  - clone + compile CUDA kernels"
 
     arch = cfg.get("TORCH_CUDA_ARCH_LIST") or os.environ.get("TORCH_CUDA_ARCH_LIST")
     if arch:
@@ -396,7 +405,7 @@ def bootstrap(cfg: dict[str, str]) -> None:
     os.environ["MAX_JOBS"] = str(max_jobs)
     os.environ["GIT_TERMINAL_PROMPT"] = "0"
 
-    scripts = str(ROOT / ".venv" / "Scripts")
+    scripts = str(VENV_PY.parent)
     os.environ["PATH"] = scripts + os.pathsep + os.environ.get("PATH", "")
 
     if not shutil.which("git"):
@@ -411,8 +420,9 @@ def bootstrap(cfg: dict[str, str]) -> None:
     step_ok("engine", time.time() - t3)
 
     t4 = time.time()
-    step(5, 5, "Server dependencies (aiohttp, huggingface_hub, pillow)")
-    run(pip_cmd("install", "aiohttp", "huggingface_hub", "pillow"), cwd=str(ROOT))
+    step(5, 5, "Server dependencies (aiohttp, huggingface_hub, pillow"
+         + "".join(", " + m for m in EXTRA_PACKAGES) + ")")
+    run(pip_cmd("install", "aiohttp", "huggingface_hub", "pillow", *EXTRA_PACKAGES), cwd=str(ROOT))
     step_ok("server deps", time.time() - t4)
     print()
     print(f"  {green('Setup complete.')}  Next launches start in a few seconds.")
@@ -426,11 +436,61 @@ def require_engine_version() -> None:
         capture_output=True, text=True, cwd=str(ROOT),
     )
     ver = (r.stdout or "").strip() or "unknown"
-    if r.returncode != 0 or ver != "1.4.4":
+    if r.returncode != 0 or ver != ENGINE_VERSION:
         die(
-            f"this kit requires ExLlamaV3 v1.4.4, but the venv has '{ver}'.\n"
-            f"Fix: delete the .venv folder and run windows\\start.bat again."
+            f"this kit requires ExLlamaV3 v{ENGINE_VERSION}, but the venv has '{ver}'.\n"
+            f"Fix: delete the {VENV_PY.parents[1].name} folder and run windows\\start.bat again."
         )
+
+
+def select_environment(cfg: dict[str, str]) -> None:
+    """DRAFT=dflash2 (tools/dflash2.py) runs on ExLlamaV3 1.6.0 in a virtualenv
+    of its own, so the 1.4.4 one every other DRAFT value uses is never touched.
+    Everything below reads the module-level names this rebinds - here and in
+    setup_core, which the setup page and the console fallback share. A card
+    that is too small is refused before anything is created. Windows is
+    untested for this path (see README)."""
+    import dflash2
+    global VENV_PY, ENGINE_VERSION, EXTRA_PACKAGES
+    if not dflash2.wanted(cfg.get("DRAFT")):
+        return
+    why = dflash2.gate_message(nvidia_total_mib() / 1024)
+    if why:
+        die(why)
+    import setup_core
+    VENV_PY = ROOT / dflash2.VENV_NAME / "Scripts" / "python.exe"
+    ENGINE_VERSION = dflash2.ENGINE_VERSION
+    EXTRA_PACKAGES = dflash2.EXTRA_PACKAGES
+    setup_core.VENV_DIR = ROOT / dflash2.VENV_NAME
+    setup_core.VENV_PY = VENV_PY
+    setup_core.ENGINE_VERSION = ENGINE_VERSION
+    setup_core.EXTRA_PACKAGES = EXTRA_PACKAGES
+
+
+def dflash2_pin(cfg: dict[str, str]) -> dict[str, str] | None:
+    """DRAFT=dflash2 only: the measured settings for MODEL_DIR, or die before
+    anything for an unmeasured quant is downloaded. None for every other DRAFT."""
+    import dflash2
+    if not dflash2.wanted(cfg.get("DRAFT")):
+        return None
+    pinned, why = dflash2.pin(cfg.get("MODEL_DIR") or "")
+    if pinned is None:
+        die(why)
+    return pinned
+
+
+def dflash2_drafter(cfg: dict[str, str]) -> None:
+    """DRAFT=dflash2 only: fetch the drafter at its pinned commit and check its
+    checksum, so a setup that stops before the start leaves a complete install,
+    as linux/setup.sh does."""
+    import dflash2
+    if not dflash2.wanted(cfg.get("DRAFT")):
+        return
+    drafter = ROOT / dflash2.DRAFT_DIR
+    download_model(VENV_PY, dflash2.DRAFT_REPO, drafter, "dflash2 drafter", dflash2.DRAFT_REVISION)
+    why = dflash2.verify(drafter)
+    if why:
+        die(why)
 
 
 def nvidia_total_mib() -> int:
@@ -723,12 +783,14 @@ def run_first_run(cfg: dict[str, str], reasons: list[str],
             model_path = Path(model_dir)
             if not model_path.is_absolute():
                 model_path = ROOT / model_path
+            dflash2_pin(cfg)
             download_model(VENV_PY, cfg.get("HF_TARGET_REPO") or DEFAULT_REPO,
                            model_path, "target model", cfg.get("HF_REVISION") or None)
     else:
         cfg = done or cfg
     if cfg.get("HF_TOKEN"):
         os.environ["HF_TOKEN"] = cfg["HF_TOKEN"]
+    dflash2_drafter(cfg)
     return cfg
 
 
@@ -1268,7 +1330,7 @@ def cherry_after_ready(proc: subprocess.Popen, prep: dict, host: str, port: str,
         except Exception as e:  # noqa: BLE001
             warn(f"Could not open Cherry Studio: {e}")
     else:
-        info(f"Open it any time:  .venv\\Scripts\\python.exe tools\\cherry.py open")
+        info(f"Open it any time:  {VENV_PY.parents[1].name}\\Scripts\\python.exe tools\\cherry.py open")
     info("This window is the server - keep it open while chatting. Ctrl+C or windows\\stop.bat to stop.")
     print()
 
@@ -1293,6 +1355,16 @@ def server_command(cfg: dict[str, str]):
     cpu_cache = cfg.get("CPU_CACHE_GB", "0")
     draft = (cfg.get("DRAFT") or "mtp").strip().lower()
     gpu_mem = cfg.get("GPU_MEM_GB")
+    drafter = None
+    if draft == "dflash2":
+        # the settings it was measured with, for this run only (.env is not
+        # changed), and only for the quants that were measured
+        import dflash2
+        pinned = dflash2_pin(cfg)
+        context, cache_quant, gpu_mem = (pinned["CONTEXT_SIZE"], pinned["CACHE_QUANT"],
+                                         pinned["GPU_MEM_GB"])
+        drafter = ROOT / dflash2.DRAFT_DIR
+        info("DRAFT=dflash2: the measured settings are used, not the ones in .env")
     vision_mode = (cfg.get("VISION") or "auto").strip().lower()
     if vision_mode in ("0", "false", "no", "off", "none"):
         vision_mode = "off"
@@ -1310,8 +1382,8 @@ def server_command(cfg: dict[str, str]):
             gpu_mem = "14.7"
         info(f"VRAM budget  {gpu_mem} GB (auto)   context  {context}")
 
-    if draft not in ("mtp", "none"):
-        die(f"DRAFT must be mtp or none (got: {draft})")
+    if draft not in ("mtp", "none", "dflash2"):
+        die(f"DRAFT must be mtp, none or dflash2 (got: {draft})")
 
     # KV cache format: integer bits
     cache_quant = cache_quant.strip().lower().replace(" ", "")
@@ -1325,6 +1397,9 @@ def server_command(cfg: dict[str, str]):
 
     repo = cfg.get("HF_TARGET_REPO") or DEFAULT_REPO
     download_model(VENV_PY, repo, model_path, "target model", cfg.get("HF_REVISION") or None)
+    if drafter is not None:
+        # pinned to a commit, and its one weight file to a checksum (tools/dflash2.py)
+        dflash2_drafter(cfg)
 
     model_id = (cfg.get("MODEL_ID") or model_path.name).strip().lower()
     cmd = [
@@ -1335,7 +1410,7 @@ def server_command(cfg: dict[str, str]):
         "--port", port,
         "--cache_size", context,
         "--grid_size", gpu_mem,
-        "--draft_model", draft,
+        "--draft_model", str(drafter) if drafter is not None else draft,
     ]
     if cache_quant != "none":
         cmd.extend(["--cache_quant", cache_quant])
@@ -1373,7 +1448,8 @@ def main() -> int:
     if cfg.get("HF_TOKEN"):
         os.environ["HF_TOKEN"] = cfg["HF_TOKEN"]
 
-    scripts = str(ROOT / ".venv" / "Scripts")
+    select_environment(cfg)
+    scripts = str(VENV_PY.parent)
     os.environ["PATH"] = scripts + os.pathsep + os.environ.get("PATH", "")
 
     cc, drv = nvidia_cc_driver()
@@ -1432,7 +1508,7 @@ def main() -> int:
             "    (a prebuilt engine wheel in the wheels\\ folder avoids needing them)\n"
             "  - NVIDIA CUDA Toolkit missing (nvcc not on PATH)\n"
             "  - PyTorch CPU-only wheel (set TORCH_INDEX_URL in .env)\n"
-            "Delete .venv and run windows\\START-HERE.bat again after fixing that."
+            f"Delete {VENV_PY.parents[1].name} and run windows\\START-HERE.bat again after fixing that."
         )
 
     require_engine_version()
@@ -1553,6 +1629,13 @@ def main() -> int:
                 # The UI asked for another model: .env has the new settings, so
                 # rebuild the command line and load again in this same window.
                 cfg = load_dotenv(ENV_FILE)
+                drafted_before = ENGINE_VERSION != DEFAULT_ENGINE_VERSION
+                import dflash2
+                if dflash2.wanted(cfg.get("DRAFT")) != drafted_before:
+                    # linux/start.sh re-execs itself here and so picks the other
+                    # environment; this loop keeps the one it started with
+                    die("DRAFT was changed in .env while the kit was running.\n"
+                        "Close this window and run windows\\start.bat again.")
                 cmd, host, port, gpu_mem, ui, context = server_command(cfg)
                 rt.url = f"http://127.0.0.1:{port}/"   # a switch may change PORT
                 print()
