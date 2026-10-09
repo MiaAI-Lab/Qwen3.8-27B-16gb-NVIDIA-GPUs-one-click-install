@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the OpenAI-compatible exllamav3 server (tools/serve_openai.py).
+# Start the OpenAI- and Anthropic-compatible exllamav3 server (tools/serve_openai.py).
 # Configuration lives in .env — created from .env.example on first run.
 #
 # Works from the deployment kit or from the engine repo itself. First run
@@ -426,7 +426,7 @@ MODEL_DIR="${MODEL_DIR:?MODEL_DIR must be set in .env}"
 # says which, and refuses the rest here - before any model is downloaded.
 _gpu_from=".env"
 if [ "$_dflash2" = 1 ]; then
-    _pin="$("$PYTHON" tools/dflash2.py pin --model-dir "$MODEL_DIR")" || exit 1
+    _pin="$("$PYTHON" tools/dflash2.py pin --model-dir "$MODEL_DIR" --gpu-mem "${GPU_MEM_GB:-}")" || exit 1
     while IFS='=' read -r _k _v; do
         case "$_k" in
             CONTEXT_SIZE|GPU_MEM_GB|CACHE_QUANT|DFLASH2_REPO|DFLASH2_REVISION|DFLASH2_DIR)
@@ -454,6 +454,19 @@ else
     if [ "$GPU_MEM_GB" -lt 8 ]; then GPU_MEM_GB=8; fi
     echo "GPU_MEM_GB not set — auto-detected budget: ${GPU_MEM_GB} GB (override in .env)"
 fi
+# Two GPUs: GPU_MEM_GB=<gpu0>,<gpu1>, in the order nvidia-smi lists them. Fail
+# here, in words, if fewer cards are visible than budgets are written.
+case "$GPU_MEM_GB" in
+    *,*)
+        export CUDA_DEVICE_ORDER=PCI_BUS_ID
+        _have=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)
+        _want=$(printf '%s' "$GPU_MEM_GB" | awk -F, '{print NF}')
+        if [ "${_have:-0}" -gt 0 ] && [ "$_have" -lt "$_want" ]; then
+            echo "ERROR: GPU_MEM_GB=$GPU_MEM_GB lists $_want budgets but nvidia-smi sees $_have GPU(s)." >&2
+            echo "       Use one value per card you have, e.g. GPU_MEM_GB=14.7" >&2
+            exit 1
+        fi ;;
+esac
 CACHE_QUANT="${CACHE_QUANT:-none}"
 CPU_CACHE_GB="${CPU_CACHE_GB:-0}"
 # Seconds between the server's live " .. " progress lines (0 = off; the
@@ -542,6 +555,10 @@ if [ "$CPU_CACHE_GB" != "0" ]; then
     cmd+=(--cpu_cache_size "$CPU_CACHE_GB")
 fi
 cmd+=(--progress_every "$PROGRESS_EVERY")
+# Two GPUs (GPU_MEM_GB=14.9,7.2) and MTP draft length - see .env.example.
+[ -n "${GPU_OFFLOAD_LAYERS:-}" ] && cmd+=(--offload_layers "$GPU_OFFLOAD_LAYERS")
+[ -n "${DRAFT_TOKENS:-}" ] && cmd+=(--num_draft_tokens "$DRAFT_TOKENS")
+[ -n "${DRAFT_CONFIDENCE:-}" ] && cmd+=(--dynamic_draft "$DRAFT_CONFIDENCE")
 
 # --- the harness ----------------------------------------------------------
 # The model server serves /v1 and a small page at / saying where things are.

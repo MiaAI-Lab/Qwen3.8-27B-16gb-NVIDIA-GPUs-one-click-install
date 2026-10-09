@@ -483,6 +483,9 @@ def dflash2_pin(cfg: dict[str, str]) -> dict[str, str] | None:
     import dflash2
     if not dflash2.wanted(cfg.get("DRAFT")):
         return None
+    why = dflash2.multi_gpu_message(cfg.get("GPU_MEM_GB"))
+    if why:
+        die(why)
     pinned, why = dflash2.pin(cfg.get("MODEL_DIR") or "")
     if pinned is None:
         die(why)
@@ -552,11 +555,12 @@ def torch_index_for_driver(cfg: dict[str, str]) -> str:
     return DEFAULT_TORCH_INDEX
 
 
-def nvidia_mem_mib() -> tuple[int, int, int]:
-    """(used, free, total) MiB for GPU 0 via nvidia-smi, or (0, 0, 0)."""
+def nvidia_mem_mib(index: int = 0) -> tuple[int, int, int]:
+    """(used, free, total) MiB for GPU `index` (nvidia-smi / PCI order), or (0, 0, 0)."""
     try:
         r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used,memory.free,memory.total",
+            ["nvidia-smi", "-i", str(index),
+             "--query-gpu=memory.used,memory.free,memory.total",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10,
         )
@@ -611,9 +615,19 @@ def vram_preflight(gpu_mem_gb: str, margin_gib: float = 0.3) -> None:
     On Windows a short budget does not fail loudly: the driver can spill CUDA
     memory to system RAM and the model then runs many times slower."""
     try:
-        need_mib = int(float(gpu_mem_gb) * 1024)
-    except ValueError:
+        # "14.9,7.2" (two GPUs): GPU 0 is checked in the loop below; the others
+        # are only reported, since each is a separate card with its own budget
+        budgets = [float(x) for x in str(gpu_mem_gb).replace(" ", "").split(",") if x]
+        need_mib = int(budgets[0] * 1024)
+    except (ValueError, IndexError):
         return
+    for idx, gb in enumerate(budgets[1:], start = 1):
+        u, f, t = nvidia_mem_mib(idx)
+        if t <= 0:
+            warn(f"GPU {idx}: nvidia-smi does not show it, but GPU_MEM_GB lists a budget for it.")
+        elif f < int((gb + margin_gib) * 1024):
+            warn(f"GPU {idx} has {f / 1024:.1f} GB free of {t / 1024:.1f} GB; "
+                 f"its budget is {gb:g} GB. Free VRAM on it or lower GPU_MEM_GB.")
     used, free, total = nvidia_mem_mib()
     if total <= 0:
         warn("nvidia-smi not found - skipping the free-VRAM check.")
@@ -1067,7 +1081,8 @@ def start_tray(rt: Runtime, log_path: Path | None):
 def ui_mode(cfg: dict[str, str]) -> str:
     """UI=browser (default) starts the DeepSeek Harness once the server is
     Ready and opens it; UI=server starts it but opens nothing; UI=no does not
-    start it at all, leaving a plain OpenAI endpoint on /v1."""
+    start it at all, leaving the server as plain endpoints: OpenAI on /v1,
+    Anthropic on /v1/messages."""
     # SIMPLEX_UI is the per-run override (`simplex start --no-harness`, or
     # windows\start.bat --no-harness). It beats .env; UI in the environment does not,
     # because .env is this file's answer for everything else too.
@@ -1116,7 +1131,8 @@ def harness_after_ready(proc: subprocess.Popen, host: str, port: str,
         row = dsh.describe_model(base)
     except Exception as e:  # noqa: BLE001
         warn(f"could not ask the server what it is ({e})")
-        info(f"The API is serving at {cyan(base)} - point any OpenAI client at it.")
+        info(f"The API is serving at {cyan(base)} - point any OpenAI or "
+             f"Anthropic client at it.")
         return
 
     try:
@@ -1432,6 +1448,12 @@ def server_command(cfg: dict[str, str]):
     # end-of-request " == stats" line always prints). Passed raw like the
     # other numeric knobs: a bad value dies loudly in the server's argparse.
     cmd.extend(["--progress_every", str(cfg.get("PROGRESS_EVERY") or "1.0")])
+    # Two GPUs (GPU_MEM_GB=14.9,7.2) and MTP draft length - see .env.example.
+    for key, flag in (("GPU_OFFLOAD_LAYERS", "--offload_layers"),
+                      ("DRAFT_TOKENS", "--num_draft_tokens"),
+                      ("DRAFT_CONFIDENCE", "--dynamic_draft")):
+        if (cfg.get(key) or "").strip():
+            cmd.extend([flag, cfg[key].strip()])
     cmd.extend(["--vision", vision_mode, "--image_max_pixels", image_max_pixels])
     ui = ui_mode(cfg)
     cmd.extend(["--ui", "off" if ui == "no" else "on"])
