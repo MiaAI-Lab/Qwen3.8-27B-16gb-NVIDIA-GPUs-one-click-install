@@ -8,8 +8,9 @@ no drafting at all (`-dm none`), or a separate draft model's directory
 (`-dm <dir>`), which is how DRAFT=dflash2 runs (it needs ExLlamaV3 1.6.0, see
 tools/dflash2.py). The launchers map the .env `DRAFT` knob onto these.
 
-Requires ExLlamaV3 >= 1.4.4: the served quant carries a quantized vision
-tower (vision_bits 3), which only v1.4.4+ decodes correctly.
+Requires ExLlamaV3 >= 1.4.4 (the kit installs 1.6.0): the served quant
+carries a quantized vision tower (vision_bits 3), which only v1.4.4+ decodes
+correctly.
 
 Images: with --vision auto (default) the vision tower is loaded next to the
 text model and OpenAI `image_url` content parts (data: URLs or http(s) URLs)

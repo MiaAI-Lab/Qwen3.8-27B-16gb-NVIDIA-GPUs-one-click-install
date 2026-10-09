@@ -550,14 +550,14 @@ Simplex looks for one in this order:
    configuration.
 3. **`WHEEL_INDEX`** in `.env` — one or more `pip --find-links` targets (a GitHub
    Releases page, a file share, an internal index).
-4. **PyPI**, which has `triton-windows` but not `exllamav3`.
+4. **PyPI**, which has `triton-windows`; the kit does not take the engine from it.
 5. **Compiling from source**, for the cases none of the above covers — a CUDA line
    or platform the engine has no build for (aarch64/GB10), or no route to
    github.com.
 
 Step 2 resolves to one exact URL rather than pointing pip at the release page, and
 that distinction matters. The CUDA line and torch version live in the wheel's *local
-version* (`1.4.4+cu128.torch2.10.0`), which pip does not match against anything:
+version* (`1.6.0+cu128.torch2.10.0`), which pip does not match against anything:
 given `--find-links` it filters on the Python and platform tags only, then takes the
 highest version string. A torch 2.10 environment would be handed the torch 2.11
 build, and the failure arrives later as an undefined-symbol `ImportError` that reads
@@ -582,22 +582,23 @@ That prints the venv's tags, the torch version and CUDA line found, and the whee
 would install. `wheels/README.md` covers the override cases and the recipe for
 building one yourself.
 
-**Engine version.** This kit requires **ExLlamaV3 v1.4.4** — it is what the quantized
-vision tower needs, and what the kit is validated against. PyPI skips 1.4.4
-(`1.4.2` → `1.4.5`), so the launchers install the git tag, and both start paths
-refuse to run against any other version. The one exception is the opt-in
-[`DRAFT=dflash2`](#optional-draftdflash2-32-gb-cards), which needs **v1.6.0** and
-installs it into a separate `.venv-dflash2`, checked the same way; `.venv` stays on
-1.4.4. Engine: [ExLlamaV3](https://github.com/turboderp-org/exllamav3).
+**Engine version.** This kit requires **ExLlamaV3 v1.6.0**, for every `DRAFT` value.
+The quantized vision tower needs v1.4.4 or newer, and v1.6.0 is what the kit is
+validated against. The launchers install the git tag (or the matching release
+wheel), and both start paths refuse to run against any other version.
+**Upgrading from a kit that ran v1.4.4:** delete the old `.venv` folder (and
+`.venv-dflash2` if you have one) and start again; the first run rebuilds it with
+v1.6.0 and `transformers`. Weights in `models/` are kept.
+Engine: [ExLlamaV3](https://github.com/turboderp-org/exllamav3).
 
 ---
 
 ## Optional: `DRAFT=dflash2` (32 GB cards)
 
 `DRAFT=dflash2` replaces the MTP head with a separate drafter, a DFlash2
-block-diffusion draft model, and needs ExLlamaV3 **1.6.0** instead of 1.4.4. It is
-off by default. With `DRAFT` unset, `mtp` or `none` nothing below applies: same
-engine, same `.venv`, same flags, same downloads.
+block-diffusion draft model. It is off by default. With `DRAFT` unset, `mtp` or
+`none` nothing below applies: same engine (1.6.0), same `.venv`, same flags, same
+downloads.
 
 ```
 DRAFT=dflash2        in .env, then ./linux/start.sh      (Windows: see the limits below)
@@ -606,10 +607,9 @@ DRAFT=mtp            in .env (or delete the line) to go back; nothing is reinsta
 
 What it does:
 
-- **Own environment.** The engine goes into `.venv-dflash2`, built the first time you
-  start with `DRAFT=dflash2`. `.venv` (1.4.4) is not touched, so switching `DRAFT`
-  back and forth costs nothing after the first time. It also gets `transformers`,
-  which 1.6.0's chat template imports but no longer pulls in (1.4.4 got it through
+- **Same environment.** The engine and `transformers` live in the one `.venv`, so
+  switching `DRAFT` back and forth reinstalls nothing. `transformers` is needed by
+  1.6.0's chat template, which no longer pulls it in (1.4.4 got it through
   `flash-linear-attention`).
 - **Engine wheel.** Resolved exactly as in [Prebuilt wheels](#prebuilt-wheels-no-compiler-needed),
   from a table of what the v1.6.0 release actually published (`tools/wheels.py`). If
@@ -635,22 +635,22 @@ What it does:
 
 One RTX 5090 (32 GB) on Linux, driver 610.43.02, power limit 450 W with the SM clock
 capped at 2200 MHz. Both sides ran the same `tools/serve_openai.py` with
-`--grid_size 22.8 --cache_quant 4 --vision auto`. *Default* is this kit as it ships
-(ExLlamaV3 1.4.4 + MTP); *dflash2* is ExLlamaV3 1.6.0 + the drafter above. Decode
+`--grid_size 22.8 --cache_quant 4 --vision auto`. *Default* below is the kit's previous default
+(ExLlamaV3 1.4.4 + MTP; the kit now ships 1.6.0 + MTP, see the depth table); *dflash2* is ExLlamaV3 1.6.0 + the drafter above. Decode
 tokens per second with RigMark 1.3.0 (commit `218c8ae`), median of 5 runs, thinking
 off. C1 is a single request, end to end.
 
 | | quant, context | code | prose | structured | C1 |
 | --- | --- | ---: | ---: | ---: | ---: |
-| default | 4.0 bpw, 262144 | 180.0 | 103.3 | 205.9 | 155.0 |
+| 1.4.4 + MTP (previous default) | 4.0 bpw, 262144 | 180.0 | 103.3 | 205.9 | 155.0 |
 | dflash2 | 4.0 bpw, 262144 | 274.6 | 113.2 | 366.4 | 198.8 |
 
-That is +52.6 % code, +9.6 % prose, +78.0 % structured and +28.3 % C1. Structured
+Against the previous default that is +52.6 % code, +9.6 % prose, +78.0 % structured and +28.3 % C1. Structured
 output is the best case; prose gains the least.
 
 Quality, same questions, seed 42, thinking off (MMLU 200 questions, GSM8K 100):
 
-| quant | default | dflash2 |
+| quant | 1.4.4 + MTP | dflash2 |
 | --- | --- | --- |
 | 4.0 bpw | 80.0 % / 96 % | 79.5 % / 96 % |
 
@@ -661,8 +661,8 @@ Decode speed at depth, 4.0 bpw, tokens per second (llama-benchy, 2048-token prom
 
 | context depth | 0 | 8k | 32k | 64k | 128k | 248k | VRAM |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| default (1.4.4 + MTP) | 114.4 | 114.6 | 101.2 | 94.2 | 73.7 | 65.0 | 22704 MiB |
-| 1.6.0 + MTP | 121.8 | 115.9 | 112.5 | 122.6 | 102.9 | 79.3 | 22366 MiB |
+| 1.4.4 + MTP (previous default) | 114.4 | 114.6 | 101.2 | 94.2 | 73.7 | 65.0 | 22704 MiB |
+| 1.6.0 + MTP (current default) | 121.8 | 115.9 | 112.5 | 122.6 | 102.9 | 79.3 | 22366 MiB |
 | dflash2 (1.6.0 + DFlash2) | 147.0 | 164.3 | 156.5 | 121.3 | 104.4 | 75.0 | 24850 MiB |
 
 ### Limits
@@ -674,7 +674,7 @@ Decode speed at depth, 4.0 bpw, tokens per second (llama-benchy, 2048-token prom
   level from 64k (121.3 against 122.6), and slightly behind at 248k (75.0 against
   79.3). The large gains above are for answers of a few thousand tokens, not for a
   full context window.
-- **Not for 16 or 24 GB cards.** It needs about 2.1 GiB more VRAM than the default (2.4 GiB more than 1.6.0 + MTP; table above).
+- **Not for 16 or 24 GB cards.** It needs about 2.4 GiB more VRAM than the default (1.6.0 + MTP; 2.1 GiB more than the old 1.4.4 default; table above).
   A test on a 16 GB RTX 5060 Ti used a different combination (the 2.5 bpw quant and
   the unquantised bf16 DFlash2 drafter, 3.85 GB): the context fell to 44032 tokens,
   the vision tower no longer fit, and the server returned a growing number of empty
@@ -735,7 +735,7 @@ fine. The ones you are most likely to touch:
 | `SHORTCUTS` | `auto` | Windows shortcuts; `no` to skip |
 | `HF_TOKEN` | — | only needed for gated repos |
 
-`.venv/`, `.venv-dflash2/`, `models/`, `logs/`, `apps/`, `.dsh/` and `.env` stay on your machine and
+`.venv/`, `models/`, `logs/`, `apps/`, `.dsh/` and `.env` stay on your machine and
 are not part of the git tree.
 
 ---

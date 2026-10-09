@@ -204,15 +204,16 @@ _load_env() {
 _load_env
 
 # --- which engine, which venv ---------------------------------------------
-# DRAFT=dflash2 (tools/dflash2.py) needs ExLlamaV3 1.6.0. It gets a virtualenv
-# of its own, so switching DRAFT back and forth never reinstalls anything and
-# the 1.4.4 install used by every other value is not touched. A card that is
-# too small is refused here, before a venv or a download exists.
+# Every DRAFT value runs on ExLlamaV3 1.6.0 in the one .venv, so switching DRAFT
+# back and forth never reinstalls anything. transformers is installed with it:
+# 1.6.0's chat template imports it and the engine no longer pulls it in.
+# DRAFT=dflash2 (tools/dflash2.py) is the only value with a gate: a card that is
+# too small is refused here, before a download exists.
 VENV=".venv"
-ENGINE_VERSION="1.4.4"
-_wheel_engine=()
-_extra_pkgs=()        # tools/dflash2.py EXTRA_PACKAGES
-_extra_probe=""
+ENGINE_VERSION="1.6.0"
+_wheel_engine=(--engine-version "$ENGINE_VERSION")
+_extra_pkgs=(transformers)   # tools/dflash2.py EXTRA_PACKAGES
+_extra_probe=", transformers"
 _dflash2=0
 if [ "$(echo "${DRAFT:-}" | tr '[:upper:]' '[:lower:]')" = "dflash2" ]; then
     if [ -z "$_pyprof" ]; then
@@ -221,11 +222,6 @@ if [ "$(echo "${DRAFT:-}" | tr '[:upper:]' '[:lower:]')" = "dflash2" ]; then
     fi
     "$_pyprof" tools/dflash2.py gate || exit 1
     _dflash2=1
-    VENV=".venv-dflash2"
-    ENGINE_VERSION="1.6.0"
-    _wheel_engine=(--engine-version "$ENGINE_VERSION")
-    _extra_pkgs=(transformers)
-    _extra_probe=", transformers"
 fi
 
 # .env is sourced as shell vars; the model-download subprocess needs the HF
@@ -334,10 +330,9 @@ if [ ! -x "$VENV/bin/python" ] \
         _engine_src="."
         _engine_note="local engine repo — compiling CUDA kernels"
     else
-        # Pinned to the v1.4.4 tag. PyPI has no 1.4.4 wheel (it jumps
-        # 1.4.2 -> 1.4.5), so the tag is the only way to get exactly v1.4.4,
-        # which this quant needs (quantized vision tower). DRAFT=dflash2 pins
-        # v1.6.0 the same way.
+        # Pinned to the v1.6.0 tag, so the install is exactly the release the
+        # kit is validated against (the quant needs v1.4.4+ for its quantized
+        # vision tower).
         _engine_src="${EXL3_REPO:-git+https://github.com/turboderp-org/exllamav3.git@v$ENGINE_VERSION}"
         _engine_note="exllamav3 engine — clone + compile CUDA kernels"
     fi
@@ -384,13 +379,13 @@ PYTHON="$VENV/bin/python"
 export PATH="$(pwd)/$VENV/bin:$PATH"
 
 # --- engine version guard ---------------------------------------------------
-# v1.4.4 is mandatory: this quant ships a quantized vision tower (vision_bits 3),
-# which older builds decode incorrectly, and stock v1.4.4 is what this kit is
-# validated against. DRAFT=dflash2 requires v1.6.0 in its own venv instead.
+# The exact version is mandatory: this quant ships a quantized vision tower
+# (vision_bits 3), which builds older than v1.4.4 decode incorrectly, and stock
+# v1.6.0 is what this kit is validated against.
 if ! "$PYTHON" -c "import sys; from exllamav3.version import __version__ as v; sys.exit(0 if v == \"$ENGINE_VERSION\" else (print(\" !! unexpected exllamav3 version:\", v) or 1))" 2>/dev/null; then
     _gotver="$("$PYTHON" -c 'from exllamav3.version import __version__; print(__version__)' 2>/dev/null || echo unknown)"
     echo "ERROR: this kit requires ExLlamaV3 v$ENGINE_VERSION, but the venv has '$_gotver'." >&2
-    echo "Fix: EXL3_REPO=git+https://github.com/turboderp-org/exllamav3.git@v$ENGINE_VERSION then rm -rf $VENV && ./start.sh" >&2
+    echo "Fix: rm -rf $VENV && ./start.sh   (the first run reinstalls the engine; models are kept)" >&2
     exit 1
 fi
 

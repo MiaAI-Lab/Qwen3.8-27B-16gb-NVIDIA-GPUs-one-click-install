@@ -620,7 +620,7 @@ def main(argv: list[str]) -> int:
     a = ap.parse_args(argv)
     import win_start
     cfg = win_start.load_dotenv(core.ENV_FILE)
-    win_start.select_environment(cfg)   # DRAFT=dflash2: gate + its own venv
+    win_start.select_environment(cfg)   # DRAFT=dflash2: card gate
 
     def console(line: str, kind: str) -> None:
         prefix = {"cmd": "  > ", "error": "  ! ", "hint": "    ", "out": "    "}.get(kind, "    ")

@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """DRAFT=dflash2: the opt-in DFlash2 drafter. Everything it needs to know in one place.
 
-The default drafter is the MTP head inside the checkpoint, on ExLlamaV3 1.4.4.
-DRAFT=dflash2 swaps it for a separate drafter model, which needs ExLlamaV3
-1.6.0. That engine lives in its own environment (.venv-dflash2), so changing
-DRAFT back and forth never reinstalls anything and the 1.4.4 install is never
-touched. The two launchers (linux/start.sh, tools/win_start.py) and
+The default drafter is the MTP head inside the checkpoint. DRAFT=dflash2 swaps
+it for a separate drafter model. Both run on ExLlamaV3 1.6.0 in the one .venv,
+so changing DRAFT back and forth never reinstalls anything. The two launchers (linux/start.sh, tools/win_start.py) and
 tools/setup_core.py all ask this file instead of each carrying a copy.
 
 What was measured, and so what is allowed (README, "DFlash2"): one RTX 5090 on
@@ -31,12 +29,13 @@ from pathlib import Path
 
 DRAFT = "dflash2"
 ENGINE_VERSION = "1.6.0"
-VENV_NAME = ".venv-dflash2"
+VENV_NAME = ".venv"
 
-# Installed into that environment next to the kit's own server libraries.
-# 1.4.4 gets transformers through its flash-linear-attention requirement; 1.6.0
-# carries those kernels itself and no longer pulls it in, but its chat template
-# (Tokenizer.hf_chat_template) still imports it.
+# Installed next to the kit's own server libraries. 1.4.4 got transformers
+# through its flash-linear-attention requirement; 1.6.0 carries those kernels
+# itself and no longer pulls it in, but its chat template
+# (Tokenizer.hf_chat_template) still imports it - without it every chat request
+# returns HTTP 500. Needed for every DRAFT value, not only dflash2.
 EXTRA_PACKAGES = ("transformers",)
 
 # The drafter: an EXL3 4.00 bpw quant of z-lab's DFlash2 (r0b0tlab's upload).
@@ -64,16 +63,16 @@ def wanted(draft: str | None) -> bool:
     return (draft or "").strip().lower() == DRAFT
 
 
-def venv_name(draft: str | None) -> str:
-    return VENV_NAME if wanted(draft) else ".venv"
+def venv_name(draft: str | None = None) -> str:
+    return VENV_NAME
 
 
-def engine_version(draft: str | None, default: str) -> str:
-    return ENGINE_VERSION if wanted(draft) else default
+def engine_version(draft: str | None = None, default: str = ENGINE_VERSION) -> str:
+    return ENGINE_VERSION
 
 
-def extra_packages(draft: str | None) -> tuple[str, ...]:
-    return EXTRA_PACKAGES if wanted(draft) else ()
+def extra_packages(draft: str | None = None) -> tuple[str, ...]:
+    return EXTRA_PACKAGES
 
 
 def gate_message(total_gib: float) -> str:
