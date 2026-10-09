@@ -608,7 +608,9 @@ What it does:
 
 - **Own environment.** The engine goes into `.venv-dflash2`, built the first time you
   start with `DRAFT=dflash2`. `.venv` (1.4.4) is not touched, so switching `DRAFT`
-  back and forth costs nothing after the first time.
+  back and forth costs nothing after the first time. It also gets `transformers`,
+  which 1.6.0's chat template imports but no longer pulls in (1.4.4 got it through
+  `flash-linear-attention`).
 - **Engine wheel.** Resolved exactly as in [Prebuilt wheels](#prebuilt-wheels-no-compiler-needed),
   from a table of what the v1.6.0 release actually published (`tools/wheels.py`). If
   no wheel fits, the fallback is a source build of the `v1.6.0` tag.

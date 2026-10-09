@@ -33,6 +33,12 @@ DRAFT = "dflash2"
 ENGINE_VERSION = "1.6.0"
 VENV_NAME = ".venv-dflash2"
 
+# Installed into that environment next to the kit's own server libraries.
+# 1.4.4 gets transformers through its flash-linear-attention requirement; 1.6.0
+# carries those kernels itself and no longer pulls it in, but its chat template
+# (Tokenizer.hf_chat_template) still imports it.
+EXTRA_PACKAGES = ("transformers",)
+
 # The drafter: an EXL3 4.00 bpw quant of z-lab's DFlash2 (r0b0tlab's upload).
 # Pinned to a commit rather than a branch, and to the checksum of its one weight
 # file, so what is downloaded is what was measured.
@@ -64,6 +70,10 @@ def venv_name(draft: str | None) -> str:
 
 def engine_version(draft: str | None, default: str) -> str:
     return ENGINE_VERSION if wanted(draft) else default
+
+
+def extra_packages(draft: str | None) -> tuple[str, ...]:
+    return EXTRA_PACKAGES if wanted(draft) else ()
 
 
 def gate_message(total_gib: float) -> str:

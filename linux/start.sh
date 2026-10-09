@@ -211,6 +211,8 @@ _load_env
 VENV=".venv"
 ENGINE_VERSION="1.4.4"
 _wheel_engine=()
+_extra_pkgs=()        # tools/dflash2.py EXTRA_PACKAGES
+_extra_probe=""
 if [ "$(echo "${DRAFT:-}" | tr '[:upper:]' '[:lower:]')" = "dflash2" ]; then
     if [ -z "$_pyprof" ]; then
         echo "DRAFT=dflash2 needs python3 on PATH to check this machine, and none was found." >&2
@@ -220,6 +222,8 @@ if [ "$(echo "${DRAFT:-}" | tr '[:upper:]' '[:lower:]')" = "dflash2" ]; then
     VENV=".venv-dflash2"
     ENGINE_VERSION="1.6.0"
     _wheel_engine=(--engine-version "$ENGINE_VERSION")
+    _extra_pkgs=(transformers)
+    _extra_probe=", transformers"
 fi
 
 # .env is sourced as shell vars; the model-download subprocess needs the HF
@@ -230,7 +234,7 @@ if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; fi
 # Re-enters if the venv is missing OR the install is incomplete (e.g. a
 # Ctrl-C during the first run left a half-installed venv) — pip is idempotent.
 if [ ! -x "$VENV/bin/python" ] \
-   || ! "$VENV/bin/python" -c "import torch, exllamav3, aiohttp, huggingface_hub" 2>/dev/null; then
+   || ! "$VENV/bin/python" -c "import torch, exllamav3, aiohttp, huggingface_hub$_extra_probe" 2>/dev/null; then
     if [ "$MODE" != "setup" ]; then
         echo "This kit is not ready to start: the Python environment is missing or incomplete."
         _ask_yes "Install it now?" || {
@@ -368,8 +372,8 @@ if [ ! -x "$VENV/bin/python" ] \
             "$VENV/bin/pip" install --no-build-isolation \
                 "${_engine_src}"
     fi
-    _quiet_step "5/5 server dependencies (aiohttp, huggingface_hub)" \
-        "$VENV/bin/pip" install --quiet aiohttp huggingface_hub
+    _quiet_step "5/5 server dependencies (aiohttp, huggingface_hub$_extra_probe)" \
+        "$VENV/bin/pip" install --quiet aiohttp huggingface_hub ${_extra_pkgs[@]+"${_extra_pkgs[@]}"}
     echo "Setup complete."
 fi
 

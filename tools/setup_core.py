@@ -33,6 +33,7 @@ ENV_EXAMPLE = ROOT / ".env.example"
 
 ENGINE_PACKAGE = "exllamav3"
 ENGINE_VERSION = "1.4.4"
+EXTRA_PACKAGES: tuple[str, ...] = ()     # DRAFT=dflash2 only (tools/dflash2.py)
 
 
 class SetupError(RuntimeError):
@@ -129,7 +130,8 @@ def install_steps() -> list[Step]:
         items.append(Step("triton", "Triton for Windows", "GPU kernels the engine loads at import"))
     items += [
         Step("engine", "ExLlamaV3 engine", "prebuilt wheel if one fits this Python"),
-        Step("server", "Server libraries", "aiohttp, huggingface_hub, pillow"),
+        Step("server", "Server libraries", "aiohttp, huggingface_hub, pillow"
+             + "".join(", " + m for m in EXTRA_PACKAGES)),
         Step("check", "Checking the install", "imports the engine and asks the GPU to say hello"),
     ]
     return items
@@ -188,7 +190,7 @@ def venv_ready() -> tuple[bool, str]:
         "try:\n"
         "    from exllamav3.version import __version__ as v; out['engine'] = v\n"
         "except Exception as e: out['engine_error'] = str(e)[:300]\n"
-        "for mod in ('aiohttp', 'huggingface_hub', 'PIL'):\n"
+        f"for mod in {('aiohttp', 'huggingface_hub', 'PIL') + EXTRA_PACKAGES!r}:\n"
         "    try:\n"
         "        __import__(mod); out[mod] = True\n"
         "    except Exception: out[mod] = False\n"
@@ -207,7 +209,8 @@ def venv_ready() -> tuple[bool, str]:
         return False, "the ExLlamaV3 engine is not installed"
     if out.get("engine") != ENGINE_VERSION:
         return False, f"the engine is v{out['engine']}, this kit needs v{ENGINE_VERSION}"
-    for mod, label in (("aiohttp", "aiohttp"), ("huggingface_hub", "huggingface_hub"), ("PIL", "pillow")):
+    for mod, label in (("aiohttp", "aiohttp"), ("huggingface_hub", "huggingface_hub"), ("PIL", "pillow"),
+                       *((m, m) for m in EXTRA_PACKAGES)):
         if not out.get(mod):
             return False, f"{label} is missing"
     return True, ""
@@ -520,7 +523,8 @@ def install_environment(cfg: dict, log, steps: Steps, cancelled=None) -> None:
 
     # --- server libraries --------------------------------------------------
     steps.start("server")
-    if _stream(_pip("install", "aiohttp", "huggingface_hub", "pillow"), tee, cancelled=stop) != 0:
+    if _stream(_pip("install", "aiohttp", "huggingface_hub", "pillow", *EXTRA_PACKAGES),
+               tee, cancelled=stop) != 0:
         raise SetupError("The server libraries could not be installed.",
                          "Retry - this step is a plain download from pypi.org.")
     steps.finish("server")

@@ -782,7 +782,7 @@ def cmd_doctor(a) -> int:
              "try:\n"
              "  from exllamav3.version import __version__ as v; d['engine']=v\n"
              "except Exception as e: d['engine']=None\n"
-             "for m in ('torch','aiohttp','huggingface_hub','PIL'):\n"
+             f"for m in {('torch','aiohttp','huggingface_hub','PIL') + dflash2.extra_packages(cfg.get('DRAFT'))!r}:\n"
              "  try:\n"
              "    __import__(m); d[m]=True\n"
              "  except Exception: d[m]=False\n"
@@ -798,7 +798,7 @@ def cmd_doctor(a) -> int:
             bad("exllamav3 version", f"{info['engine']} (this kit needs {engine})")
         else:
             bad("exllamav3", f"not importable in {venv} - run: simplex setup")
-        for mod in ("torch", "aiohttp", "huggingface_hub"):
+        for mod in ("torch", "aiohttp", "huggingface_hub", *dflash2.extra_packages(cfg.get("DRAFT"))):
             (ok if info.get(mod) else bad)(mod, "" if info.get(mod) else "missing")
         if not info.get("PIL"):
             warn("pillow", "missing - images will be off")

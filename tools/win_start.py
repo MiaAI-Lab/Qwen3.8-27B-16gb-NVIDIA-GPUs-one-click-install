@@ -23,6 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 VENV_PY = ROOT / ".venv" / "Scripts" / "python.exe"
 ENGINE_VERSION = "1.4.4"
+EXTRA_PACKAGES: tuple[str, ...] = ()     # DRAFT=dflash2 only (tools/dflash2.py)
 ENV_FILE = ROOT / ".env"
 ENV_EXAMPLE = ROOT / ".env.example"
 SERVE = ROOT / "tools" / "serve_openai.py"
@@ -234,7 +235,8 @@ def venv_ok() -> bool:
     if not VENV_PY.is_file():
         return False
     probe = (
-        "import torch, exllamav3, aiohttp, huggingface_hub\n"
+        "import torch, exllamav3, aiohttp, huggingface_hub"
+        + "".join(", " + m for m in EXTRA_PACKAGES) + "\n"
         "import sys\n"
         "sys.exit(0 if torch.cuda.is_available() else 2)\n"
     )
@@ -417,8 +419,9 @@ def bootstrap(cfg: dict[str, str]) -> None:
     step_ok("engine", time.time() - t3)
 
     t4 = time.time()
-    step(5, 5, "Server dependencies (aiohttp, huggingface_hub, pillow)")
-    run(pip_cmd("install", "aiohttp", "huggingface_hub", "pillow"), cwd=str(ROOT))
+    step(5, 5, "Server dependencies (aiohttp, huggingface_hub, pillow"
+         + "".join(", " + m for m in EXTRA_PACKAGES) + ")")
+    run(pip_cmd("install", "aiohttp", "huggingface_hub", "pillow", *EXTRA_PACKAGES), cwd=str(ROOT))
     step_ok("server deps", time.time() - t4)
     print()
     print(f"  {green('Setup complete.')}  Next launches start in a few seconds.")
@@ -447,7 +450,7 @@ def select_environment(cfg: dict[str, str]) -> None:
     that is too small is refused before anything is created. Windows is
     untested for this path (see README)."""
     import dflash2
-    global VENV_PY, ENGINE_VERSION
+    global VENV_PY, ENGINE_VERSION, EXTRA_PACKAGES
     if not dflash2.wanted(cfg.get("DRAFT")):
         return
     why = dflash2.gate_message(nvidia_total_mib() / 1024)
@@ -456,9 +459,11 @@ def select_environment(cfg: dict[str, str]) -> None:
     import setup_core
     VENV_PY = ROOT / dflash2.VENV_NAME / "Scripts" / "python.exe"
     ENGINE_VERSION = dflash2.ENGINE_VERSION
+    EXTRA_PACKAGES = dflash2.EXTRA_PACKAGES
     setup_core.VENV_DIR = ROOT / dflash2.VENV_NAME
     setup_core.VENV_PY = VENV_PY
     setup_core.ENGINE_VERSION = ENGINE_VERSION
+    setup_core.EXTRA_PACKAGES = EXTRA_PACKAGES
 
 
 def nvidia_total_mib() -> int:
