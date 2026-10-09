@@ -300,7 +300,7 @@ def prebuilt_args(package: str, tags: dict, cfg: dict, folder: Path = WHEEL_DIR,
 
     Returned as arguments only - running pip is the caller's job, so this
     stays testable on a machine with no network and no venv."""
-    local = find_local(package, tags, folder, None if engine == ENGINE_VERSION else engine)
+    local = find_local(package, tags, folder, _local_version(package, engine))
     if local is not None:
         # An exact path is unambiguous: pip cannot decide it prefers something
         # else, and the version in the folder is the version installed.
@@ -320,6 +320,14 @@ def prebuilt_args(package: str, tags: dict, cfg: dict, folder: Path = WHEEL_DIR,
     return args
 
 
+def _local_version(package: str, engine: str) -> str | None:
+    """The engine release a wheel in wheels\\ must be, or None for any other
+    package. With both venvs in use (DRAFT=dflash2) the folder can hold a 1.4.4
+    and a 1.6.0 engine wheel side by side, and newest-wins would put 1.6.0 into
+    .venv."""
+    return engine if package.lower().replace("_", "-") == ENGINE_PACKAGE else None
+
+
 def _engine_url_for(package: str, tags: dict, venv_python: Path | str | None,
                     engine: str = ENGINE_VERSION) -> str | None:
     """The engine's own release wheel for this venv, when that is what is asked
@@ -333,7 +341,7 @@ def _engine_url_for(package: str, tags: dict, venv_python: Path | str | None,
 def describe(package: str, tags: dict, cfg: dict, folder: Path = WHEEL_DIR,
              venv_python: Path | str | None = None,
              engine: str = ENGINE_VERSION) -> str:
-    local = find_local(package, tags, folder, None if engine == ENGINE_VERSION else engine)
+    local = find_local(package, tags, folder, _local_version(package, engine))
     if local is not None:
         return f"{local.path.name}  (from wheels\\)"
     upstream = _engine_url_for(package, tags, venv_python, engine)

@@ -619,8 +619,8 @@ What it does:
   downloader, pinned to commit `265b5240592907d2d55ff0dc4d5f66569692604d`. The weight
   file is checked against sha256 `e278f218318565562af07fc333045e411ffa0d83523f8224fc8c2d24d5a68223`
   on every start. The server gets `--draft_model <that folder>`.
-- **Refused on small cards.** Below 30 GiB of VRAM it stops before it creates or
-  downloads anything, says why, and exits non-zero. Any quant other than the kit's
+- **Refused on small cards.** Below 30 GiB of VRAM it stops before the environment
+  or any download exists, says why, and exits non-zero. Any quant other than the kit's
   4.0 bpw one is refused the same way, before any model is downloaded. 5.0 bpw is
   not enabled: it was not measured on the kit's own 5.0 file.
 - **Measured settings.** For these runs `CONTEXT_SIZE`, `CACHE_QUANT` and
@@ -674,7 +674,7 @@ Decode speed at depth, 4.0 bpw, tokens per second (llama-benchy, 2048-token prom
   level from 64k (121.3 against 122.6), and slightly behind at 248k (75.0 against
   79.3). The large gains above are for answers of a few thousand tokens, not for a
   full context window.
-- **Not for 16 or 24 GB cards.** It needs about 2.1 GiB more VRAM than MTP (above).
+- **Not for 16 or 24 GB cards.** It needs about 2.1 GiB more VRAM than the default (2.4 GiB more than 1.6.0 + MTP; table above).
   A test on a 16 GB RTX 5060 Ti used a different combination (the 2.5 bpw quant and
   the unquantised bf16 DFlash2 drafter, 3.85 GB): the context fell to 44032 tokens,
   the vision tower no longer fit, and the server returned a growing number of empty

@@ -23,6 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 VENV_PY = ROOT / ".venv" / "Scripts" / "python.exe"
 ENGINE_VERSION = "1.4.4"
+DEFAULT_ENGINE_VERSION = ENGINE_VERSION
 EXTRA_PACKAGES: tuple[str, ...] = ()     # DRAFT=dflash2 only (tools/dflash2.py)
 ENV_FILE = ROOT / ".env"
 ENV_EXAMPLE = ROOT / ".env.example"
@@ -466,6 +467,32 @@ def select_environment(cfg: dict[str, str]) -> None:
     setup_core.EXTRA_PACKAGES = EXTRA_PACKAGES
 
 
+def dflash2_pin(cfg: dict[str, str]) -> dict[str, str] | None:
+    """DRAFT=dflash2 only: the measured settings for MODEL_DIR, or die before
+    anything for an unmeasured quant is downloaded. None for every other DRAFT."""
+    import dflash2
+    if not dflash2.wanted(cfg.get("DRAFT")):
+        return None
+    pinned, why = dflash2.pin(cfg.get("MODEL_DIR") or "")
+    if pinned is None:
+        die(why)
+    return pinned
+
+
+def dflash2_drafter(cfg: dict[str, str]) -> None:
+    """DRAFT=dflash2 only: fetch the drafter at its pinned commit and check its
+    checksum, so a setup that stops before the start leaves a complete install,
+    as linux/setup.sh does."""
+    import dflash2
+    if not dflash2.wanted(cfg.get("DRAFT")):
+        return
+    drafter = ROOT / dflash2.DRAFT_DIR
+    download_model(VENV_PY, dflash2.DRAFT_REPO, drafter, "dflash2 drafter", dflash2.DRAFT_REVISION)
+    why = dflash2.verify(drafter)
+    if why:
+        die(why)
+
+
 def nvidia_total_mib() -> int:
     try:
         r = subprocess.run(
@@ -756,12 +783,14 @@ def run_first_run(cfg: dict[str, str], reasons: list[str],
             model_path = Path(model_dir)
             if not model_path.is_absolute():
                 model_path = ROOT / model_path
+            dflash2_pin(cfg)
             download_model(VENV_PY, cfg.get("HF_TARGET_REPO") or DEFAULT_REPO,
                            model_path, "target model", cfg.get("HF_REVISION") or None)
     else:
         cfg = done or cfg
     if cfg.get("HF_TOKEN"):
         os.environ["HF_TOKEN"] = cfg["HF_TOKEN"]
+    dflash2_drafter(cfg)
     return cfg
 
 
@@ -1331,9 +1360,7 @@ def server_command(cfg: dict[str, str]):
         # the settings it was measured with, for this run only (.env is not
         # changed), and only for the quants that were measured
         import dflash2
-        pinned, why = dflash2.pin(str(model_path))
-        if pinned is None:
-            die(why)
+        pinned = dflash2_pin(cfg)
         context, cache_quant, gpu_mem = (pinned["CONTEXT_SIZE"], pinned["CACHE_QUANT"],
                                          pinned["GPU_MEM_GB"])
         drafter = ROOT / dflash2.DRAFT_DIR
@@ -1372,10 +1399,7 @@ def server_command(cfg: dict[str, str]):
     download_model(VENV_PY, repo, model_path, "target model", cfg.get("HF_REVISION") or None)
     if drafter is not None:
         # pinned to a commit, and its one weight file to a checksum (tools/dflash2.py)
-        download_model(VENV_PY, dflash2.DRAFT_REPO, drafter, "dflash2 drafter", dflash2.DRAFT_REVISION)
-        why = dflash2.verify(drafter)
-        if why:
-            die(why)
+        dflash2_drafter(cfg)
 
     model_id = (cfg.get("MODEL_ID") or model_path.name).strip().lower()
     cmd = [
@@ -1605,6 +1629,13 @@ def main() -> int:
                 # The UI asked for another model: .env has the new settings, so
                 # rebuild the command line and load again in this same window.
                 cfg = load_dotenv(ENV_FILE)
+                drafted_before = ENGINE_VERSION != DEFAULT_ENGINE_VERSION
+                import dflash2
+                if dflash2.wanted(cfg.get("DRAFT")) != drafted_before:
+                    # linux/start.sh re-execs itself here and so picks the other
+                    # environment; this loop keeps the one it started with
+                    die("DRAFT was changed in .env while the kit was running.\n"
+                        "Close this window and run windows\\start.bat again.")
                 cmd, host, port, gpu_mem, ui, context = server_command(cfg)
                 rt.url = f"http://127.0.0.1:{port}/"   # a switch may change PORT
                 print()

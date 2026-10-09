@@ -549,6 +549,13 @@ def download_weights(cfg: dict, on_progress=None, cancelled=None, token: str = "
     repo = cfg.get("HF_TARGET_REPO") or ""
     if not repo:
         raise SetupError("No model repository is set.", "Pick a profile first.")
+    import dflash2
+    if dflash2.wanted(cfg.get("DRAFT")):
+        # refused before the download, not after it (tools/dflash2.py)
+        pinned, why = dflash2.pin(cfg.get("MODEL_DIR") or "")
+        if pinned is None:
+            first, _, rest = why.partition("\n")
+            raise SetupError(first, rest)
     _, dest = weights_ready(cfg)
     dl = downloader.Download(
         repo, dest, cfg.get("HF_REVISION") or "",

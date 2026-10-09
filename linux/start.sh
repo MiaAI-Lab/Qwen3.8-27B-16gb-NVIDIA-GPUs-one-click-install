@@ -213,12 +213,14 @@ ENGINE_VERSION="1.4.4"
 _wheel_engine=()
 _extra_pkgs=()        # tools/dflash2.py EXTRA_PACKAGES
 _extra_probe=""
+_dflash2=0
 if [ "$(echo "${DRAFT:-}" | tr '[:upper:]' '[:lower:]')" = "dflash2" ]; then
     if [ -z "$_pyprof" ]; then
         echo "DRAFT=dflash2 needs python3 on PATH to check this machine, and none was found." >&2
         exit 1
     fi
     "$_pyprof" tools/dflash2.py gate || exit 1
+    _dflash2=1
     VENV=".venv-dflash2"
     ENGINE_VERSION="1.6.0"
     _wheel_engine=(--engine-version "$ENGINE_VERSION")
@@ -410,15 +412,18 @@ if [ "$MODE" = "start" ] && [ "$PICK" = "1" ]; then
         3)  echo "Nothing started." ; exit 0 ;;
         *)  echo "Could not work out which model to start (code $_pick)." >&2 ; exit "$_pick" ;;
     esac
+    # re-read for the model just picked; the environment chosen above stays
+    _venv="$VENV"; _engine="$ENGINE_VERSION"
     _load_env
+    VENV="$_venv"; ENGINE_VERSION="$_engine"
 fi
 
 MODEL_DIR="${MODEL_DIR:?MODEL_DIR must be set in .env}"
 # DRAFT=dflash2 runs the settings it was measured with, for this run only (.env
 # is not changed), and only for the quants that were measured. tools/dflash2.py
-# says which, and refuses the rest here - before anything is downloaded.
+# says which, and refuses the rest here - before any model is downloaded.
 _gpu_from=".env"
-if [ "$VENV" = ".venv-dflash2" ]; then
+if [ "$_dflash2" = 1 ]; then
     _pin="$("$PYTHON" tools/dflash2.py pin --model-dir "$MODEL_DIR")" || exit 1
     while IFS='=' read -r _k _v; do
         case "$_k" in
