@@ -638,12 +638,13 @@ Engine: [ExLlamaV3](https://github.com/turboderp-org/exllamav3).
 
 ---
 
-## Optional: `DRAFT=dflash2` (32 GB cards)
+## Optional: `DRAFT=dflash2` (32 GB and 16 GB cards)
 
 `DRAFT=dflash2` replaces the MTP head with a separate drafter, a DFlash2
 block-diffusion draft model. It is off by default. With `DRAFT` unset, `mtp` or
 `none` nothing below applies: same engine (1.6.0), same `.venv`, same flags, same
-downloads.
+downloads. It was measured in two combinations, each only as listed below: a 32 GB
+RTX 5090 with the 4.0 bpw quant, and a 16 GB RTX 5060 Ti (Linux) with the 2.5 bpw quant.
 
 ```
 DRAFT=dflash2        in .env, then ./linux/start.sh      (Windows: see the limits below)
@@ -664,19 +665,28 @@ What it does:
   downloader, pinned to commit `265b5240592907d2d55ff0dc4d5f66569692604d`. The weight
   file is checked against sha256 `e278f218318565562af07fc333045e411ffa0d83523f8224fc8c2d24d5a68223`
   on every start. The server gets `--draft_model <that folder>`.
-- **Refused on small cards.** Below 30 GiB of VRAM it stops before the environment
-  or any download exists, says why, and exits non-zero. Any quant other than the kit's
-  4.0 bpw one is refused the same way, before any model is downloaded. 5.0 bpw is
-  not enabled: it was not measured on the kit's own 5.0 file.
+- **Refused where it was not measured.** A 32 GB class card (30 GiB of VRAM or more)
+  runs the kit's 4.0 bpw quant; a 16 GB class card (15.5 to 17 GiB, Linux only) runs
+  its 2.5 bpw quant. On any other card, including a 16 GB card under Windows, it stops
+  before the environment or any download exists, says why, and exits non-zero. Any
+  other quant on those cards is refused the same way, before any model is downloaded.
+  5.0 bpw is not enabled: it was not measured on the kit's own 5.0 file.
 - **Measured settings.** For these runs `CONTEXT_SIZE`, `CACHE_QUANT` and
   `GPU_MEM_GB` from `.env` are replaced by the ones the numbers below were measured
   with, and `.env` itself is not changed:
 
-  | quant | `CONTEXT_SIZE` | `CACHE_QUANT` | `GPU_MEM_GB` | images |
-  | --- | --- | --- | --- | --- |
-  | 4.0 bpw | `262144` | `4` | `22.8` | `VISION=auto` |
+  | card | quant | `CONTEXT_SIZE` | `CACHE_QUANT` | `GPU_MEM_GB` | images | server environment |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 32 GB | 4.0 bpw | `262144` | `4` | `22.8` | `VISION=auto` | |
+  | 16 GB (Linux) | 2.5 bpw | `90112` | `4` | `15.4` | `VISION=auto` | `EXL3_QC_STAGING=0` |
 
-### What was measured
+  `EXL3_QC_STAGING=0` is set for the 16 GB run only. With a quantized KV cache the
+  engine otherwise makes an fp16 scratch copy of K and V in each prefill step, which
+  this card has little room for. The engine's documentation names a prefill slowdown
+  for the setting; that was not measured here, and neither was this context with the
+  scratch copy left on.
+
+### What was measured on a 32 GB card
 
 One RTX 5090 (32 GB) on Linux, driver 610.43.02, power limit 450 W with the SM clock
 capped at 2200 MHz. Both sides ran the same `tools/serve_openai.py` with
@@ -710,26 +720,56 @@ Decode speed at depth, 4.0 bpw, tokens per second (llama-benchy, 2048-token prom
 | 1.6.0 + MTP (current default) | 121.8 | 115.9 | 112.5 | 122.6 | 102.9 | 79.3 | 22366 MiB |
 | dflash2 (1.6.0 + DFlash2) | 147.0 | 164.3 | 156.5 | 121.3 | 104.4 | 75.0 | 24850 MiB |
 
+### What was measured on a 16 GB card
+
+One RTX 5060 Ti (16311 MiB, 15849 MiB usable) on Linux, driver 595.71.05, power limit
+180 W, SM clock capped at 2200 MHz, nothing else on the card. The kit's 2.5 bpw quant with
+the 16 GB row above. Decode tokens per second, RigMark 1.3.0 (commit `218c8ae`), thinking
+off, seed 42, median of three runs. The *MTP* row is the kit's unpatched server at 98304
+tokens of context, measured earlier the same day on its own server start (not the kit's
+default 16 GB profile):
+
+| | code | prose | structured | C1 |
+| --- | ---: | ---: | ---: | ---: |
+| MTP, 98304 | 65.0 | 39.9 | 73.9 | 55.2 |
+| dflash2, 90112 | 89.6 | 44.0 | 129.0 | 62.4 |
+
++37.9 % on code. Prose varies by about 3 tok/s between runs, so read it as "not slower".
+An alternating check later the same day (both at 90112) gave 64.9 against 94.1 on code;
+2 of its 15 dflash2 code runs fell into a repetition loop (see Limits).
+
+Quality at 90112 (not run with MTP at this setting): MMLU 74.5 % (149/200), GSM8K 96/100,
+tool-eval-bench agent score 87, needle 9/9 up to about 65.5k tokens. Stability, one server
+for about 4.6 h: a 3-hour soak of 4940 requests with no empty reply and no HTTP error,
+prompts up to 87987 tokens answered, VRAM peak 15358 MiB (491 MiB below usable).
+
 ### Limits
 
-- **One card, one OS.** Measured on a single RTX 5090 on Linux. Nothing was measured
-  on other 32 GB cards, on 16 or 24 GB cards, or on Windows. The Windows launcher
-  (`tools/win_start.py`) has the same logic but has **not been run**.
-- **The lead shrinks with depth.** Against 1.6.0 + MTP the gain is +42 % at 8k, about
-  level from 64k (121.3 against 122.6), and slightly behind at 248k (75.0 against
-  79.3). The large gains above are for answers of a few thousand tokens, not for a
-  full context window.
-- **Not for 16 or 24 GB cards.** It needs about 2.4 GiB more VRAM than the default (1.6.0 + MTP; 2.1 GiB more than the old 1.4.4 default; table above).
-  A test on a 16 GB RTX 5060 Ti used a different combination (the 2.5 bpw quant and
-  the unquantised bf16 DFlash2 drafter, 3.85 GB): the context fell to 44032 tokens,
-  the vision tower no longer fit, and the server returned a growing number of empty
-  replies. The 4.0 bpw drafter was not tried on 16 GB. 24 GB was not measured; the
-  5090 run used 24850 MiB.
+- **Repetition loops (16 GB).** In the alternating check, 2 of 15 dflash2 code runs
+  repeated a test case until 6054 and 8192 tokens (temperature 0). None in 35 earlier
+  dflash2 code runs and none in 30 MTP runs. The cause is not known.
+- **One card per setting, one OS.** The 4.0 bpw row was measured on a single RTX 5090,
+  the 2.5 bpw row on a single RTX 5060 Ti, both on Linux. Nothing was measured on
+  other cards of those sizes, on 24 GB cards, or on Windows. The 16 GB row is refused
+  on Windows; for the 32 GB row the Windows launcher (`tools/win_start.py`) has the same
+  logic but has **not been run**.
+- **The lead shrinks with depth (32 GB card).** Against 1.6.0 + MTP the gain is +42 % at
+  8k, about level from 64k (121.3 against 122.6), and slightly behind at 248k (75.0
+  against 79.3). The large gains above are for answers of a few thousand tokens, not
+  for a full context window. No depth table was measured on 16 GB.
+- **Not for 24 GB cards.** On the 4.0 bpw quant it needs about 2.4 GiB more VRAM than the default (1.6.0 + MTP; 2.1 GiB more than the old 1.4.4 default; table above).
+  24 GB was not measured; the 5090 run used 24850 MiB.
+- **16 GB: smaller context, little room.** 90112 tokens instead of the 176128 the MTP
+  profile holds; a longer prompt gets HTTP 400 (highest tested: 87987). Anything else on
+  the card (a desktop, another program) comes out of the 491 MiB left. Long prompts take
+  minutes (227 s for 89987 tokens, measured at 98304 context). An earlier test with the
+  unquantised bf16 drafter fell to 44032 tokens and lost images; the numbers above use the
+  4.00 bpw drafter this option downloads.
 - **Text only.** The measurements above are text benchmarks. Images are enabled
   (`VISION=auto`) as in the default setup.
-- **Only the measured row.** The kit's 4.0 bpw quant at 262144. Other quants (5.0
-  bpw included), other contexts and a different `CACHE_QUANT` were not measured and
-  are refused or overridden.
+- **Only the measured rows.** The kit's 4.0 bpw quant at 262144 on a 32 GB card, and its
+  2.5 bpw quant at 90112 on a 16 GB card. Other quants (5.0 bpw included), other contexts
+  and a different `CACHE_QUANT` were not measured and are refused or overridden.
 - **Unified-memory boards** (GB10) report no VRAM total to `nvidia-smi` and are
   refused.
 - The drafter's model card names a fork of ExLlamaV3 as its requirement. The numbers
@@ -774,7 +814,7 @@ fine. The ones you are most likely to touch:
 | `HOST` | `0.0.0.0` | set to `127.0.0.1` to keep `/v1` off your network |
 | `UI` | `browser` | `browser`, `server`, or `no` |
 | `SIMPLEX_HARNESS_PORT` | `3080` | the chat UI's port. Do **not** set `DSH_PORT` in `.env` — current dsh treats that key in a file as fatal and the harness never binds |
-| `DRAFT` | `mtp` | `none` turns off speculative decoding. `dflash2` swaps the MTP head for a separate drafter on ExLlamaV3 1.6.0: 32 GB cards, 4.0 bpw only, measured on Linux only — see [DRAFT=dflash2](#optional-draftdflash2-32-gb-cards) |
+| `DRAFT` | `mtp` | `none` turns off speculative decoding. `dflash2` swaps the MTP head for a separate drafter on ExLlamaV3 1.6.0: 32 GB cards with 4.0 bpw, or 16 GB cards with 2.5 bpw (Linux), measured on Linux only — see [DRAFT=dflash2](#optional-draftdflash2-32-gb-and-16-gb-cards) |
 | `PROGRESS_EVERY` | `1.0` | seconds between the live ` .. ` progress lines per phase; `0` = live lines off (the per-request ` == stats` line always prints) |
 | `SETUP` | `browser` | `console` for terminal questions on Windows |
 | `TRAY` | `auto` | Windows notification-area icon; `no` to skip |

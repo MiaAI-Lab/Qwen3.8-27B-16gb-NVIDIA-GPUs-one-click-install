@@ -810,6 +810,7 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                   embeddings = embeddings)
         prefill_seen = 0
         eos = {}      # engine per-stage timings, filled from the final EOS result
+        job_error = None
         live = _LiveProgress(_req_tag(rid, streaming), prompt_toks)
         t0 = time.time()   # before the lock: wall must include waiting for it
         with gen_lock:
@@ -825,6 +826,18 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                     reason = "cancelled"
                     break
                 for r in generator.iterate():
+                    if r.get("stage") == "error":
+                        # The generator reaps a failed job and reports it as
+                        # an eos result with an "error" field and no text.
+                        # Reading it as a normal stop used to answer the
+                        # client with HTTP 200, finish_reason "length" and
+                        # zero tokens - invisible to every caller and, on a
+                        # GPU running at the memory edge, the start of a
+                        # poisoned state where each next big prompt kept
+                        # failing the same way.
+                        err = r.get("error")
+                        if err is not None:
+                            job_error = (type(err).__name__, str(err))
                     if r.get("stage") == "prefill":
                         curr = int(r.get("curr_progress") or 0)
                         live.prefill(curr)
@@ -857,6 +870,24 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                         }
             if reason != "cancelled" and prefill_seen < prompt_toks:
                 _bump_stats(prompt=prompt_toks - prefill_seen)
+        if job_error is not None:
+            # Drop the references that kept the failed job's memory pinned
+            # (the result object holds the exception and the job), give the
+            # caching allocator its pages back, then surface the failure so
+            # the next request starts on a clean GPU instead of an OOM.
+            try:
+                del r
+            except UnboundLocalError:
+                pass
+            del job
+            import gc
+            gc.collect()
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            raise RuntimeError("%s: %s" % job_error)
         attempt = {"eos": eos, "wall": time.time() - t0}
         return job
 
@@ -1038,6 +1069,11 @@ async def chat_completions(request):
             return web.json_response(
                 {"error": {"message": str(e), "type": "invalid_request_error"}},
                 status = 400)
+        except Exception as e:
+            return web.json_response(
+                {"error": {"message": f"generation failed: {e}",
+                           "type": "server_error"}},
+                status = 500)
         msg = {"role": "assistant", "content": content or None}
         if reasoning:
             msg["reasoning_content"] = reasoning

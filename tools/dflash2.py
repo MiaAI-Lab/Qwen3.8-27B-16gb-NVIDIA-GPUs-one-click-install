@@ -6,12 +6,19 @@ it for a separate drafter model. Both run on ExLlamaV3 1.6.0 in the one .venv,
 so changing DRAFT back and forth never reinstalls anything. The two launchers (linux/start.sh, tools/win_start.py) and
 tools/setup_core.py all ask this file instead of each carrying a copy.
 
-What was measured, and so what is allowed (README, "DFlash2"): one RTX 5090 on
-Linux, the kit's own 4.0 bpw quant at 262144 tokens, `--grid_size 22.8
---cache_quant 4`, images on. That is the only setting this accepts. On a 32 GB
-card the profile planner already writes the 4.0 bpw row as exactly that; the
-launchers still apply the measured numbers for the run, so a hand-edited .env
-cannot drift from what was measured (nothing is written to .env).
+What was measured, and so what is allowed (README, "DFlash2"), two settings:
+
+  - one RTX 5090 (32 GB) on Linux: the kit's own 4.0 bpw quant at 262144 tokens,
+    `--grid_size 22.8 --cache_quant 4`, images on;
+  - one RTX 5060 Ti (16 GB) on Linux: the kit's own 2.5 bpw quant at 90112 tokens,
+    `--grid_size 15.4 --cache_quant 4`, images on, EXL3_QC_STAGING=0.
+
+Those are the only settings this accepts, each only on a card of the size it was
+measured on. On a 32 GB card the profile planner already writes the 4.0 bpw row
+as exactly the first; the launchers still apply the measured numbers for the run,
+so a hand-edited .env cannot drift from what was measured (nothing is written to
+.env). The 16 GB setting is not what the planner writes for that card (it plans a
+14.6 to 14.7 GB budget), so it is applied the same way.
 
 Standard library only (it runs before the virtualenv exists):
 
@@ -24,7 +31,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import sys
+from collections import namedtuple
 from pathlib import Path
 
 DRAFT = "dflash2"
@@ -47,15 +56,35 @@ DRAFT_DIR = "models/Qwen3.8-27B-DFlash2-EXL3-4.00bpw"
 DRAFT_FILE = "model.safetensors"
 DRAFT_SHA256 = "e278f218318565562af07fc333045e411ffa0d83523f8224fc8c2d24d5a68223"
 
-# Total VRAM below which it is refused. Measured on a 32 GB RTX 5090 the server
-# process held 24850 MiB (4.0 bpw) with the drafter, which does not fit a 24 GB
-# card.
-MIN_VRAM_GIB = 30.0
-
-# The measured rows: quant id -> CONTEXT_SIZE. Nothing else is enabled. 5.0 bpw
-# was not measured on the kit's own 5.0 file, so it is not enabled.
-MEASURED = {"4.0": 262144}
-GRID_GB = "22.8"
+# The measured rows, by quant id. Nothing else is enabled: 5.0 bpw was not
+# measured on the kit's own 5.0 file, and a row is only used on the size of card
+# it was measured on.
+#   cards       lowest and highest (exclusive; None = no limit) total VRAM in GiB,
+#               as nvidia-smi reports it, for which the row is used. The 4.0 bpw
+#               row keeps the 30 GiB floor it had. The 2.5 bpw row was measured on
+#               a card that reports 16311 MiB (15.93 GiB); 15.5 up to 17 is what
+#               counts as a 16 GB class card here (a choice, not a measurement), and
+#               it starts at 15.5 because its GPU_MEM_GB of 15.4 does not fit a card
+#               that reports less. Measured on a 32 GB RTX 5090 the server process
+#               held 24850 MiB (4.0 bpw) with the drafter, which does not fit a
+#               24 GB card.
+#   context     CONTEXT_SIZE for the run
+#   grid        GPU_MEM_GB for the run
+#   env         environment variables the server was started with in the
+#               measurement
+#   linux_only  measured on Linux only, so refused on Windows
+#   where       what the refusal text says about the card ("" = the 32 GB class)
+Row = namedtuple("Row", "cards context grid env linux_only where")
+MEASURED = {
+    "4.0": Row((30.0, None), 262144, "22.8", {}, False, ""),
+    # EXL3_QC_STAGING=0 turns off the engine's fp16 scratch copy of K and V
+    # during prefill with a quantized KV cache, which this card has little room
+    # for. The engine's documentation names a prefill slowdown for it, not
+    # measured here. It was set in the measurement, and the same context with
+    # it on was not measured.
+    "2.5": Row((15.5, 17.0), 90112, "15.4", {"EXL3_QC_STAGING": "0"}, True,
+               " on a 16 GB card"),
+}
 CACHE_QUANT = "4"
 
 
@@ -75,34 +104,62 @@ def extra_packages(draft: str | None = None) -> tuple[str, ...]:
     return EXTRA_PACKAGES
 
 
-def gate_message(total_gib: float) -> str:
+def _size_fits(row: Row, total_gib: float) -> bool:
+    low, high = row.cards
+    return total_gib >= low and (high is None or total_gib < high)
+
+
+def card_quant(total_gib: float, windows: bool | None = None) -> str | None:
+    """The quant that was measured on a card of this size (on this OS), or None."""
+    if windows is None:
+        windows = os.name == "nt"
+    return next((q for q, row in MEASURED.items()
+                 if _size_fits(row, total_gib) and not (windows and row.linux_only)), None)
+
+
+def gate_message(total_gib: float, windows: bool | None = None) -> str:
     """Why this card is refused, or "" when it is not."""
+    if windows is None:
+        windows = os.name == "nt"
     if total_gib <= 0:
-        return ("DRAFT=dflash2 needs a 32 GB class NVIDIA card and nvidia-smi did not report "
-                "one.\nSet DRAFT=mtp (the default) in .env to run without it.")
-    if total_gib < MIN_VRAM_GIB:
-        return (f"DRAFT=dflash2 needs a 32 GB class card (at least {MIN_VRAM_GIB:.0f} GiB); "
-                f"this one has {total_gib:.1f} GiB.\n"
-                "On a 32 GB RTX 5090 the server held 24850 MiB (4.0 bpw) with the "
-                "drafter,\nwhich does not fit a 24 GB card. "
+        return ("DRAFT=dflash2 needs a 32 GB or 16 GB class NVIDIA card and nvidia-smi did not "
+                "report one.\nSet DRAFT=mtp (the default) in .env to run without it.")
+    if card_quant(total_gib, windows) is not None:
+        return ""
+    if windows and any(row.linux_only and _size_fits(row, total_gib) for row in MEASURED.values()):
+        return (f"DRAFT=dflash2 on a 16 GB card was only measured on Linux; this is Windows "
+                f"({total_gib:.1f} GiB).\n"
                 "Set DRAFT=mtp (the default) in .env to run without it.")
-    return ""
+    return (f"DRAFT=dflash2 needs a 32 GB class card (at least {MEASURED['4.0'].cards[0]:.0f} GiB) "
+            f"or, on Linux, a 16 GB class card; this one has {total_gib:.1f} GiB.\n"
+            "On a 32 GB RTX 5090 the server held 24850 MiB (4.0 bpw) with the "
+            "drafter,\nwhich does not fit a 24 GB card. "
+            "Set DRAFT=mtp (the default) in .env to run without it.")
 
 
-def pin(model_dir: str) -> tuple[dict[str, str] | None, str]:
-    """(settings, "") for a measured quant, else (None, why not).
+def pin(model_dir: str, total_gib: float | None = None,
+        windows: bool | None = None) -> tuple[dict[str, str] | None, str]:
+    """(settings, "") for a measured quant on a measured card, else (None, why not).
 
     The settings are the ones the speed numbers were measured with, for this run
-    only: the launchers apply them over .env without writing them back."""
+    only: the launchers apply them over .env without writing them back. The card
+    is the first one nvidia-smi lists unless `total_gib` is given."""
     import profiles
+    if total_gib is None:
+        total_gib = profiles.detect_gpu().total_gib
+    why = gate_message(total_gib, windows)
+    if why:
+        return None, why
+    want = card_quant(total_gib, windows)
     name = Path((model_dir or "").replace("\\", "/")).name.lower()
     q = next((q for q in profiles.QUANTS if Path(q.model_dir).name.lower() == name), None)
-    if q is None or q.id not in MEASURED:
-        return None, (f"DRAFT=dflash2 was only measured with the kit's 4.0 bpw quant "
-                      f"(MODEL_DIR is {model_dir or 'not set'}).\n"
+    if q is None or q.id != want:
+        return None, (f"DRAFT=dflash2 was only measured with the kit's {want} bpw quant"
+                      f"{MEASURED[want].where} (MODEL_DIR is {model_dir or 'not set'}).\n"
                       "Pick that one in setup, or set DRAFT=mtp (the default) in .env.")
-    return {"CONTEXT_SIZE": str(MEASURED[q.id]), "GPU_MEM_GB": GRID_GB,
-            "CACHE_QUANT": CACHE_QUANT}, ""
+    row = MEASURED[want]
+    return {"CONTEXT_SIZE": str(row.context), "GPU_MEM_GB": row.grid,
+            "CACHE_QUANT": CACHE_QUANT, **row.env}, ""
 
 
 def verify(dest: Path) -> str:

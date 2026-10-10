@@ -24,8 +24,18 @@ Notable changes to this kit. Newest first.
 - A `#` inside a quoted `.env` value is kept by the Windows reader, the profile
   writer and the harness launcher, matching `linux/start.sh`. Thanks to Sasha
   Mitchell (PR #12).
+- An error raised by the engine while generating (for example out of memory in a
+  long prefill) is no longer answered with HTTP 200, `finish_reason=length` and an
+  empty reply. A non-streaming request now gets HTTP 500 with the engine's message,
+  and the failed job's references are released (`gc.collect()`,
+  `torch.cuda.empty_cache()`).
 
 ### Added
+- `DRAFT=dflash2` on 16 GB cards, Linux only, with the kit's 2.5 bpw quant: context
+  90112, `GPU_MEM_GB=15.4`, 4-bit KV cache, and `EXL3_QC_STAGING=0` in the server's
+  environment (set by `linux/start.sh`). Measured on one RTX 5060 Ti; any other
+  quant, and a 16 GB card under Windows, is refused. The 32 GB row is unchanged.
+  Numbers and limits are in the README ("DRAFT=dflash2").
 - Per-request stats: one ` == stats` line per request, live ` .. ` progress lines
   (`PROGRESS_EVERY`), and `last_request` in `/health`. Thanks to Ivan Ribeiro Rocha
   (PR #7).
@@ -58,6 +68,12 @@ Do not set `EXL3_REPO` to work around the version error: it skips the prebuilt w
 and forces a source compile.
 
 ### Not validated
+- `DRAFT=dflash2` on 16 GB was measured on one RTX 5060 Ti on Linux. Its MTP
+  comparison comes from a separate server start earlier the same day, there is no
+  MTP quality run at that context, and the 500 response above was exercised in an
+  earlier build (a 68013-token prompt), not in the final configuration. In an
+  alternating check, 2 of 15 dflash2 code runs fell into a repetition loop at
+  temperature 0; the cause is not known.
 - The 12 / 16 / 24 GB profiles were tuned on 1.4.4 and have not been re-measured on
   1.6.0.
 - The Windows launcher has not been run on 1.6.0.

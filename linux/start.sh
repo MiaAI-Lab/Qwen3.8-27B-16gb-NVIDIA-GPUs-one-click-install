@@ -209,8 +209,8 @@ _load_env
 # Every DRAFT value runs on ExLlamaV3 1.6.0 in the one .venv, so switching DRAFT
 # back and forth never reinstalls anything. transformers is installed with it:
 # 1.6.0's chat template imports it and the engine no longer pulls it in.
-# DRAFT=dflash2 (tools/dflash2.py) is the only value with a gate: a card that is
-# too small is refused here, before a download exists.
+# DRAFT=dflash2 (tools/dflash2.py) is the only value with a gate: a card size
+# that was not measured is refused here, before a download exists.
 VENV=".venv"
 ENGINE_VERSION="1.6.0"
 _wheel_engine=(--engine-version "$ENGINE_VERSION")
@@ -427,14 +427,18 @@ MODEL_DIR="${MODEL_DIR:?MODEL_DIR must be set in .env}"
 _gpu_from=".env"
 if [ "$_dflash2" = 1 ]; then
     _pin="$("$PYTHON" tools/dflash2.py pin --model-dir "$MODEL_DIR")" || exit 1
+    _pin_env=""
     while IFS='=' read -r _k _v; do
         case "$_k" in
             CONTEXT_SIZE|GPU_MEM_GB|CACHE_QUANT|DFLASH2_REPO|DFLASH2_REVISION|DFLASH2_DIR)
                 printf -v "$_k" '%s' "$_v" ;;
+            # read by the engine, not by the kit: the server has to inherit it
+            EXL3_QC_STAGING)
+                export EXL3_QC_STAGING="$_v"; _pin_env=", EXL3_QC_STAGING=$_v" ;;
         esac
     done <<< "$_pin"
     _gpu_from="the DRAFT=dflash2 measurement, not .env"
-    echo "DRAFT=dflash2: context $CONTEXT_SIZE, KV cache $CACHE_QUANT-bit (the measured settings)"
+    echo "DRAFT=dflash2: context $CONTEXT_SIZE, KV cache $CACHE_QUANT-bit (the measured settings)$_pin_env"
 fi
 PORT="${PORT:-8888}"
 HOST="${HOST:-0.0.0.0}"
