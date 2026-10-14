@@ -587,6 +587,14 @@ def write_env(path: Path, updates: dict[str, str]) -> None:
     import os, stat, tempfile
     updates = {k: _env_value(v) for k, v in updates.items()}
     lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    # GPU_MEM_GB=14.9,14.9 is a per-GPU budget a person wrote for two cards. The
+    # planner above sizes one card, so it must not turn the list back into one
+    # number. Keep the list; the rest of the profile is still written.
+    for raw in lines:
+        m = re.match(r"^\s*GPU_MEM_GB\s*=\s*[\"']?([^\"'#]*)", raw)
+        if m and "," in m.group(1) and "," not in updates.get("GPU_MEM_GB", ""):
+            updates.pop("GPU_MEM_GB", None)
+            break
     done = set()
     for i, raw in enumerate(lines):
         m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", raw)

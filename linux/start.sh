@@ -426,6 +426,11 @@ MODEL_DIR="${MODEL_DIR:?MODEL_DIR must be set in .env}"
 # says which, and refuses the rest here - before any model is downloaded.
 _gpu_from=".env"
 if [ "$_dflash2" = 1 ]; then
+    case "${GPU_MEM_GB:-}" in
+        *,*) echo "ERROR: DRAFT=dflash2 is measured on one card; GPU_MEM_GB=$GPU_MEM_GB lists several." >&2
+             echo "       Use DRAFT=mtp for two GPUs." >&2
+             exit 1 ;;
+    esac
     _pin="$("$PYTHON" tools/dflash2.py pin --model-dir "$MODEL_DIR")" || exit 1
     while IFS='=' read -r _k _v; do
         case "$_k" in
@@ -453,6 +458,31 @@ else
     fi
     if [ "$GPU_MEM_GB" -lt 8 ]; then GPU_MEM_GB=8; fi
     echo "GPU_MEM_GB not set — auto-detected budget: ${GPU_MEM_GB} GB (override in .env)"
+fi
+# Two GPUs: GPU_MEM_GB=<gpu0>,<gpu1> in nvidia-smi order (one budget per card);
+# TENSOR_PARALLEL=1 runs them as one tensor-parallel model instead of a layer
+# split. Fail here, in words, if fewer cards are visible than budgets are written.
+TENSOR_PARALLEL="${TENSOR_PARALLEL:-0}"
+case "$GPU_MEM_GB" in
+    *,*)
+        export CUDA_DEVICE_ORDER=PCI_BUS_ID
+        _have=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)
+        _want=$(printf '%s' "$GPU_MEM_GB" | awk -F, '{print NF}')
+        if [ "${_have:-0}" -gt 0 ] && [ "$_have" -lt "$_want" ]; then
+            echo "ERROR: GPU_MEM_GB=$GPU_MEM_GB lists $_want budgets but nvidia-smi sees $_have GPU(s)." >&2
+            echo "       Use one value per card you have, e.g. GPU_MEM_GB=14.7" >&2
+            exit 1
+        fi ;;
+    *)
+        if [ "$TENSOR_PARALLEL" = 1 ]; then
+            echo "ERROR: TENSOR_PARALLEL=1 needs one GPU_MEM_GB budget per card, e.g. GPU_MEM_GB=14.9,14.9" >&2
+            exit 1
+        fi ;;
+esac
+if [ "$TENSOR_PARALLEL" = 1 ] && [ "$(echo "${DRAFT:-}" | tr '[:upper:]' '[:lower:]')" = "dflash2" ]; then
+    echo "ERROR: TENSOR_PARALLEL=1 cannot run DRAFT=dflash2 (exllamav3 1.6.0: the DFlash2 selector" >&2
+    echo "       needs top-k logits, which tensor-parallel targets do not provide). Use DRAFT=mtp." >&2
+    exit 1
 fi
 CACHE_QUANT="${CACHE_QUANT:-none}"
 CPU_CACHE_GB="${CPU_CACHE_GB:-0}"
@@ -542,6 +572,7 @@ if [ "$CPU_CACHE_GB" != "0" ]; then
     cmd+=(--cpu_cache_size "$CPU_CACHE_GB")
 fi
 cmd+=(--progress_every "$PROGRESS_EVERY")
+[ "$TENSOR_PARALLEL" = 1 ] && cmd+=(--tensor_parallel --tp_backend "${TP_BACKEND:-native}")
 
 # --- the harness ----------------------------------------------------------
 # The model server serves /v1 and a small page at / saying where things are.

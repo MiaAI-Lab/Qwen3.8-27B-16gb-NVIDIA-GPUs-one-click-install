@@ -26,6 +26,11 @@ Notable changes to this kit. Newest first.
   Mitchell (PR #12).
 
 ### Added
+- Two GPUs: `GPU_MEM_GB` takes one budget per card (`14.5,14.5`, `nvidia-smi`
+  order), and the opt-in `TENSOR_PARALLEL=1` (`TP_BACKEND=native|nccl`) runs both
+  cards on every layer through exllamav3's own `-tp`. Default stays the layer split.
+  `linux/start.sh` checks the number of budgets against the visible GPUs and refuses
+  `DRAFT=dflash2` with a list; the profile writer keeps a list in `.env`.
 - Per-request stats: one ` == stats` line per request, live ` .. ` progress lines
   (`PROGRESS_EVERY`), and `last_request` in `/health`. Thanks to Ivan Ribeiro Rocha
   (PR #7).

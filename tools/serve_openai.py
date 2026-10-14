@@ -369,28 +369,52 @@ def _quiet_triton():
     threading.Thread(target = pump, daemon = True, name = "quiet-triton").start()
 
 
-def _cap_process_vram(gb):
-    """Hard-cap this process to `gb` GiB so a large unified-memory box
-    behaves like a discrete card with that much free VRAM. ExLlama lifts
-    the CUDA fraction after autosplit; pin it back to the same cap."""
+def parse_budgets(spec):
+    """GPU_MEM_GB / --grid_size: one budget ("14.7") or one per GPU ("14.9,14.9").
+    The list is in exllamav3's device order (CUDA_DEVICE_ORDER=PCI_BUS_ID, i.e.
+    the order nvidia-smi prints)."""
+    try:
+        budgets = [float(x) for x in str(spec).replace(" ", "").split(",") if x]
+    except ValueError:
+        budgets = []
+    if not budgets or any(b <= 0 for b in budgets):
+        raise SystemExit(f"GPU_MEM_GB / --grid_size must be positive numbers in GB, "
+                         f"one per GPU, e.g. 14.7 or 14.9,14.9 (got {spec!r}).")
+    return budgets
+
+
+def _cap_process_vram(budgets):
+    """Hard-cap this process to `budgets[i]` GiB on GPU i so a large unified-memory
+    box behaves like a discrete card with that much free VRAM. ExLlama lifts the
+    CUDA fraction after autosplit; pin it back to the same cap. One budget keeps
+    the single-card behaviour (GPU 0 only)."""
     import torch
     from exllamav3.util import memory as _mem
     torch.cuda.init()
-    total = torch.cuda.get_device_properties(0).total_memory
-    cap_bytes = int(float(gb) * 1024 ** 3)
-    frac = min(max(cap_bytes / total, 0.01), 1.0)
+    n = torch.cuda.device_count()
+    if len(budgets) > n:
+        raise SystemExit(f"GPU_MEM_GB lists {len(budgets)} budgets but {n} GPU(s) are "
+                         f"visible (CUDA_VISIBLE_DEVICES="
+                         f"{os.environ.get('CUDA_VISIBLE_DEVICES', '')!r}).")
+    fracs = []
+    for i, gb in enumerate(budgets):
+        total = torch.cuda.get_device_properties(i).total_memory
+        if gb * 1024 ** 3 > total:
+            raise SystemExit(f"GPU {i} ({torch.cuda.get_device_name(i)}) has "
+                             f"{total / 1024**3:.1f} GiB; a budget of {gb} GB does not fit.")
+        fracs.append(min(max(gb * 1024 ** 3 / total, 0.01), 1.0))
+        print(f" == VRAM cap GPU {i} ({torch.cuda.get_device_name(i)}): {gb} GB "
+              f"(fraction {fracs[-1]:.4f} of {total / 1024**3:.1f} GiB)", flush = True)
 
-    def _pin(devices=None):
-        for i in (devices if devices is not None else [0]):
-            torch.cuda.set_per_process_memory_fraction(frac, device = i)
+    def _pin(devices = None):
+        for i in (devices if devices is not None else range(len(fracs))):
+            if i < len(fracs):
+                torch.cuda.set_per_process_memory_fraction(fracs[i], device = i)
 
     _pin()
     _mem.set_memory_fraction_use = lambda use, device: _pin([device])
     _mem.set_memory_fraction_reserve = lambda reserve, device: _pin([device])
     _mem.unset_memory_fraction = lambda active: _pin(active)
-    print(f" == VRAM cap: {gb} GB "
-          f"({cap_bytes / 1024**3:.2f} GiB, fraction {frac:.4f} of "
-          f"{total / 1024**3:.1f} GB device)", flush = True)
 
 
 def build_model(argv, use_draft = True):
@@ -1373,9 +1397,17 @@ def main():
                     help = "'mtp' for MTP drafting (head inside the "
                            "main checkpoint: no extra weights, much smaller KV footprint), "
                            "a draft model's directory, or 'none' to disable drafting")
-    ap.add_argument("-gs", "--grid_size", type = float, default = 14.7,
+    ap.add_argument("-gs", "--grid_size", type = str, default = "14.7",
                     help = "GPU memory budget in GB (autosplit + process cap). "
-                           "14.7 is the 16 GB-card recipe")
+                           "14.7 is the 16 GB-card recipe. Two or more GPUs: one "
+                           "budget per GPU in nvidia-smi order, e.g. 14.9,14.9")
+    ap.add_argument("-tp", "--tensor_parallel", action = "store_true",
+                    help = "tensor-parallel load across the GPUs in --grid_size "
+                           "(default: layer split, the model's layers one after "
+                           "the other)")
+    ap.add_argument("-tpb", "--tp_backend", type = str, default = "native",
+                    choices = ["native", "nccl"],
+                    help = "tensor-parallel backend (with --tensor_parallel)")
     ap.add_argument("-cs", "--cache_size", type = int, default = 199936,
                     help = "KV cache size in tokens (default 199936 ~200k for "
                            "16 GB VRAM; must be a multiple of 256)")
@@ -1416,16 +1448,27 @@ def main():
     args = ap.parse_args()
     MODEL_ID = (args.model_id or os.path.basename(os.path.normpath(args.model))).strip().lower() or MODEL_ID
     PROGRESS_EVERY = args.progress_every
-    _cap_process_vram(args.grid_size)
+    budgets = parse_budgets(args.grid_size)
+    args.grid_size = ",".join(f"{b:g}" for b in budgets)
+    if args.tensor_parallel and len(budgets) < 2:
+        raise SystemExit("--tensor_parallel needs one GPU_MEM_GB budget per GPU, "
+                         "e.g. GPU_MEM_GB=14.9,14.9")
     _draft = args.draft_model.lower()
     use_mtp = _draft == "mtp"
     use_draft = _draft not in ("none", "", "-")
+    if args.tensor_parallel and use_draft and not use_mtp:
+        raise SystemExit("--tensor_parallel works with --draft_model mtp or none, not with a "
+                         "separate drafter: exllamav3's DFlash2 does not support tensor-parallel "
+                         "targets (its selector needs top-k logits).")
+    _cap_process_vram(budgets)
     argv = ["-m", args.model,
             "-gs", str(args.grid_size), "-cs", str(args.cache_size)]
     if use_mtp:
         argv += ["-mtp"]
     elif use_draft:
         argv += ["-dm", args.draft_model]
+    if args.tensor_parallel:
+        argv += ["-tp", "-tpb", args.tp_backend]
     if args.cache_quant:
         argv += ["-cq", args.cache_quant]
     if args.cpu_cache_size:
@@ -1444,10 +1487,11 @@ def main():
         vision["reason"] = "disabled (--vision off)"
     try:
         import torch
-        a = torch.cuda.memory_allocated(0) / 1024 ** 3
-        r = torch.cuda.memory_reserved(0) / 1024 ** 3
-        print(f" == cuda allocated {a:.2f} GiB, reserved {r:.2f} GiB "
-              f"(cap {args.grid_size} GB)", flush = True)
+        for i in range(len(budgets)):
+            a = torch.cuda.memory_allocated(i) / 1024 ** 3
+            r = torch.cuda.memory_reserved(i) / 1024 ** 3
+            print(f" == cuda GPU {i} allocated {a:.2f} GiB, reserved {r:.2f} GiB "
+                  f"(cap {budgets[i]:g} GB)", flush = True)
     except Exception as e:
         print(f" == cuda memory stats unavailable: {e}", flush = True)
     # Build and mount first, bind the port next, and only then say Ready: a
