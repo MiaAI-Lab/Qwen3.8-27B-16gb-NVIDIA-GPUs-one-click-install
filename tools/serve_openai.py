@@ -41,7 +41,11 @@ print no live line at all.
 Defaults match the serving convention: temperature 0.6, top-k 20, top-p 0.95,
 thinking enabled (reasoning arrives inline in `<think>`), speculative
 drafting active (drafter chosen via -dm, see above).
-Concurrency: requests are serialized (batch-1 draft); concurrent callers queue.
+Concurrency: by default requests are serialized (batch-1 draft); concurrent
+callers queue. PARALLEL=n (--parallel n, n > 1) is opt-in: up to n requests
+share the engine's decode steps (continuous batching, drafts included), the
+rest queue. Greedy replies can differ from a solo run at the last bit, as in any
+batched engine; PARALLEL=1 is byte-for-byte the old behaviour.
 
 Tool calling (Qwen3.8 XML format):
   - `tools` (OpenAI function specs) are rendered by the model's HF chat template
@@ -60,7 +64,7 @@ Launch (from repo root; 16 GB NVIDIA recipe):
   .venv/bin/python tools/serve_openai.py \
       -m models/Qwen3.8-27B-EXL3-2.0bpw -gs 14.7 -cs 199936 -cq 8,4 --port 8888
 """
-import argparse, asyncio, json, os, re, sys, time, threading, uuid
+import argparse, asyncio, collections, json, os, re, sys, time, threading, uuid
 import token_budget          # tools/token_budget.py: cache-fit clamp on max_tokens
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aiohttp import web
@@ -71,6 +75,79 @@ PORT = 8888
 MODEL_ID = "qwen3.8-27b-exl3-2.0bpw"
 
 gen_lock = threading.Lock()          # serialize generation (batch-1 draft)
+PARALLEL = 1                         # --parallel: concurrent generations (1 = serialized, as before)
+gate = None                          # _ParallelGate when PARALLEL > 1
+
+
+class _ParallelGate:
+    """PARALLEL > 1: up to `n` requests share the engine's iterate() steps.
+
+    The engine batches whatever jobs are enqueued (it was loaded with
+    max_batch_size = n, see main()). Every request thread enqueues its own job,
+    then takes turns stepping the engine: whoever finds its inbox empty takes
+    `step`, runs ONE iterate() and files each result under the job it belongs
+    to. `slots` keeps at most n jobs in the engine; further requests wait for a
+    slot exactly like they waited for gen_lock before. Vision embeddings and
+    every other direct GPU use take `step` too (gen_lock is rebound to it)."""
+
+    def __init__(self, n):
+        self.n = n
+        self.slots = threading.BoundedSemaphore(n)
+        self.step = threading.Lock()
+        self.inbox = {}                  # job -> deque of its engine results
+        self.active = 0
+
+    def busy(self):
+        return self.active > 0
+
+    def drive(self, generator, job, handle, should_stop, on_admit):
+        """Run `job` to its end, calling handle(result) for each of its results.
+        Returns True if it was cancelled via should_stop()."""
+        self.slots.acquire()
+        try:
+            on_admit()
+            box = collections.deque()
+            with self.step:
+                generator.enqueue(job)
+                self.inbox[job] = box
+                self.active += 1
+            finished = cancelled = False
+            try:
+                while not finished:
+                    if should_stop is not None and should_stop():
+                        with self.step:
+                            generator.cancel(job)
+                        cancelled = True
+                        break
+                    if not box:
+                        with self.step:
+                            if not box:
+                                for r in generator.iterate():
+                                    other = self.inbox.get(r["job"])
+                                    if other is not None:
+                                        other.append(r)
+                    while box:
+                        r = box.popleft()
+                        handle(r)
+                        if r.get("eos"):
+                            finished = True
+            finally:
+                with self.step:
+                    self.inbox.pop(job, None)
+                    self.active -= 1
+                    if not finished and not cancelled:   # an error: free the job's pages
+                        try:
+                            generator.cancel(job)
+                        except Exception:
+                            pass
+            return cancelled
+        finally:
+            self.slots.release()
+
+
+def _busy():
+    return gate.busy() if gate is not None else gen_lock.locked()
+
 vision = {"model": None, "max_pixels": 1048576, "reason": "not loaded"}
 IMAGE_TRIPLE = "<|vision_start|><|image_pad|><|vision_end|>"   # what the chat template emits per image
 stats_lock = threading.Lock()
@@ -211,7 +288,7 @@ class _LiveProgress:
         self.last = time.time()
 
     def queued(self, wait):
-        """Called the moment gen_lock is finally held. The generation's clock
+        """Called the moment gen_lock (or, with PARALLEL, a generation slot) is finally held. The generation's clock
         starts here either way: prefill is the next thing the engine does once
         the lock is ours, so t_phase set now covers the WHOLE phase - matching
         the summary's engine-side time_prefill - rather than starting at the
@@ -812,51 +889,62 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
         eos = {}      # engine per-stage timings, filled from the final EOS result
         live = _LiveProgress(_req_tag(rid, streaming), prompt_toks)
         t0 = time.time()   # before the lock: wall must include waiting for it
-        with gen_lock:
-            live.queued(time.time() - t0)
-            generator.enqueue(job)
-            while generator.num_remaining_jobs():
-                # Stop has to reach the GPU, not just the socket. One check per
-                # decode step is a few milliseconds of latency and releases the
-                # job's cache pages immediately, so the next request is not
-                # queued behind a reply nobody is reading any more.
-                if should_stop is not None and should_stop():
-                    generator.cancel(job)
-                    reason = "cancelled"
-                    break
-                for r in generator.iterate():
-                    if r.get("stage") == "prefill":
-                        curr = int(r.get("curr_progress") or 0)
-                        live.prefill(curr)
-                        if curr > prefill_seen:
-                            _bump_stats(prompt=curr - prefill_seen)
-                            prefill_seen = curr
-                    elif _result_new_tokens(r):
-                        n = _result_new_tokens(r)
-                        _bump_stats(completion=n)
-                        live.decode(n)
-                    chunk = r.get("text", "")
-                    if chunk:
-                        text += chunk
-                        if on_text is not None:
-                            on_text(chunk)
-                    if r.get("eos"):
-                        reason = r.get("eos_reason", reason)
-                        # The EOS dict is the only place the engine reports
-                        # per-stage timings, and it is only sent on a natural
-                        # finish: cancel() drops it, hence the empty-dict
-                        # fallback path in _report_request.
-                        eos = {
-                            "time_prefill": float(r.get("time_prefill") or 0.0),
-                            "time_generate": float(r.get("time_generate") or 0.0),
-                            "time_enqueued": float(r.get("time_enqueued") or 0.0),
-                            "new_tokens": int(r.get("new_tokens") or 0),
-                            "cached_tokens": int(r.get("cached_tokens") or 0),
-                            "accepted_draft_tokens": int(r.get("accepted_draft_tokens") or 0),
-                            "rejected_draft_tokens": int(r.get("rejected_draft_tokens") or 0),
-                        }
-            if reason != "cancelled" and prefill_seen < prompt_toks:
-                _bump_stats(prompt=prompt_toks - prefill_seen)
+
+        def handle(r):
+            nonlocal prefill_seen, text, reason, eos
+            if r.get("stage") == "prefill":
+                curr = int(r.get("curr_progress") or 0)
+                live.prefill(curr)
+                if curr > prefill_seen:
+                    _bump_stats(prompt=curr - prefill_seen)
+                    prefill_seen = curr
+            elif _result_new_tokens(r):
+                n = _result_new_tokens(r)
+                _bump_stats(completion=n)
+                live.decode(n)
+            chunk = r.get("text", "")
+            if chunk:
+                text += chunk
+                if on_text is not None:
+                    on_text(chunk)
+            if r.get("eos"):
+                reason = r.get("eos_reason", reason)
+                # The EOS dict is the only place the engine reports
+                # per-stage timings, and it is only sent on a natural
+                # finish: cancel() drops it, hence the empty-dict
+                # fallback path in _report_request.
+                eos = {
+                    "time_prefill": float(r.get("time_prefill") or 0.0),
+                    "time_generate": float(r.get("time_generate") or 0.0),
+                    "time_enqueued": float(r.get("time_enqueued") or 0.0),
+                    "new_tokens": int(r.get("new_tokens") or 0),
+                    "cached_tokens": int(r.get("cached_tokens") or 0),
+                    "accepted_draft_tokens": int(r.get("accepted_draft_tokens") or 0),
+                    "rejected_draft_tokens": int(r.get("rejected_draft_tokens") or 0),
+                }
+
+        if gate is not None:
+            # PARALLEL > 1: share the engine's steps with the other requests.
+            if gate.drive(generator, job, handle, should_stop,
+                          lambda: live.queued(time.time() - t0)):
+                reason = "cancelled"
+        else:
+            with gen_lock:
+                live.queued(time.time() - t0)
+                generator.enqueue(job)
+                while generator.num_remaining_jobs():
+                    # Stop has to reach the GPU, not just the socket. One check per
+                    # decode step is a few milliseconds of latency and releases the
+                    # job's cache pages immediately, so the next request is not
+                    # queued behind a reply nobody is reading any more.
+                    if should_stop is not None and should_stop():
+                        generator.cancel(job)
+                        reason = "cancelled"
+                        break
+                    for r in generator.iterate():
+                        handle(r)
+        if reason != "cancelled" and prefill_seen < prompt_toks:
+            _bump_stats(prompt=prompt_toks - prefill_seen)
         attempt = {"eos": eos, "wall": time.time() - t0}
         return job
 
@@ -939,7 +1027,7 @@ async def health(request):
     with stats_lock:
         return web.json_response({
             "ok": True,
-            "busy": gen_lock.locked(),
+            "busy": _busy(),
             "backend": "exl3",
             "prompt_tokens_total": stats["prompt_tokens_total"],
             "completion_tokens_total": stats["completion_tokens_total"],
@@ -1365,7 +1453,7 @@ def mount_landing(app, args):
 
 
 def main():
-    global MODEL_DIR, DRAFT_DIR, PORT, MODEL_ID, PROGRESS_EVERY
+    global MODEL_DIR, DRAFT_DIR, PORT, MODEL_ID, PROGRESS_EVERY, PARALLEL, gate, gen_lock
     _quiet_triton()
     ap = argparse.ArgumentParser()
     ap.add_argument("-m", "--model", default = MODEL_DIR)
@@ -1409,6 +1497,13 @@ def main():
                     help = "max request body size in MiB (aiohttp's built-in "
                            "default is 1 MiB, far too small for a full tool "
                            "set + a long transcript)")
+    ap.add_argument("--parallel", type = int, default = 1,
+                    help = "requests generated at the same time (continuous "
+                           "batching). 1 = one at a time, the default and the "
+                           "old behaviour. n > 1 reserves recurrent-state "
+                           "slots for n streams: costs VRAM (about 0.7 GiB per "
+                           "extra stream with MTP on this model), so lower "
+                           "CONTEXT_SIZE if the load no longer fits")
     ap.add_argument("--progress_every", type = float, default = 1.0,
                     help = "seconds between live ' .. ' progress lines per "
                            "phase while a request runs; 0 disables them (the "
@@ -1416,6 +1511,12 @@ def main():
     args = ap.parse_args()
     MODEL_ID = (args.model_id or os.path.basename(os.path.normpath(args.model))).strip().lower() or MODEL_ID
     PROGRESS_EVERY = args.progress_every
+    if args.parallel < 1:
+        ap.error("--parallel must be 1 or more")
+    PARALLEL = args.parallel
+    if PARALLEL > 1:
+        gate = _ParallelGate(PARALLEL)
+        gen_lock = gate.step        # vision embeddings etc. take turns with the stepping
     _cap_process_vram(args.grid_size)
     _draft = args.draft_model.lower()
     use_mtp = _draft == "mtp"
@@ -1430,6 +1531,8 @@ def main():
         argv += ["-cq", args.cache_quant]
     if args.cpu_cache_size:
         argv += ["-ccs", str(args.cpu_cache_size)]
+    if PARALLEL > 1:
+        argv += ["-ambs", str(PARALLEL)]   # state slots + load-time buffers for n streams
 
     print(f" == loading {args.model}"
           + (" + MTP head" if use_mtp else
@@ -1437,6 +1540,11 @@ def main():
           + " ...", flush = True)
     generator, tokenizer, config = build_model(argv, use_draft = use_draft)
     stats["context_length"] = int(args.cache_size)
+    if PARALLEL > 1:
+        # first use imports transformers lazily; from several request threads at once that
+        # import can fail (cannot import name 'AutoTokenizer'), so do it once here
+        tokenizer.hf_chat_template([{"role": "user", "content": "hi"}], add_generation_prompt = True,
+                                   enable_thinking = False)
     if args.vision == "auto":
         print(" == loading vision tower (images) ...", flush = True)
         load_vision(config, args.image_max_pixels)

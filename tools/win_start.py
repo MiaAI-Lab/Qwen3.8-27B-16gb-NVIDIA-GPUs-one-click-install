@@ -1432,6 +1432,9 @@ def server_command(cfg: dict[str, str]):
     # end-of-request " == stats" line always prints). Passed raw like the
     # other numeric knobs: a bad value dies loudly in the server's argparse.
     cmd.extend(["--progress_every", str(cfg.get("PROGRESS_EVERY") or "1.0")])
+    # Requests generated at the same time (1 = one at a time). Passed raw like
+    # the other numeric knobs: a bad value dies loudly in the server's argparse.
+    cmd.extend(["--parallel", str(cfg.get("PARALLEL") or "1")])
     cmd.extend(["--vision", vision_mode, "--image_max_pixels", image_max_pixels])
     ui = ui_mode(cfg)
     cmd.extend(["--ui", "off" if ui == "no" else "on"])

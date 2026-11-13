@@ -459,6 +459,8 @@ CPU_CACHE_GB="${CPU_CACHE_GB:-0}"
 # Seconds between the server's live " .. " progress lines (0 = off; the
 # end-of-request " == stats" line always prints). See .env.example.
 PROGRESS_EVERY="${PROGRESS_EVERY:-1.0}"
+# Requests generated at the same time (1 = one at a time, the default).
+PARALLEL="${PARALLEL:-1}"
 
 # --- speculative decoding method ---------------------------------------------
 # DRAFT = mtp | none | dflash2 (see .env.example for the trade-offs).
@@ -542,6 +544,7 @@ if [ "$CPU_CACHE_GB" != "0" ]; then
     cmd+=(--cpu_cache_size "$CPU_CACHE_GB")
 fi
 cmd+=(--progress_every "$PROGRESS_EVERY")
+cmd+=(--parallel "$PARALLEL")
 
 # --- the harness ----------------------------------------------------------
 # The model server serves /v1 and a small page at / saying where things are.
