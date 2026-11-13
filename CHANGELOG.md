@@ -26,6 +26,9 @@ Notable changes to this kit. Newest first.
   Mitchell (PR #12).
 
 ### Added
+- Opt-in `PARALLEL=n` (default `1`, unchanged behaviour): up to n requests are generated
+  together in the engine's decode steps instead of queueing behind each other, with MTP
+  drafts batched across streams. Costs VRAM for the extra stream state (see `.env.example`).
 - Per-request stats: one ` == stats` line per request, live ` .. ` progress lines
   (`PROGRESS_EVERY`), and `last_request` in `/health`. Thanks to Ivan Ribeiro Rocha
   (PR #7).

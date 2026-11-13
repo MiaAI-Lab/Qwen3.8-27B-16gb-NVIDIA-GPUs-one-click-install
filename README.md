@@ -775,6 +775,7 @@ fine. The ones you are most likely to touch:
 | `UI` | `browser` | `browser`, `server`, or `no` |
 | `SIMPLEX_HARNESS_PORT` | `3080` | the chat UI's port. Do **not** set `DSH_PORT` in `.env` — current dsh treats that key in a file as fatal and the harness never binds |
 | `DRAFT` | `mtp` | `none` turns off speculative decoding. `dflash2` swaps the MTP head for a separate drafter on ExLlamaV3 1.6.0: 32 GB cards, 4.0 bpw only, measured on Linux only — see [DRAFT=dflash2](#optional-draftdflash2-32-gb-cards) |
+| `PARALLEL` | `1` | requests generated at the same time. `1` = one at a time (queue), as before. `2`-`4` = they share the decode steps; each costs about 0.7 GiB VRAM on the 27B with MTP, so lower `CONTEXT_SIZE` with it |
 | `PROGRESS_EVERY` | `1.0` | seconds between the live ` .. ` progress lines per phase; `0` = live lines off (the per-request ` == stats` line always prints) |
 | `SETUP` | `browser` | `console` for terminal questions on Windows |
 | `TRAY` | `auto` | Windows notification-area icon; `no` to skip |
